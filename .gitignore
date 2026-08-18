@@ -1,0 +1,18 @@
+# Copyrighted ROM/BIOS dumps and third-party reference material with
+# uncertain redistribution rights (e.g. Casio PB-1000 command reference
+# derived docs) — kept locally only, never published.
+/roms/
+/references/
+
+# Local dev-tool/session state — not part of the project itself.
+.claude/
+**/.claude/
+
+# Personal debugging trace logs accumulated during development.
+/log/
+
+# Build artifacts (regenerate via bldfrm_msx.sh / hdmi_bridge's build.sh).
+__pycache__/
+build/
+build-*/
+*.pyc

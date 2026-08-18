@@ -1,0 +1,101 @@
+ MSXエミュレータをpico2にセッティングする手順を教えてください
+
+まずプロジェクトのメモリと現在の状態を確認します。
+
+  Read 1 file, listed 1 directory, ran 1 shell command, recalled 1 memory
+
+プロジェクトの構造が把握できました。MSXエミュレータのセットアップ手順をまとめます。
+
+---
+MSXエミュレータ Pico2 セットアップ手順
+
+前提条件（一度だけ）
+
+# 1. MicroPythonクローン（未済の場合）
+cd ~/projects
+git clone https://github.com/micropython/micropython.git
+cd micropython
+git submodule update --init --recursive
+
+# 2. mpy-cross ビルド（未済の場合）
+make -C mpy-cross
+
+# 3. RP2サブモジュール（未済の場合）
+cd ports/rp2
+make submodules
+
+---
+手順 1：ファームウェアビルド
+
+プロジェクトルート（Google Drive側）から実行：
+
+cd /mnt/chromeos/GoogleDrive/MyDrive/RaspberryPiPico/MSX_emu_pico2
+chmod +x bldfrm_msx.sh
+./bldfrm_msx.sh
+
+成功すると：
+~/projects/micropython/ports/rp2/build-RPI_PICO2/firmware.uf2
+
+---
+手順 2：Pico2 にフラッシュ
+
+1. BOOTSELボタンを押しながら USBケーブルを接続
+2. RPI-RP2 ドライブとしてマウントされる
+3. firmware.uf2 をコピー
+cp ~/projects/micropython/ports/rp2/build-RPI_PICO2/firmware.uf2 <RPI-RP2ドライブ>/
+4. 自動的に再起動
+
+---
+手順 3：SDカードの準備
+
+/sd/msx/
+  MSX.ROM         ← 32KB MSX BIOS（必須、自分で用意）
+  *.ROM           ← カートリッジROM（任意）
+  config.txt      ← 任意の設定
+
+config.txt の書式：
+bios=/sd/msx/MSX.ROM
+cart=/sd/msx/SomeGame.ROM
+
+---
+手順 4：MicroPython ファイルを転送
+
+pip install mpremote
+
+# Pico2接続確認
+mpremote connect /dev/ttyACM0
+
+# MSX Pythonファイルを転送
+cd /mnt/chromeos/GoogleDrive/MyDrive/RaspberryPiPico/MSX_emu_pico2
+mpremote fs cp mp/main.py :
+mpremote fs cp mp/msx_keymap.py :
+mpremote fs cp mp/msx_menu.py :
+
+---
+手順 5：起動確認
+
+mpremote connect /dev/ttyACM0
+
+REPLで：
+>>> import msx
+>>> msx.reset()
+
+正常ならROM選択メニューがILI9341ディスプレイに表示されます。
+
+---
+トラブルシューティング
+
+┌───────────────────────────────┬────────────────────────────────────────────────────┐
+│             症状              │                     原因・対処                     │
+├───────────────────────────────┼────────────────────────────────────────────────────┤
+│ ビルドエラー                  │ cat /tmp/msx_build.log で詳細確認                  │
+├───────────────────────────────┼────────────────────────────────────────────────────┤
+│ Pico2がドライブとして見えない │ BOOTSELを押しながら接続、データ用USBケーブルか確認 │
+├───────────────────────────────┼────────────────────────────────────────────────────┤
+│ 黒画面                        │ MSX.ROM が /sd/msx/MSX.ROM に存在するか確認        │
+├───────────────────────────────┼────────────────────────────────────────────────────┤
+│ import msx でエラー           │ ファームウェアが正しくフラッシュされているか確認   │
+└───────────────────────────────┴────────────────────────────────────────────────────┘
+
+---
+ビルド環境はすでに構築済みですか？どのステップから始めればよいか教えていただければ、詳しくサポートします。
