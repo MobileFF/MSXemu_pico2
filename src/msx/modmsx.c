@@ -82,6 +82,12 @@ static bool cart_fetch_from_pyfile(void *userdata, uint8_t slot,
     return (errcode == 0 && n == MSX_CART_PAGE_SIZE);
 }
 
+/* CALL/RST hook table — see its definition further below (near
+ * msx.reset()) for the full comment. Forward-declared here so
+ * msx_py_init() can re-link it after msx_init() zeroes msx_state.cpu.
+ * call_hook, the same way msx_set_cart_fetch_cb() is re-called below. */
+static void call_hook_relink(void);
+
 /* PWM audio state */
 static uint8_t  audio_pwm_pin   = 0xFF;
 static uint8_t  audio_pwm_slice = 0;
@@ -172,9 +178,11 @@ static mp_obj_t msx_py_init(void) {
     }
 
     msx_init(&msx_state);
-    /* msx_init() zeroes the whole state including cart_fetch_cb, so this
-     * must be re-registered every time (harmless/idempotent otherwise). */
+    /* msx_init() zeroes the whole state including cart_fetch_cb and
+     * cpu.call_hook, so both must be re-registered every time (harmless/
+     * idempotent otherwise). */
     msx_set_cart_fetch_cb(&msx_state, cart_fetch_from_pyfile, NULL);
+    call_hook_relink();
     msx_global_initialized = true;
     return mp_const_none;
 }
@@ -353,10 +361,129 @@ static mp_obj_t msx_py_is_cart_paged(mp_obj_t slot_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_is_cart_paged_obj, msx_py_is_cart_paged);
 
 /* -----------------------------------------------------------------------
+ * CALL/RST hook table
+ *
+ * Lets Python register a callback that fires whenever the Z80 executes a
+ * CALL/RST targeting a specific address, in place of the real subroutine
+ * — e.g. to replace a piece of the MSX BIOS with a native implementation.
+ * The actual interception point lives in z80.c's call() (see z80.h's
+ * call_hook comment); this table + dispatcher is the Python-facing half,
+ * deliberately kept entirely in this MicroPython binding layer (msx_core.c
+ * itself has no notion of hooks, same separation as the rest of this
+ * file's C-core/Python-binding split).
+ *
+ * Same design as the CAL-hook mechanism this project's sibling PB-1000
+ * emulator has for its HD61700 CPU core — but the Z80 has real CALL/RST
+ * instructions (unlike the HD61700, whose BASIC-level "CALL" is just
+ * push+JP with no dedicated opcode), so the hook only needs to run at
+ * actual CALL/RST execution rather than being checked before every single
+ * instruction fetch.
+ * ----------------------------------------------------------------------- */
+#define CALL_HOOK_MAX 16
+static uint16_t call_hook_addrs[CALL_HOOK_MAX];
+static mp_obj_t  call_hook_fns[CALL_HOOK_MAX];  /* static = scanned by conservative GC */
+static bool      call_hook_enabled[CALL_HOOK_MAX];
+static int       call_hook_count = 0;
+
+static bool c_call_hook_dispatcher(void *userdata, uint16_t addr) {
+    (void)userdata;
+    for (int i = 0; i < call_hook_count; i++) {
+        if (call_hook_addrs[i] == addr && call_hook_enabled[i]) {
+            mp_call_function_0(call_hook_fns[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Re-link msx_state.cpu.call_hook after anything that re-runs z80_init()
+ * (msx_init()/msx_reset()) — that zeroes the field along with the other
+ * callback pointers, same reason msx_set_cart_fetch_cb() has to be
+ * re-called after msx_init() elsewhere in this file. No-op if no hooks
+ * are registered. */
+static void call_hook_relink(void) {
+    if (call_hook_count > 0) {
+        msx_state.cpu.call_hook = c_call_hook_dispatcher;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * msx.set_call_hook(address: int, callable)
+ * Registers (or replaces) the hook for `address`. `callable` is invoked
+ * with no arguments each time a CALL/RST targeting `address` would
+ * execute; the actual CALL/RST is then skipped (see z80.h's call_hook
+ * comment) — the callable is responsible for whatever the replaced
+ * subroutine should do (e.g. via msx.get_ram_view(), msx.debug_peek(),
+ * future register-access API, etc.).
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_set_call_hook(mp_obj_t addr_obj, mp_obj_t fn_obj) {
+    uint16_t addr = (uint16_t)mp_obj_get_int(addr_obj);
+    for (int i = 0; i < call_hook_count; i++) {
+        if (call_hook_addrs[i] == addr) {
+            call_hook_fns[i] = fn_obj;
+            call_hook_enabled[i] = true;
+            msx_state.cpu.call_hook = c_call_hook_dispatcher;
+            return mp_const_none;
+        }
+    }
+    if (call_hook_count >= CALL_HOOK_MAX) {
+        mp_raise_ValueError(MP_ERROR_TEXT("too many call hooks"));
+    }
+    call_hook_addrs[call_hook_count]   = addr;
+    call_hook_fns[call_hook_count]     = fn_obj;
+    call_hook_enabled[call_hook_count] = true;
+    call_hook_count++;
+    msx_state.cpu.call_hook = c_call_hook_dispatcher;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(msx_py_set_call_hook_obj, msx_py_set_call_hook);
+
+/* -----------------------------------------------------------------------
+ * msx.clear_call_hook(address: int)
+ * Unregisters the hook for `address`, if any.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_clear_call_hook(mp_obj_t addr_obj) {
+    uint16_t addr = (uint16_t)mp_obj_get_int(addr_obj);
+    for (int i = 0; i < call_hook_count; i++) {
+        if (call_hook_addrs[i] == addr) {
+            call_hook_count--;
+            call_hook_addrs[i]   = call_hook_addrs[call_hook_count];
+            call_hook_fns[i]     = call_hook_fns[call_hook_count];
+            call_hook_enabled[i] = call_hook_enabled[call_hook_count];
+            call_hook_fns[call_hook_count] = MP_OBJ_NULL; /* release GC ref */
+            break;
+        }
+    }
+    if (call_hook_count == 0) {
+        msx_state.cpu.call_hook = NULL;
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_clear_call_hook_obj, msx_py_clear_call_hook);
+
+/* -----------------------------------------------------------------------
+ * msx.set_call_hook_enabled(address: int, enabled: bool)
+ * Enables or disables a registered hook without unregistering it.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_set_call_hook_enabled(mp_obj_t addr_obj, mp_obj_t enabled_obj) {
+    uint16_t addr = (uint16_t)mp_obj_get_int(addr_obj);
+    bool enabled = mp_obj_is_true(enabled_obj);
+    for (int i = 0; i < call_hook_count; i++) {
+        if (call_hook_addrs[i] == addr) {
+            call_hook_enabled[i] = enabled;
+            break;
+        }
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(msx_py_set_call_hook_enabled_obj, msx_py_set_call_hook_enabled);
+
+/* -----------------------------------------------------------------------
  * msx.reset()
  * ----------------------------------------------------------------------- */
 static mp_obj_t msx_py_reset(void) {
     msx_reset(&msx_state);
+    call_hook_relink();
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_reset_obj, msx_py_reset);
@@ -978,6 +1105,10 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init),                   MP_ROM_PTR(&msx_py_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_reset),                  MP_ROM_PTR(&msx_py_reset_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_ready),               MP_ROM_PTR(&msx_py_is_ready_obj) },
+    /* CALL/RST hooks */
+    { MP_ROM_QSTR(MP_QSTR_set_call_hook),          MP_ROM_PTR(&msx_py_set_call_hook_obj) },
+    { MP_ROM_QSTR(MP_QSTR_clear_call_hook),        MP_ROM_PTR(&msx_py_clear_call_hook_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_call_hook_enabled),  MP_ROM_PTR(&msx_py_set_call_hook_enabled_obj) },
     /* ROM management */
     { MP_ROM_QSTR(MP_QSTR_load_bios),              MP_ROM_PTR(&msx_py_load_bios_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_bios_view),          MP_ROM_PTR(&msx_py_get_bios_view_obj) },

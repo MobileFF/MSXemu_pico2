@@ -181,6 +181,15 @@ static inline void cond_jump(z80* const z, bool condition) {
 
 // calls to next word in memory
 static inline void call(z80* const z, uint16_t addr) {
+  if (z->call_hook && z->call_hook(z->userdata, addr)) {
+    // Intercepted: skip the push+jump entirely. The instruction's own
+    // opcode/operand bytes were already consumed (by nextw()/the RST
+    // dispatch) before call() was reached, so z->pc is already sitting on
+    // the instruction right after the CALL/RST — execution just falls
+    // through to it, as if the hooked "subroutine" ran and returned
+    // instantly.
+    return;
+  }
   pushw(z, z->pc);
   z->pc = addr;
   z->mem_ptr = addr;
@@ -707,6 +716,7 @@ void z80_init(z80* const z) {
   z->write_byte = NULL;
   z->port_in = NULL;
   z->port_out = NULL;
+  z->call_hook = NULL;
   z->userdata = NULL;
 
   z->cyc = 0;

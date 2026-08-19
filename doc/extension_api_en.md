@@ -89,6 +89,26 @@ Runs one full frame's worth (~59659 T-states, 60fps) of Z80 execution, VDP scanl
 
 ---
 
+## CALL/RST Hooks
+
+Intercepts the Z80 the instant it's about to execute a `CALL`/conditional-`CALL`/`RST` targeting a specific address, and calls a Python callback instead. Useful for replacing part of the BIOS with a native implementation, tracing calls to a specific routine, and similar uses. When a hook fires, the normal `CALL`/`RST` (pushing the return address and jumping) is skipped entirely — the callback is responsible for putting the machine in whatever state the replaced subroutine would have left it in (registers, memory, etc.), as if it had already run and returned.
+
+This project's sibling PB-1000 emulator (HD61700 CPU) has the same kind of mechanism, but the HD61700 has no dedicated `CALL`-equivalent opcode (BASIC's `CALL` there is just push+JP), so it has to check on every single instruction fetch. The Z80 has real `CALL`/`RST` instructions, so this only needs to check right when one of those actually executes — no per-instruction overhead.
+
+### `msx.set_call_hook(address: int, callable)`
+
+Registers `callable` to be invoked (with no arguments) every time a `CALL`/`RST` targeting `address` would execute (replaces any existing hook at the same address). Up to 16 hooks can be registered at once (`CALL_HOOK_MAX`). Registrations survive `msx.reset()`/`msx.init()` — internally, the hook table lives entirely on the Python-binding side and the C-side callback pointer is automatically re-linked afterward.
+
+### `msx.clear_call_hook(address: int)`
+
+Unregisters the hook at `address`, if any.
+
+### `msx.set_call_hook_enabled(address: int, enabled: bool)`
+
+Temporarily enables or disables a registered hook without unregistering it.
+
+---
+
 ## Clock Tuning
 
 ### `msx.boost_peri_clock()`

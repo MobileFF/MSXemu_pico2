@@ -11,6 +11,18 @@ struct z80 {
   void (*write_byte)(void*, uint16_t, uint8_t);
   uint8_t (*port_in)(z80*, uint8_t);
   void (*port_out)(z80*, uint8_t, uint8_t);
+  // Optional CALL/RST hook (NULL by default — zero overhead when unused).
+  // Called with (userdata, target address) whenever a CALL nn, a
+  // conditional CALL cc,nn whose condition is true, or an RST n
+  // instruction is about to execute — i.e. every place that would
+  // otherwise push the return address and jump. Returning true intercepts
+  // the call entirely: the push and jump are both skipped, so execution
+  // just continues at the instruction after the CALL/RST, as if the
+  // "subroutine" the hook implements had already run and returned.
+  // Returning false executes the CALL/RST normally. This is a project
+  // addition (not part of upstream superzazu/z80) — see msx's
+  // set_call_hook()/clear_call_hook() Python API.
+  bool (*call_hook)(void*, uint16_t);
   void* userdata;
 
   unsigned long cyc; // cycle count (t-states)
