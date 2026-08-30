@@ -615,9 +615,33 @@ uint8_t *msx_cart_alloc(msx_state_t *msx, uint8_t slot, uint32_t size) {
     if (!msx->initialized || slot > 1 || size == 0 || size > MSX_CART_MAX_SIZE) {
         return NULL;
     }
-    msx_eject_cart(msx, slot);
-    msx->cart[slot] = (uint8_t *)malloc(size);
-    if (!msx->cart[slot]) return NULL;
+    /* Deliberately NOT msx_eject_cart(msx, slot) here — that would free()
+     * cart[slot], which is exactly the malloc()/free() cycle this
+     * function exists to avoid (see cart_alloc_cap[]'s comment in
+     * msx_core.h). Do the same paged-mode cleanup msx_eject_cart() does,
+     * minus touching cart[]/cart_alloc_cap[]; msx_load_cart_paged() still
+     * calls the real msx_eject_cart() when switching a slot *to* paged
+     * mode, which correctly frees this buffer since it's genuinely not
+     * needed in that mode. */
+    free(msx->cart_cache[slot]);
+    msx->cart_cache[slot] = NULL;
+    msx->cart_paged[slot] = false;
+    for (int i = 0; i < 4; i++) msx->cart_cache_page[slot][i] = -1;
+
+    if (!(msx->cart[slot] && msx->cart_alloc_cap[slot] >= size)) {
+        /* No existing block, or it's too small — round small carts up to
+         * MSX_CART_INRAM_MAX so this capacity, once established, covers
+         * every future in-RAM cart on this slot (the common case: nothing
+         * bigger than that is ever routed here — see MSX_CART_INRAM_MAX's
+         * comment). Bigger requests (rare/unused in practice) just get
+         * exactly what they ask for, no reuse benefit either way. */
+        uint32_t new_cap = (size <= MSX_CART_INRAM_MAX) ? MSX_CART_INRAM_MAX : size;
+        uint8_t *fresh = (uint8_t *)malloc(new_cap);
+        if (!fresh) return NULL;
+        free(msx->cart[slot]);
+        msx->cart[slot] = fresh;
+        msx->cart_alloc_cap[slot] = new_cap;
+    }
     msx->cart_size[slot] = size;
     return msx->cart[slot];
 }
@@ -693,8 +717,15 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
  * ----------------------------------------------------------------------- */
 void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     if (slot > 1) return;
+    /* Genuinely frees cart[slot] (unlike msx_cart_alloc()'s own internal
+     * cleanup, which deliberately keeps reusing this block across swaps —
+     * see cart_alloc_cap[]'s comment in msx_core.h). Called here for a
+     * real "nothing loaded" state and by msx_load_cart_paged() when a
+     * slot switches *to* paged mode, where this buffer genuinely isn't
+     * needed any more. */
     free(msx->cart[slot]);
-    msx->cart[slot]      = NULL;
+    msx->cart[slot]         = NULL;
+    msx->cart_alloc_cap[slot] = 0;
     free(msx->cart_cache[slot]);
     msx->cart_cache[slot] = NULL;
     msx->cart_paged[slot] = false;

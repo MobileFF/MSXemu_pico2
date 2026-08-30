@@ -65,6 +65,14 @@
 #define MSX_BIOS_SIZE       0x8000u   /* 32KB BIOS/BASIC in slot 0 */
 #define MSX_RAM_SIZE        0x10000u  /* 64KB RAM in slot 3 */
 #define MSX_CART_MAX_SIZE   0x80000u  /* 512KB max cart ROM */
+/* Matches msx_menu.py's _CART_INRAM_MAX — the Python side already refuses
+ * to route anything bigger than this through msx_cart_alloc() (it goes
+ * through the paged Mega ROM path instead), so this is a real, exact
+ * upper bound, not a guess. msx_cart_alloc() always mallocs at least this
+ * much capacity the first time slot 0 is used, then reuses that same
+ * block for every later cart <= this size — see cart_alloc_cap[] above
+ * and msx_cart_alloc()'s comment in msx_core.c. */
+#define MSX_CART_INRAM_MAX  0x8000u   /* 32KB */
 #define MSX_VRAM_SIZE       0x4000u   /* 16KB TMS9918A VRAM (vrEmuTms9918's own buffer) */
 
 /* -----------------------------------------------------------------------
@@ -138,6 +146,20 @@ typedef struct {
     uint8_t  bios[MSX_BIOS_SIZE];        /* slot 0 (32KB) */
     uint8_t  ram[MSX_RAM_SIZE];          /* slot 3 (64KB) */
     uint8_t *cart[2];                    /* slot 1, slot 2 (heap-allocated, full-ROM mode) */
+    /* 2026-08-31: capacity currently malloc'd at cart[slot] (>= cart_size
+     * below) — msx_cart_alloc() keeps reusing this block across cart
+     * swaps within the same slot rather than free()ing and re-malloc()ing
+     * every time (msx_eject_cart() leaves it in place). Repeated
+     * malloc()/free() cycles on the small (64KB) MICROPY_C_HEAP_SIZE heap
+     * were observed on real hardware to fail a 32KB allocation with
+     * plenty of nominal free space, because nothing else on that heap
+     * ever moves to defragment it (same non-compacting-allocator lesson
+     * this project already hit on the separate MicroPython GC heap for
+     * BIOS/cart loading — see msx_cart_alloc()'s comment in msx_core.c
+     * for why a *static* buffer, tried first, isn't the fix either: it
+     * grows msx_state_t's static footprint, which starves the GC heap
+     * the exact same way a bigger C heap reservation did). */
+    uint32_t cart_alloc_cap[2];
     uint32_t cart_size[2];
     uint8_t  cart_type[2];               /* MSX_MAPPER_* */
     uint8_t  cart_bank[2][4];            /* active 8KB-page per window (ASCII8/Konami) */

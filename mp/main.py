@@ -88,6 +88,7 @@ except ImportError:
     _usb_ready = False
 
 from msx_keymap import apply_hid_report, HID_F5, HID_F7, HID_F8, MOD_LGUI, MOD_RGUI
+from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
                         save_state_to, load_state_from, load_cart_smart,
                         set_display_state, readinto_chunked)
@@ -107,6 +108,10 @@ SPI_BAUD = 62_500_000   # 62.5 MHz = clk_peri(250MHz)/4 — the highest clean ra
                         # there's no achievable rate between them since the SPI clock
                         # divider only produces even divisors of clk_peri). Verified safe
                         # on both panels below.
+                        # 2026-08-27: lowering this to 20MHz on the second board did NOT
+                        # fix its SD/LCD instability — ruled out as an SPI signal-
+                        # integrity margin issue. See project notes for the ongoing
+                        # investigation.
 
 # Panel size — selects how msx.init_display_hardware() centers the native
 # 256x192 image (no scaling; see main.py's render_to_display_1to1()
@@ -141,7 +146,29 @@ SD_MOSI_PIN = 11
 SD_SCK_PIN  = 10
 SD_MISO_PIN = 12
 SD_CS_PIN   = 15
-SD_INIT_BAUD = 400_000
+SD_INIT_BAUD = 400_000    # SD spec's mandatory low-speed handshake rate —
+                          # sdcard.py's init_card() already hardcodes this
+                          # itself for that handshake regardless of what's
+                          # passed in here; this constant only seeds the
+                          # initial machine.SPI() constructor call, which
+                          # init_card() immediately overrides anyway.
+# 2026-08-29: SDCard()'s own baudrate= parameter (used for every
+# readblocks()/writeblocks() data transfer, NOT just the handshake — see
+# sdcard.py) used to be given SD_INIT_BAUD too, meaning every SD block
+# read/write ran at 400kHz. Split out as its own constant so the handshake
+# rate and the data rate can be tuned independently.
+#
+# First attempt (20MHz) made SD mounting fail outright ("timeout waiting
+# for response" from readinto(), in uos.mount()'s very first readblocks()
+# call reading the filesystem header) — on real hardware. The 62.5MHz
+# proven stable for the *LCD* on this same bus says nothing about what the
+# *SD card* itself can tolerate: an LCD controller and an SD card in SPI
+# mode have very different input timing margins, so "the bus already runs
+# this fast for something else" is not evidence it's safe for the card.
+# 4MHz is a deliberately conservative starting point (still 10x the
+# previous 400kHz) — raise it later only after confirming reads are
+# reliable at this rate first.
+SD_DATA_BAUD = 4_000_000
 
 AUDIO_PIN    = 14
 
@@ -173,7 +200,7 @@ def mount_sd():
                               miso=machine.Pin(SD_MISO_PIN))
         sd_cs = machine.Pin(SD_CS_PIN, machine.Pin.OUT, value=1)
         sd = sdcard.SDCard(sd_spi, sd_cs,
-                           baudrate=SD_INIT_BAUD,
+                           baudrate=SD_DATA_BAUD,
                            restore_baudrate=SPI_BAUD)
         uos.mount(sd, '/sd')
         print("SD mounted at /sd")
@@ -312,6 +339,15 @@ _display_mode = 'both'   # 'both' | 'lcd' | 'hdmi' — see HDMI Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via config.txt: hdmi_baud=15000000
 
+# Set once in run() right after display init, from the same values passed to
+# msx.init_display_hardware() — kept around so poll_keyboard()'s menu-crash
+# recovery path (see the OSError handler around show_emulator_menu()) can
+# re-run that same call to try to unstick the LCD after an SD I/O error
+# leaves it frozen, without needing run()'s locals.
+_lcd_w = 0
+_lcd_h = 0
+_rotate_180 = False
+
 def _init_hdmi_output():
     """Callback for the HDMI Settings menu — see msx_menu.show_emulator_menu().
     Called the moment HDMI is turned on live from Off (e.g. config.txt had
@@ -352,11 +388,74 @@ def poll_keyboard():
     # Edge-triggered so holding the combo doesn't reopen the menu.
     menu_down = (mod & (MOD_LGUI | MOD_RGUI)) != 0 and HID_F7 in kc
     if menu_down and not _menu_held:
-        hdmi_state = show_emulator_menu(
-            msx, usb_host, ROM_DIR, {_bios_name}, SAVE_PATH, CONFIG_PATH,
-            hdmi_state={'enabled': _hdmi_enabled, 'display': _display_mode,
-                        'frame_skip': _hdmi_frame_skip},
-            init_hdmi_output=_init_hdmi_output)
+        # 2026-08-29: poll_keyboard() (this function) is deliberately called
+        # from run()'s main loop *while the current frame's LCD DMA transfer
+        # is still in flight* (started by render_to_display_1to1() just
+        # before this call, not waited-for via wait_display() until after —
+        # see the "Poll USB keyboard... while DMA runs" comment there). If
+        # GUI+F7 lands in that window, show_emulator_menu()'s very first
+        # draw (_draw_runtime_menu() -> MenuCanvas.flush() ->
+        # render_to_display_1to1()) reconfigures and restarts the *same*
+        # DMA channel/SPI peripheral without msx_render_to_display_1to1()
+        # ever checking whether the previous transfer actually finished —
+        # a real, timing-dependent race, independent of which physical
+        # board is running this firmware (matches: swapping boards didn't
+        # change the failure rate). Settle the in-flight transfer here,
+        # before the menu can touch the bus at all, at the (rare) cost of
+        # a wait_display() the pipeline was specifically trying to avoid —
+        # only on the GUI+F7 path, not every frame.
+        msx.wait_display()
+        # Safety net: show_emulator_menu() already catches OSError around
+        # most of its own SD access, but an unhandled OSError from *some*
+        # path inside it (still being tracked down — see 2026-08-29
+        # troubleshooting notes) was observed on real hardware to kill this
+        # whole run() loop, ending the game session over what should be a
+        # recoverable SD hiccup. Catch broadly here as a last resort, and
+        # log the full traceback to the Pico's *internal flash* (not /sd —
+        # logging to the same card that just failed would be circular, and
+        # serial output has repeatedly shown dropped/garbled characters —
+        # sometimes whole lines — on this hardware during this
+        # investigation, so a clean file is more trustworthy than trusting
+        # what scrolled by on the terminal). Retrieve with:
+        #   mpremote cp :crashlog.txt .
+        try:
+            hdmi_state = show_emulator_menu(
+                msx, usb_host, ROM_DIR, {_bios_name}, SAVE_PATH, CONFIG_PATH,
+                hdmi_state={'enabled': _hdmi_enabled, 'display': _display_mode,
+                            'frame_skip': _hdmi_frame_skip},
+                init_hdmi_output=_init_hdmi_output)
+        except Exception as e:
+            print(f"Menu crashed: {e!r} — resuming gameplay")
+            try:
+                import sys
+                with open('/crashlog.txt', 'w') as _f:
+                    sys.print_exception(e, _f)
+            except Exception as log_e:
+                print(f"(also failed to write /crashlog.txt: {log_e!r})")
+            # Observed on real hardware (2026-08-29): after this exact
+            # OSError, gameplay resumes but the LCD never draws again —
+            # whatever the failed SD transaction left the shared SPI1
+            # peripheral in, msx_render_to_display_1to1()'s lightweight
+            # per-frame reconfigure (baudrate/format/DMA-enable bits only,
+            # see its comment in msx_core.c) isn't enough to recover from.
+            # msx.init_display_hardware() re-runs the LCD's own full panel
+            # init sequence (SWRESET etc.) — a real recovery attempt, not
+            # guaranteed to fix a wedged SPI *peripheral* specifically
+            # (it deliberately avoids the hardware spi_init() reset, to
+            # not pull the rug out from under the SD driver's own SPI
+            # object — see that function's comment), but cheap to try
+            # before giving up on the display for the rest of the session.
+            if _lcd_w:
+                try:
+                    msx.init_display_hardware(
+                        SPI_ID, SPI_BAUD, SPI_MOSI, SPI_SCK,
+                        SPI_CS, SPI_DC, SPI_RST, SPI_BL,
+                        _lcd_w, _lcd_h, _rotate_180)
+                    print("Display re-init attempted after menu crash")
+                except Exception as disp_e:
+                    print(f"Display re-init also failed: {disp_e!r}")
+            hdmi_state = {'enabled': _hdmi_enabled, 'display': _display_mode,
+                          'frame_skip': _hdmi_frame_skip}
         _hdmi_enabled    = hdmi_state['enabled']
         _display_mode    = hdmi_state['display']
         _hdmi_frame_skip = hdmi_state['frame_skip']
@@ -459,6 +558,8 @@ def run():
         SPI_CS, SPI_DC, SPI_RST, SPI_BL,
         lcd_w, lcd_h, rotate_180
     )
+    global _lcd_w, _lcd_h, _rotate_180
+    _lcd_w, _lcd_h, _rotate_180 = lcd_w, lcd_h, rotate_180
 
     # 5.1 — Optional HDMI bridge output (hdmi_bridge/README.md). Must come
     #       after init_display_hardware() (reuses its SPI1 instance). Off
@@ -589,6 +690,11 @@ def run():
         msx.set_audio_filter(int(cfg.get('audio_filter', 0)))
     except (ValueError, TypeError) as e:
         print(f"Bad volume/audio_filter in config.txt: {e}")
+
+    # 8.5 — Load /sd/msx/ext/ and /ext/ extension modules (CALL/RST hook
+    # plugins — see mp/msx_ext.py and doc/extension_api.md). Runs before
+    # reset() so any hooks are already in place when the machine starts.
+    load_extensions(msx)
 
     # 9 — Reset and start
     msx.reset()

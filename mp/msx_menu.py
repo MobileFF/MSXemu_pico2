@@ -13,6 +13,7 @@ Use the rgb() helper below for all colors.
 
 import uos
 import framebuf
+import time
 
 try:
     import msx as _msx
@@ -52,6 +53,7 @@ C_RED    = rgb(220, 0,   0)
 
 _display_mode = 'both'
 _hdmi_enabled = False
+_lcd_suspended = False
 
 
 def set_display_state(display_mode, hdmi_enabled):
@@ -74,10 +76,23 @@ def hdmi_suspend():
     if no LCD is actually wired, and HDMI output resumes automatically as
     soon as hdmi_resume() is called. Returns the previous _hdmi_enabled
     value; pass it to hdmi_resume() when the SD-heavy operation is done.
+
+    Every caller used to fall straight into its SD access the instant this
+    returned, but flipping _hdmi_enabled only stops the next HDMI frame
+    from being sent; it does nothing about a frame whose blocking SPI send
+    was still in flight (or had just finished) the moment this was called.
+    The mode-0 switch the SD driver performs right after then lands with
+    zero settling time in that case, which is exactly the same-peripheral
+    SPI mode switching hazard documented in msx_core.c. A short pause
+    here, before the caller ever touches the SD card, costs nothing during
+    normal menu use and gives that in-flight activity (and the peripheral
+    itself) a moment to settle first.
     """
     global _hdmi_enabled
     prev = _hdmi_enabled
     _hdmi_enabled = False
+    if prev:
+        time.sleep_ms(20)
     return prev
 
 
@@ -85,6 +100,42 @@ def hdmi_resume(prev_enabled):
     """Restore the _hdmi_enabled value hdmi_suspend() returned."""
     global _hdmi_enabled
     _hdmi_enabled = prev_enabled
+
+
+def lcd_suspend():
+    """Temporarily disable LCD rendering (MenuCanvas.flush() no-ops its
+    render_to_display_1to1()/wait_display() calls while this is set)
+    around an SD-heavy operation, mirroring hdmi_suspend() above.
+
+    2026-08-29: added while chasing a real-hardware OSError EIO from SD
+    reads that reproduces on the very first SD touch after a stretch of
+    LCD-only rendering (confirmed independent of HDMI — the same EIO
+    reproduces with hdmi=0, where HDMI's SPI mode 3 never gets used at
+    all, so this isn't the already-known HDMI mode-switch hazard).
+    MenuCanvas.flush() already calls msx.wait_display() after every LCD
+    render, so an in-flight DMA transfer specifically isn't the
+    mechanism — but nothing previously stopped a *fresh* LCD render from
+    starting again right up until the moment SD is touched. This — plus
+    the same short settling pause hdmi_suspend() uses — is a real,
+    previously-untried experiment for that gap, not a confirmed fix.
+
+    Returns the previous _lcd_suspended value; pass it to lcd_resume()
+    when the SD-heavy operation is done. Doesn't touch _display_mode, so
+    HDMI (if enabled) keeps rendering independently — only the LCD side
+    goes quiet for the duration.
+    """
+    global _lcd_suspended
+    prev = _lcd_suspended
+    _lcd_suspended = True
+    if not prev:
+        time.sleep_ms(20)
+    return prev
+
+
+def lcd_resume(prev_suspended):
+    """Restore the _lcd_suspended value lcd_suspend() returned."""
+    global _lcd_suspended
+    _lcd_suspended = prev_suspended
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +185,15 @@ class MenuCanvas:
         # all and the screen would freeze with no way to see what's
         # happening, even though the emulator keeps running (found on real
         # hardware navigating this exact menu).
+        #
+        # `and not _lcd_suspended` is the LCD-side counterpart to
+        # `_hdmi_enabled` above — see lcd_suspend()'s docstring. Note this
+        # means an SD-heavy action performed with HDMI unusable (off, or
+        # display=lcd) goes fully blank for that brief window instead of
+        # falling back to anything: there is nothing left to fall back to
+        # once LCD itself is the side being suspended.
         use_hdmi = _hdmi_enabled and _display_mode in ('both', 'hdmi')
-        use_lcd  = _display_mode in ('both', 'lcd') or not use_hdmi
+        use_lcd  = (_display_mode in ('both', 'lcd') or not use_hdmi) and not _lcd_suspended
         if use_lcd:
             self._msx.render_to_display_1to1()
             self._msx.wait_display()
@@ -201,7 +259,25 @@ def _draw_file_list(canvas, title, items, selected, scroll):
     canvas.flush()
 
 
+_last_printed_msg = None
+
+
+def _echo_msg(msg):
+    """Print `msg` to the REPL/serial console the first time it's seen
+    (not on every redraw of the same screen, since these draw functions
+    get called repeatedly while a message stays on screen). The LCD's
+    small font truncates messages (canvas.text(msg[:31], ...) below and
+    in _draw_runtime_menu()/_draw_audio_settings()/_draw_hdmi_settings()),
+    so a long error (e.g. a full OSError's text) is otherwise only ever
+    partially readable on-screen."""
+    global _last_printed_msg
+    if msg and msg != _last_printed_msg:
+        print(f"MENU: {msg}")
+    _last_printed_msg = msg
+
+
 def _draw_message(canvas, title, line1, line2="", color=C_WHITE):
+    _echo_msg(f"{line1} {line2}".strip() if line2 else line1)
     canvas.clear(C_BLACK)
     canvas.rect(0, 0, canvas.W, 12, C_CYAN, fill=True)
     canvas.text(title[:31], 2, 2, C_BLACK)
@@ -463,11 +539,15 @@ def load_cart_smart(msx_module, slot, path):
         # was observed to be unreliable on real hardware.
         view = msx_module.cart_alloc(slot, size)
         if view is None:
-            return False
+            # 2026-08-29: was a silent `return False` — collapsed into the
+            # same generic "load_cart() failed" message as every other
+            # failure mode here, with no way to tell a C-heap allocation
+            # failure apart from a short SD read from the caller's message.
+            raise RuntimeError(f"cart_alloc({size} bytes) failed (C heap exhausted/fragmented?)")
         with open(path, 'rb') as f:
             n = readinto_chunked(f, view, size)
         if n != size:
-            return False
+            raise RuntimeError(f"short read: got {n}/{size} bytes from {path}")
         return msx_module.cart_finalize(slot)
 
     if not _flash_cache_valid(path, size):
@@ -531,12 +611,15 @@ def select_rom(msx_module, directory, title="Select ROM",
     """
     import time
 
-    # HDMI suspended only around the actual SD directory listing — the
+    # HDMI/LCD suspended only around the actual SD directory listing — the
     # interactive browsing loop below just redraws the already-fetched
-    # `items` list from RAM (no further SD access per keypress), so HDMI
-    # stays on throughout browsing. See hdmi_suspend()'s comment.
+    # `items` list from RAM (no further SD access per keypress), so both
+    # stay on throughout browsing. See hdmi_suspend()/lcd_suspend()'s
+    # comments.
     _prev_hdmi = hdmi_suspend()
+    _prev_lcd  = lcd_suspend()
     items = _list_roms(directory, exclude_names=exclude_names)
+    lcd_resume(_prev_lcd)
     hdmi_resume(_prev_hdmi)
     canvas = MenuCanvas(msx_module)
 
@@ -635,6 +718,7 @@ _FRAME_SKIP_MAX = 8
 
 
 def _draw_runtime_menu(canvas, cursor, msg=""):
+    _echo_msg(msg)
     canvas.clear(C_BLACK)
     canvas.rect(0, 0, canvas.W, 12, C_YELLOW, fill=True)
     canvas.text("EMULATOR MENU", 2, 2, C_BLACK)
@@ -657,6 +741,7 @@ def _draw_runtime_menu(canvas, cursor, msg=""):
 
 
 def _draw_audio_settings(canvas, cursor, volume, filt, msg=""):
+    _echo_msg(msg)
     canvas.clear(C_BLACK)
     canvas.rect(0, 0, canvas.W, 12, C_YELLOW, fill=True)
     canvas.text("AUDIO SETTINGS", 2, 2, C_BLACK)
@@ -741,6 +826,7 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
 
 
 def _draw_hdmi_settings(canvas, cursor, state, msg=""):
+    _echo_msg(msg)
     canvas.clear(C_BLACK)
     canvas.rect(0, 0, canvas.W, 12, C_YELLOW, fill=True)
     canvas.text("HDMI SETTINGS", 2, 2, C_BLACK)
@@ -908,12 +994,26 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # directory listing and resumes it for interactive
                 # browsing (no SD access happens per-keypress there), so
                 # HDMI can stay on for this call.
-                selected = select_rom(msx_module, rom_dir,
-                                      title="Select Cartridge ROM",
-                                      usb_host_mod=usb_host_mod,
-                                      auto_if_one=False,
-                                      timeout_ms=0,
-                                      exclude_names=exclude_names)
+                #
+                # Unlike every other SD-touching action in this menu,
+                # select_rom()'s own uos.listdir(rom_dir) used to be called
+                # completely unguarded — on marginal SD hardware this can
+                # raise OSError (seen in the field as [Errno 5] EIO), which
+                # then propagated all the way out of show_emulator_menu()
+                # and killed the whole run() loop (game session lost) for
+                # what should be a recoverable "SD hiccup, try again" case.
+                listdir_failed = False
+                try:
+                    selected = select_rom(msx_module, rom_dir,
+                                          title="Select Cartridge ROM",
+                                          usb_host_mod=usb_host_mod,
+                                          auto_if_one=False,
+                                          timeout_ms=0,
+                                          exclude_names=exclude_names)
+                except OSError as e:
+                    selected = None
+                    listdir_failed = True
+                    msg = f"Directory listing failed: {e}"
                 if selected:
                     # HDMI suspended from the moment a file is picked until
                     # the load finishes (success or not) — the "Loading…"
@@ -923,7 +1023,11 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                     # hdmi_suspend()'s comment); does NOT force LCD mode,
                     # so a display=hdmi (no LCD) setup keeps working the
                     # same way, just without a picture during this window.
+                    # LCD suspended too (lcd_suspend()) — see its docstring;
+                    # both outputs go quiet for this window (no picture on
+                    # either until it resumes), not just HDMI.
                     _prev_hdmi = hdmi_suspend()
+                    _prev_lcd  = lcd_suspend()
                     try:
                         # SD reads of cart-sized files take a visible moment
                         # (shared bus with the LCD) — without this, the screen
@@ -955,8 +1059,9 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                             # cart-sized read) are both real possibilities.
                             msg = f"Load failed: {e}"
                     finally:
+                        lcd_resume(_prev_lcd)
                         hdmi_resume(_prev_hdmi)
-                else:
+                elif not listdir_failed:
                     msg = ""
 
             elif label == "Save State":
@@ -965,8 +1070,10 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # suspended for the duration (see hdmi_suspend()'s
                 # comment — a sustained ~64KB SD write is exactly the
                 # kind of SD access that's unreliable soon after an
-                # HDMI-mode draw); does not force LCD mode.
+                # HDMI-mode draw); does not force LCD mode. LCD suspended
+                # too (lcd_suspend()) — see its docstring.
                 _prev_hdmi = hdmi_suspend()
+                _prev_lcd  = lcd_suspend()
                 _draw_runtime_menu(canvas, cursor, "Saving…")
                 try:
                     save_state_to(msx_module, save_path)
@@ -974,13 +1081,16 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 except Exception as e:
                     msg = f"Save failed: {e}"
                 finally:
+                    lcd_resume(_prev_lcd)
                     hdmi_resume(_prev_hdmi)
 
             elif label == "Load State":
                 # Reading ~64KB from SD takes a couple of seconds — same
                 # as above, show feedback instead of an apparent freeze,
-                # and same HDMI-suspend-during-SD-access reasoning.
+                # and same HDMI-suspend-during-SD-access reasoning. LCD
+                # suspended too (lcd_suspend()) — see its docstring.
                 _prev_hdmi = hdmi_suspend()
+                _prev_lcd  = lcd_suspend()
                 _draw_runtime_menu(canvas, cursor, "Loading…")
                 try:
                     ok = load_state_from(msx_module, save_path)
@@ -988,6 +1098,7 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 except Exception as e:
                     msg = f"Load failed: {e}"
                 finally:
+                    lcd_resume(_prev_lcd)
                     hdmi_resume(_prev_hdmi)
 
             elif label == "Audio Settings":
@@ -1016,20 +1127,35 @@ def load_config(config_path):
     Example /sd/msx/config.txt:
         bios=/sd/msx/MSX.ROM
         cart=/sd/msx/MySoftware.ROM
+
+    Retries a few times on OSError before giving up: on marginal SD
+    hardware, open()/read() can fail transiently, and this file is read
+    once at boot before anything else has "warmed up" the SPI bus. A
+    silent failure here used to be indistinguishable from "no config.txt
+    exists" — the caller would fall back to defaults (e.g. bios=MSX.ROM)
+    with no indication that a perfectly valid bios= line was actually
+    sitting unread on the card. Log loudly instead so that scenario is
+    diagnosable from the boot log alone.
     """
     cfg = {}
-    try:
-        with open(config_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    k, _, v = line.partition('=')
-                    cfg[k.strip().lower()] = v.strip()
-    except OSError:
-        pass
-    return cfg
+    last_err = None
+    for attempt in range(3):
+        cfg = {}
+        try:
+            with open(config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        k, _, v = line.partition('=')
+                        cfg[k.strip().lower()] = v.strip()
+            return cfg
+        except OSError as e:
+            last_err = e
+            time.sleep_ms(50)
+    print(f"WARNING: could not read {config_path} after 3 attempts ({last_err}) — using defaults")
+    return {}
 
 
 def save_config(config_path, updates):
