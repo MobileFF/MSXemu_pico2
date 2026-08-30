@@ -990,24 +990,58 @@ static mp_obj_t msx_py_debug_step(mp_obj_t n_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_debug_step_obj, msx_py_debug_step);
 
 /* -----------------------------------------------------------------------
- * Debug: msx.debug_cpu() -> (pc, sp, a, f, cyc, halted, iff1, int_mode)
+ * Debug: msx.debug_cpu() ->
+ *   (pc, sp, a, f, bc, de, hl, ix, iy, cyc, halted, iff1, int_mode)
+ * The first 9 fields are exactly msx.debug_set_cpu()'s argument list, in
+ * the same order — read, tweak what you need, write back.
  * ----------------------------------------------------------------------- */
 static mp_obj_t msx_py_debug_cpu(void) {
     msx_debug_cpu_t c;
     msx_debug_get_cpu(&msx_state, &c);
-    mp_obj_t items[8] = {
+    mp_obj_t items[13] = {
         mp_obj_new_int(c.pc),
         mp_obj_new_int(c.sp),
         mp_obj_new_int(c.a),
         mp_obj_new_int(c.f),
+        mp_obj_new_int(c.bc),
+        mp_obj_new_int(c.de),
+        mp_obj_new_int(c.hl),
+        mp_obj_new_int(c.ix),
+        mp_obj_new_int(c.iy),
         mp_obj_new_int(c.cyc),
         mp_obj_new_bool(c.halted),
         mp_obj_new_bool(c.iff1),
         mp_obj_new_int(c.int_mode),
     };
-    return mp_obj_new_tuple(8, items);
+    return mp_obj_new_tuple(13, items);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_debug_cpu_obj, msx_py_debug_cpu);
+
+/* -----------------------------------------------------------------------
+ * Debug: msx.debug_set_cpu(pc, sp, a, f, bc, de, hl, ix, iy)
+ * Writes registers back into the live CPU. Meant to be called from
+ * inside a msx.set_call_hook() callback (which otherwise has no way to
+ * see or affect the registers of the CALL/RST it just replaced) to leave
+ * behind whatever result the real subroutine would have — e.g. a return
+ * value in HL, a status flag in F. cyc/halted/iff1/int_mode are not
+ * settable here; see the interrupt-vector caveat in doc/extension_api.md.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_debug_set_cpu(size_t n_args, const mp_obj_t *args) {
+    (void)n_args; /* fixed at 9 via MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN below */
+    msx_debug_set_cpu(&msx_state,
+        (uint16_t)mp_obj_get_int(args[0]),  /* pc */
+        (uint16_t)mp_obj_get_int(args[1]),  /* sp */
+        (uint8_t) mp_obj_get_int(args[2]),  /* a  */
+        (uint8_t) mp_obj_get_int(args[3]),  /* f  */
+        (uint16_t)mp_obj_get_int(args[4]),  /* bc */
+        (uint16_t)mp_obj_get_int(args[5]),  /* de */
+        (uint16_t)mp_obj_get_int(args[6]),  /* hl */
+        (uint16_t)mp_obj_get_int(args[7]),  /* ix */
+        (uint16_t)mp_obj_get_int(args[8])); /* iy */
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_debug_set_cpu_obj, 9, 9,
+                                            msx_py_debug_set_cpu);
 
 /* -----------------------------------------------------------------------
  * Debug: msx.debug_peek(addr) -> byte
@@ -1017,6 +1051,43 @@ static mp_obj_t msx_py_debug_peek(mp_obj_t addr_obj) {
     return mp_obj_new_int(msx_debug_peek(&msx_state, addr));
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_debug_peek_obj, msx_py_debug_peek);
+
+/* -----------------------------------------------------------------------
+ * Debug: msx.debug_poke(addr, value) — writes one byte through the
+ * current slot mapping (same path as a Z80 write instruction). No-op if
+ * the mapped-in slot at that page is ROM (cartridge/BIOS), same as real
+ * hardware. Pairs with msx.debug_peek(); together they let a test script
+ * plant a tiny machine-code snippet directly into MSX RAM.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_debug_poke(mp_obj_t addr_obj, mp_obj_t value_obj) {
+    uint16_t addr = (uint16_t)mp_obj_get_int(addr_obj);
+    uint8_t value = (uint8_t)mp_obj_get_int(value_obj);
+    msx_mem_write(&msx_state, addr, value);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(msx_py_debug_poke_obj, msx_py_debug_poke);
+
+/* -----------------------------------------------------------------------
+ * Debug: msx.debug_get_slot() -> int / msx.debug_set_slot(value: int)
+ * Direct access to the PPI port A slot-select register (2 bits per 16KB
+ * page, page 0 = bits 0-1 .. page 3 = bits 6-7; 3 = RAM in this emulator,
+ * see MSX_RAM_SIZE's comment in msx_core.h). Right after msx.reset() this
+ * is 0 (every page mapped to BIOS ROM, matching real MSX cold-boot
+ * state) — BIOS itself maps RAM into page 3 during its own startup, but
+ * a test script driving the CPU directly via msx.debug_set_cpu()/
+ * msx.debug_step() without going through a real boot needs to do that
+ * itself before RAM (via debug_poke/get_ram_view) is reachable as code.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_debug_get_slot(void) {
+    return mp_obj_new_int(msx_state.slot_select);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_debug_get_slot_obj, msx_py_debug_get_slot);
+
+static mp_obj_t msx_py_debug_set_slot(mp_obj_t value_obj) {
+    msx_state.slot_select = (uint8_t)mp_obj_get_int(value_obj);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_debug_set_slot_obj, msx_py_debug_set_slot);
 
 /* -----------------------------------------------------------------------
  * Debug: msx.debug_spi_baud() -> actual Hz achieved by the last render
@@ -1160,7 +1231,11 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_get_vdp_reg),            MP_ROM_PTR(&msx_py_get_vdp_reg_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_step),             MP_ROM_PTR(&msx_py_debug_step_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_cpu),              MP_ROM_PTR(&msx_py_debug_cpu_obj) },
+    { MP_ROM_QSTR(MP_QSTR_debug_set_cpu),          MP_ROM_PTR(&msx_py_debug_set_cpu_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_peek),             MP_ROM_PTR(&msx_py_debug_peek_obj) },
+    { MP_ROM_QSTR(MP_QSTR_debug_poke),             MP_ROM_PTR(&msx_py_debug_poke_obj) },
+    { MP_ROM_QSTR(MP_QSTR_debug_get_slot),         MP_ROM_PTR(&msx_py_debug_get_slot_obj) },
+    { MP_ROM_QSTR(MP_QSTR_debug_set_slot),         MP_ROM_PTR(&msx_py_debug_set_slot_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_run_line),         MP_ROM_PTR(&msx_py_debug_run_line_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_spi_baud),         MP_ROM_PTR(&msx_py_debug_spi_baud_obj) },
     { MP_ROM_QSTR(MP_QSTR_debug_clocks),           MP_ROM_PTR(&msx_py_debug_clocks_obj) },

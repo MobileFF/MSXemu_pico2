@@ -93,6 +93,8 @@ Runs one full frame's worth (~59659 T-states, 60fps) of Z80 execution, VDP scanl
 
 Intercepts the Z80 the instant it's about to execute a `CALL`/conditional-`CALL`/`RST` targeting a specific address, and calls a Python callback instead. Useful for replacing part of the BIOS with a native implementation, tracing calls to a specific routine, and similar uses. When a hook fires, the normal `CALL`/`RST` (pushing the return address and jumping) is skipped entirely — the callback is responsible for putting the machine in whatever state the replaced subroutine would have left it in (registers, memory, etc.), as if it had already run and returned.
 
+**Where does control return to once the callback finishes?** The `CALL`/`RST` instruction's own opcode and operand bytes have already been read off PC by the time the hook check happens (fetched via `nextw()` etc.). Since an intercepted hook skips both the push and the jump entirely, once the Python callback returns, execution just continues from **the instruction immediately after the `CALL`/`RST`** — nothing ever touches the stack — exactly as if the real subroutine had run instantly and hit a `RET`. Since the caller was never left waiting on a return address it pushed, there's no need (and no reason) to manipulate `SP` via `msx.debug_set_cpu()` from inside the callback — doing so would just break things.
+
 This project's sibling PB-1000 emulator (HD61700 CPU) has the same kind of mechanism, but the HD61700 has no dedicated `CALL`-equivalent opcode (BASIC's `CALL` there is just push+JP), so it has to check on every single instruction fetch. The Z80 has real `CALL`/`RST` instructions, so this only needs to check right when one of those actually executes — no per-instruction overhead.
 
 ### `msx.set_call_hook(address: int, callable)`
@@ -106,6 +108,40 @@ Unregisters the hook at `address`, if any.
 ### `msx.set_call_hook_enabled(address: int, enabled: bool)`
 
 Temporarily enables or disables a registered hook without unregistering it.
+
+### Auto-loading extension modules (`mp/msx_ext.py`)
+
+Hook-based extensions don't require editing `main.py` — drop a file in `/sd/msx/ext/` or the onboard flash's `/ext/` and it's automatically loaded and activated at boot. Same design as the sibling PB-1000 emulator's `_ext_load_modules()`, just without the extra "RAM profile" priority tier PB-1000 has, since this emulator has no equivalent concept.
+
+At boot (after BIOS/cartridge loading, right before `msx.reset()`), `load_extensions(msx)` scans the following two directories in priority order and `__import__`s any `.py`/`.mpy` file found. If the module defines `register(msx)`, it's called.
+
+| Priority | Directory | Purpose |
+| :--- | :--- | :--- |
+| 1 (highest) | `/sd/msx/ext/` | Extensions on the SD card |
+| 2 | `/ext/` | Extensions on onboard flash |
+
+If the same module name exists in both, the `/sd/msx/ext/` copy is used and the `/ext/` one is ignored.
+
+Writing an extension (`/sd/msx/ext/myext.py`):
+
+```python
+CALL_ADDR = 0xC100   # whatever BIOS/game address you want to replace
+
+def register(msx):
+    def _hook():
+        pc, sp, a, f, bc, de, hl, ix, iy, cyc, halted, iff1, im = msx.debug_cpu()
+        # do whatever the replaced subroutine should do
+        # write back registers with msx.debug_set_cpu(...) if a caller
+        # expects a return value / status flag
+    msx.set_call_hook(CALL_ADDR, _hook)
+    print("myext: registered")
+```
+
+One extension failing to load (import error, or an exception inside `register()`) doesn't stop the others — it prints an error and moves on to the next module. See `mp/msx_ext.py` for the implementation.
+
+### Caveat: hooking an interrupt vector (e.g. `0x0038`)
+
+Discovered during hardware testing. A Z80 IM1 interrupt automatically disables interrupts the moment it's serviced, and only the handler's own trailing `EI` re-arms them for next time. Because this hook mechanism replaces the `CALL`/`RST` entirely (skipping both the push and the jump), hooking an interrupt vector (`0x0038` under IM1) skips the real handler's `EI` along with everything else — after that, interrupts never fire again system-wide, even after `msx.clear_call_hook()` or `msx.set_call_hook_enabled(False)`, since `msx.debug_set_cpu()` deliberately doesn't include `iff1` among the fields it can write, and there's no other way to re-issue `EI` from Python. This isn't a bug in the hook mechanism; it's an unavoidable consequence of fully replacing an interrupt handler under the Z80's own semantics. It does not apply to the normal use case of replacing a BIOS/game subroutine (e.g. swapping out `CHPUT`), unless that particular routine itself manipulates `EI`/`DI`. See `mp/test/test_call_hook_demo.py` for a working example that demonstrates (and explains) this exact behavior.
 
 ---
 
@@ -269,11 +305,23 @@ Executes `n` raw Z80 instructions with no VDP/audio/frame timing considered at a
 
 ### `msx.debug_cpu() -> tuple`
 
-Returns `(pc, sp, a, f, cyc, halted, iff1, int_mode)`. `cyc` is the T-state count elapsed in the current frame.
+Returns `(pc, sp, a, f, bc, de, hl, ix, iy, cyc, halted, iff1, int_mode)`. `cyc` is the T-state count elapsed in the current frame. The first 9 fields (`pc` through `iy`) are in the same order as `msx.debug_set_cpu()`'s arguments, so you can read, tweak a few, and write the whole thing straight back.
+
+### `msx.debug_set_cpu(pc, sp, a, f, bc, de, hl, ix, iy)`
+
+Writes registers back into the live CPU. A `msx.set_call_hook()` callback is invoked like any ordinary Python function — no arguments — so `msx.debug_cpu()` is the only way to see what registers the intercepted `CALL`/`RST` would have used, and this is the write-back counterpart: use it to leave behind whatever state the replaced subroutine should have (e.g. a return value in `HL`, a status flag in `F`). Typical pattern: read with `debug_cpu()`, change what you need, write the result back with `debug_set_cpu()`. `cyc`/`halted`/`iff1`/`int_mode` aren't settable here — see the interrupt-vector caveat above; poking `iff1` through an API like this wouldn't fix that anyway.
 
 ### `msx.debug_peek(addr: int) -> int`
 
 Reads one byte of the Z80 address space as currently mapped by `slot_select` (i.e. goes through slot mapping).
+
+### `msx.debug_poke(addr: int, value: int)`
+
+The write counterpart to `debug_peek()`. Writes one byte through the current `slot_select` mapping — the same path a real Z80 write instruction takes. Silently ignored if the mapped-in slot at that page is ROM (cartridge/BIOS), same as real hardware. Combine with `debug_peek()` to plant a small machine-code snippet directly into MSX RAM from a test script.
+
+### `msx.debug_get_slot() -> int` / `msx.debug_set_slot(value: int)`
+
+Direct read/write access to the slot-select register (the PPI port A equivalent): 2 bits per 16KB page, page 0 = bits 0-1 through page 3 = bits 6-7, and in this emulator value 3 means RAM. Right after `msx.reset()` this is 0 — every page mapped to BIOS ROM, matching real MSX cold-boot state. Normally the BIOS itself remaps page 3 to RAM during its own startup; a test script that drives the CPU directly via `msx.debug_set_cpu()`/`msx.debug_step()` without going through a real boot needs to set this itself before RAM (via `debug_poke`/`get_ram_view()`) is executable as code.
 
 ### `msx.debug_run_line(line: int, do_video: bool, do_audio: bool, do_int: bool)`
 

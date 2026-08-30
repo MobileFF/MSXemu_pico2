@@ -1398,6 +1398,11 @@ void msx_debug_get_cpu(const msx_state_t *msx, msx_debug_cpu_t *out) {
     out->f  = (uint8_t)((cpu->sf << 7) | (cpu->zf << 6) | (cpu->yf << 5) |
                         (cpu->hf << 4) | (cpu->xf << 3) | (cpu->pf << 2) |
                         (cpu->nf << 1) |  cpu->cf);
+    out->bc = (uint16_t)((cpu->b << 8) | cpu->c);
+    out->de = (uint16_t)((cpu->d << 8) | cpu->e);
+    out->hl = (uint16_t)((cpu->h << 8) | cpu->l);
+    out->ix = cpu->ix;
+    out->iy = cpu->iy;
     out->cyc = (uint32_t)cpu->cyc;
     out->halted = (uint8_t)cpu->halted;
     out->iff1   = (uint8_t)cpu->iff1;
@@ -1524,6 +1529,21 @@ static inline void _z80_unpack_f(z80 *cpu, uint8_t f) {
     cpu->pf = (f >> 2) & 1;
     cpu->nf = (f >> 1) & 1;
     cpu->cf =  f       & 1;
+}
+
+void msx_debug_set_cpu(msx_state_t *msx, uint16_t pc, uint16_t sp,
+                        uint8_t a, uint8_t f, uint16_t bc, uint16_t de,
+                        uint16_t hl, uint16_t ix, uint16_t iy) {
+    z80 *cpu = &msx->cpu;
+    cpu->pc = pc;
+    cpu->sp = sp;
+    cpu->a  = a;
+    _z80_unpack_f(cpu, f);
+    cpu->b = (uint8_t)(bc >> 8); cpu->c = (uint8_t)bc;
+    cpu->d = (uint8_t)(de >> 8); cpu->e = (uint8_t)de;
+    cpu->h = (uint8_t)(hl >> 8); cpu->l = (uint8_t)hl;
+    cpu->ix = ix;
+    cpu->iy = iy;
 }
 
 size_t msx_save_state_size(void) { return sizeof(msx_save_t); }

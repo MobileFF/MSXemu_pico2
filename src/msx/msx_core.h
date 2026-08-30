@@ -513,12 +513,25 @@ uint16_t msx_debug_step(msx_state_t *msx, uint32_t n);
 typedef struct {
     uint16_t pc, sp;
     uint8_t  a, f;
+    uint16_t bc, de, hl, ix, iy;
     uint32_t cyc;
     uint8_t  halted;
     uint8_t  iff1;
     uint8_t  int_mode;
 } msx_debug_cpu_t;
 void msx_debug_get_cpu(const msx_state_t *msx, msx_debug_cpu_t *out);
+
+/* Writes pc/sp/a/f/bc/de/hl/ix/iy back into the live CPU — lets a
+ * msx.set_call_hook() callback (which runs with no arguments and no
+ * access to the interrupted instruction's registers otherwise) leave the
+ * machine in whatever state the replaced subroutine should have left it
+ * in, e.g. a return value in HL or a status flag in F. cyc/halted/iff1/
+ * int_mode are deliberately not settable here — see set_call_hook's
+ * interrupt-vector caveat in doc/extension_api.md for why fiddling with
+ * interrupt state this way doesn't do what you'd want anyway. */
+void msx_debug_set_cpu(msx_state_t *msx, uint16_t pc, uint16_t sp,
+                        uint8_t a, uint8_t f, uint16_t bc, uint16_t de,
+                        uint16_t hl, uint16_t ix, uint16_t iy);
 
 /* Read one byte of Z80 address space (through the current slot mapping). */
 uint8_t msx_debug_peek(msx_state_t *msx, uint16_t addr);
