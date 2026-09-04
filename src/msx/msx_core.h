@@ -400,7 +400,12 @@ void msx_set_joystick(msx_state_t *msx, uint8_t port, uint8_t state);
  * rotate_180: false=normal orientation (MADCTL 0x28), true=180°-flipped
  * (MADCTL 0xE8, i.e. MX/MY bits inverted vs 0x28 — same MV/BGR bits, so
  * the panel stays in landscape and the CASET/PASET window math in
- * msx_render_to_display_1to1() is unaffected). */
+ * msx_render_to_display_1to1() is unaffected). Only these two values are
+ * meaningful (a bool, not an angle) — true 90°/270° would need portrait
+ * MADCTL mode plus actually rotating the 256x192 image content, not just
+ * a register bit; not implemented. This is LCD-only: msx_render_to_hdmi()
+ * never reads it and always sends the framebuf non-rotated, independent
+ * of whatever this was set to. */
 void msx_init_display_hardware(msx_state_t *msx,
                                 uint8_t spi_id, uint32_t baudrate,
                                 uint8_t mosi_pin, uint8_t sck_pin,

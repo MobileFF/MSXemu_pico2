@@ -207,57 +207,9 @@ class MenuCanvas:
 
 
 # ---------------------------------------------------------------------------
-# File browser
+# File browser — see msx_rom_browser.py (lazily imported by select_rom()
+# below and by show_emulator_menu()'s "Swap Cartridge" branch).
 # ---------------------------------------------------------------------------
-
-def _list_roms(directory, exclude_names=()):
-    """Return sorted list of .ROM / .rom files in directory, excluding exclude_names."""
-    try:
-        entries = uos.listdir(directory)
-    except OSError:
-        return []
-    roms = [e for e in entries
-            if e.lower().endswith('.rom') and e.lower() not in exclude_names]
-    roms.sort()
-    return roms
-
-
-def _draw_file_list(canvas, title, items, selected, scroll):
-    """Render a scrollable file list menu."""
-    canvas.clear(C_BLACK)
-
-    # Title bar
-    canvas.rect(0, 0, canvas.W, 12, C_GREEN, fill=True)
-    canvas.text(title[:31], 2, 2, C_BLACK)
-
-    # File list (max 15 items visible, 8px font + 2px gap)
-    LINE_H   = 10
-    LIST_Y   = 14
-    MAX_ROWS = (canvas.H - LIST_Y - 12) // LINE_H  # leave room for footer
-
-    for i in range(MAX_ROWS):
-        idx = scroll + i
-        if idx >= len(items):
-            break
-        y = LIST_Y + i * LINE_H
-        if idx == selected:
-            canvas.rect(0, y, canvas.W, LINE_H, C_GREEN, fill=True)
-            canvas.text(items[idx][:31], 2, y + 1, C_BLACK)
-        else:
-            color = C_WHITE if (i % 2 == 0) else C_GRAY
-            canvas.text(items[idx][:31], 2, y + 1, color)
-
-    # Footer
-    canvas.hline(0, canvas.H - 11, canvas.W, C_GRAY)
-    if items:
-        status = f"{selected + 1}/{len(items)}"
-        canvas.text("ENTER:select  ESC:skip", 2, canvas.H - 10, C_GRAY)
-        canvas.text(status, canvas.W - len(status) * 8 - 2, canvas.H - 10, C_CYAN)
-    else:
-        canvas.text("No .ROM files found", 2, canvas.H - 10, C_RED)
-
-    canvas.flush()
-
 
 _last_printed_msg = None
 
@@ -593,104 +545,15 @@ def load_cart_smart(msx_module, slot, path):
 def select_rom(msx_module, directory, title="Select ROM",
                usb_host_mod=None, auto_if_one=True, timeout_ms=5000,
                exclude_names=()):
-    """
-    Interactive ROM file selector.
-
-    Parameters
-    ----------
-    msx_module   : the `msx` C module (already initialized with display).
-    directory    : SD card path to scan for .ROM files (e.g. "/sd/msx").
-    title        : menu title string.
-    usb_host_mod : optional `usb_host` module for keyboard input.
-    auto_if_one  : if True, auto-select when only one file is found.
-    timeout_ms   : ms to wait for keyboard input before auto-selecting (0=infinite).
-
-    Returns
-    -------
-    str  — full path of selected file, or None if user skipped (ESC).
-    """
-    import time
-
-    # HDMI/LCD suspended only around the actual SD directory listing — the
-    # interactive browsing loop below just redraws the already-fetched
-    # `items` list from RAM (no further SD access per keypress), so both
-    # stay on throughout browsing. See hdmi_suspend()/lcd_suspend()'s
-    # comments.
-    _prev_hdmi = hdmi_suspend()
-    _prev_lcd  = lcd_suspend()
-    items = _list_roms(directory, exclude_names=exclude_names)
-    lcd_resume(_prev_lcd)
-    hdmi_resume(_prev_hdmi)
-    canvas = MenuCanvas(msx_module)
-
-    if not items:
-        _draw_message(canvas, title, "No .ROM files found in", directory, C_RED)
-        time.sleep_ms(2000)
-        return None
-
-    if auto_if_one and len(items) == 1:
-        _draw_message(canvas, title, f"Auto: {items[0]}", "Loading…", C_GREEN)
-        time.sleep_ms(800)
-        return directory + "/" + items[0]
-
-    # Without a keyboard, auto-select the first file after a brief display
-    if usb_host_mod is None:
-        _draw_message(canvas, title,
-                      items[0] if items else "(none)",
-                      "No keyboard — auto-selecting", C_YELLOW)
-        time.sleep_ms(1500)
-        return (directory + "/" + items[0]) if items else None
-
-    selected = 0
-    scroll   = 0
-    MAX_ROWS = (MenuCanvas.H - 26) // 10
-
-    _draw_file_list(canvas, title, items, selected, scroll)
-    _wait_key_release(usb_host_mod)
-
-    last_key  = 0
-    deadline  = (time.ticks_ms() + timeout_ms) if timeout_ms > 0 else None
-
-    while True:
-        time.sleep_ms(30)
-        key = _get_key(usb_host_mod)
-
-        # Auto-select first item when timeout expires with no key activity
-        if deadline is not None and key == 0:
-            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
-                _draw_message(canvas, title, f"Auto: {items[selected]}",
-                              "No input — loading…", C_YELLOW)
-                time.sleep_ms(600)
-                return directory + "/" + items[selected]
-
-        if key == last_key:
-            continue   # still held — ignore repeat for now
-        last_key = key
-
-        if key == 0:
-            continue
-
-        # Any key press resets the timeout
-        deadline = (time.ticks_ms() + timeout_ms) if timeout_ms > 0 else None
-
-        if key == HID_UP:
-            if selected > 0:
-                selected -= 1
-                if selected < scroll:
-                    scroll = selected
-        elif key == HID_DOWN:
-            if selected < len(items) - 1:
-                selected += 1
-                if selected >= scroll + MAX_ROWS:
-                    scroll = selected - MAX_ROWS + 1
-        elif key == HID_ENTER:
-            _wait_key_release(usb_host_mod)
-            return directory + "/" + items[selected]
-        elif key == HID_ESC:
-            _wait_key_release(usb_host_mod)
-            return None
-
-        _draw_file_list(canvas, title, items, selected, scroll)
+    """Thin lazy-import wrapper — see msx_rom_browser.select() for the
+    actual implementation (kept out of this module's eager compile path;
+    only loaded the first time a ROM actually needs picking)."""
+    import msx_rom_browser
+    return msx_rom_browser.select(msx_module, directory, title=title,
+                                  usb_host_mod=usb_host_mod,
+                                  auto_if_one=auto_if_one,
+                                  timeout_ms=timeout_ms,
+                                  exclude_names=exclude_names)
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +563,8 @@ def select_rom(msx_module, directory, title="Select ROM",
 # ---------------------------------------------------------------------------
 
 _RUNTIME_ITEMS = ["Swap Cartridge", "Save State", "Load State",
-                  "Audio Settings", "HDMI Settings", "Reset MSX", "Resume"]
+                  "Audio Settings", "HDMI Settings", "Display Settings",
+                  "Reset MSX", "Resume"]
 
 # Volume steps in 16-unit increments (0-256; 256 = original full-scale
 # default, ~75% PWM duty — see modmsx.c). Filter steps 0-8 (0=off; higher
@@ -715,7 +579,6 @@ _FILTER_MAX  = 8
 # 10MHz) HDMI send runs.
 _DISPLAY_MODES = ["both", "lcd", "hdmi"]
 _FRAME_SKIP_MAX = 8
-
 
 def _draw_runtime_menu(canvas, cursor, msg=""):
     _echo_msg(msg)
@@ -769,7 +632,7 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
     """
     Live-adjustable Volume/Filter screen. Changes take effect immediately
     (msx_module.set_audio_volume/set_audio_filter) so you hear the result
-    while adjusting. ENTER persists both values into config.txt via
+    while adjusting. ENTER persists both values into msx.ini via
     save_config(); ESC returns without writing the file (the live-adjusted
     values remain in effect for the rest of this session either way).
     """
@@ -812,7 +675,7 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
             else:
                 try:
                     save_config(config_path, {'volume': volume, 'audio_filter': filt})
-                    msg = "Saved to config.txt"
+                    msg = "Saved to msx.ini"
                 except Exception as e:
                     msg = f"Save failed: {e}"
             _draw_audio_settings(canvas, cursor, volume, filt, msg)
@@ -861,7 +724,7 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
     Changes take effect immediately, same philosophy as _show_audio_settings_
     menu(): adjusting here affects the running session right away (the
     caller's main loop reads these values every frame), and ENTER additionally
-    persists them into config.txt. ESC returns without writing the file, but
+    persists them into msx.ini. ESC returns without writing the file, but
     the live-adjusted values remain in effect for the rest of this session.
 
     hdmi_state: dict with keys 'enabled' (bool), 'display' ('both'/'lcd'/
@@ -871,7 +734,7 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
     init_hdmi_output: callback taking no args, called the moment HDMI is
     turned on from Off — mirrors what main.py's boot-time
     msx.init_hdmi_output() call does, since turning HDMI on for the first
-    time here (if config.txt had hdmi=0 at boot) needs that same one-time
+    time here (if msx.ini had hdmi=0 at boot) needs that same one-time
     GPIO/SPI setup. Safe/idempotent to call more than once.
     """
     import time
@@ -924,7 +787,7 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
                         'display': state['display'],
                         'hdmi_frame_skip': str(state['frame_skip']),
                     })
-                    msg = "Saved to config.txt"
+                    msg = "Saved to msx.ini"
                 except Exception as e:
                     msg = f"Save failed: {e}"
             _draw_hdmi_settings(canvas, cursor, state, msg)
@@ -937,9 +800,14 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
         _draw_hdmi_settings(canvas, cursor, state, msg)
 
 
+# "Display Settings" (LCD panel/rotation/HDMI baud/exclusive boot) lives
+# in msx_display_settings.py, imported lazily below only when the user
+# actually opens it — see show_emulator_menu()'s "Display Settings" branch.
+
+
 def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                        save_path, config_path=None, hdmi_state=None,
-                       init_hdmi_output=None):
+                       init_hdmi_output=None, display_state=None):
     """
     Pause gameplay and show the runtime emulator menu (GUI+F7).
     All actions (cart swap, save/load, reset) are performed directly here;
@@ -949,9 +817,14 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     caller's current HDMI/display/frame_skip state in (a dict with keys
     'enabled'/'display'/'frame_skip' — the caller should always pass one,
     defaulting to disabled if the HDMI bridge addon was never configured
-    in config.txt, so it can still be turned on live from this menu); the
-    (possibly updated) state is returned so the caller can update its own
-    globals.
+    in msx.ini, so it can still be turned on live from this menu).
+
+    display_state: see msx_display_settings.show(). Pass the caller's
+    current lcd/rotate/hdmi_baud/boot_exclusive state in (a dict, built
+    from whatever it actually initialized at boot).
+
+    Returns (hdmi_state, display_state), both possibly updated, so the
+    caller can update its own globals.
     """
     import time
 
@@ -981,13 +854,13 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
             msg = ""
         elif key == HID_ESC:
             _wait_key_release(usb_host_mod)
-            return hdmi_state
+            return hdmi_state, display_state
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
             label = _RUNTIME_ITEMS[cursor]
 
             if label == "Resume":
-                return hdmi_state
+                return hdmi_state, display_state
 
             elif label == "Swap Cartridge":
                 # select_rom() suspends HDMI internally around its own SD
@@ -1111,6 +984,12 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                     init_hdmi_output)
                 msg = ""
 
+            elif label == "Display Settings":
+                import msx_display_settings  # lazy — see its own docstring
+                display_state = msx_display_settings.show(
+                    msx_module, usb_host_mod, config_path, display_state)
+                msg = ""
+
             elif label == "Reset MSX":
                 msx_module.reset()
                 msg = "MSX reset"
@@ -1124,14 +1003,14 @@ def load_config(config_path):
     Read a simple key=value config file from SD.
     Returns a dict with keys like 'bios', 'cart'.
 
-    Example /sd/msx/config.txt:
+    Example /sd/msx.ini:
         bios=/sd/msx/MSX.ROM
         cart=/sd/msx/MySoftware.ROM
 
     Retries a few times on OSError before giving up: on marginal SD
     hardware, open()/read() can fail transiently, and this file is read
     once at boot before anything else has "warmed up" the SPI bus. A
-    silent failure here used to be indistinguishable from "no config.txt
+    silent failure here used to be indistinguishable from "no msx.ini
     exists" — the caller would fall back to defaults (e.g. bios=MSX.ROM)
     with no indication that a perfectly valid bios= line was actually
     sitting unread on the card. Log loudly instead so that scenario is

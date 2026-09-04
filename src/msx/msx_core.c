@@ -982,21 +982,49 @@ void msx_init_display_hardware(msx_state_t *msx,
     msx->display_ready = true;
 }
 
-/* -----------------------------------------------------------------------
- * msx_wait_display — wait for any in-flight DMA transfer to finish
- * ----------------------------------------------------------------------- */
-void msx_wait_display(msx_state_t *msx) {
-    if (!msx->display_ready) return;
+/* 2026-09-04: LCD (msx_render_to_display_1to1()) and HDMI
+ * (msx_render_to_hdmi()) share the same physical SPI bus AND the same
+ * msx_dma_chan (see hdmi_apply_spi_settings()'s comment — this has always
+ * been true for the blocking HDMI path too). Now that HDMI also leaves a
+ * DMA transfer in-flight (asynchronous, like the LCD path already did —
+ * see msx_render_to_hdmi()'s comment for why), whichever of the two CS
+ * pins is currently asserted must be tracked so the *next* function to
+ * touch the bus — LCD or HDMI, in either order, regardless of
+ * hdmi_frame_skip — can correctly wait for it and deassert the right pin
+ * before reconfiguring the bus for itself. -1 = bus currently idle. */
+static int dma_active_cs_pin = -1;
+
+/* Waits for any in-flight DMA + SPI shift-register activity left by a
+ * PREVIOUS call (LCD or HDMI, whichever used the bus last) to fully
+ * finish, and deasserts its CS pin. Must be called at the top of every
+ * function that is about to reconfigure/use the shared spi_inst/
+ * msx_dma_chan, before touching either — unlike msx_wait_display() (the
+ * Python-facing version below), this does NOT check msx->display_ready,
+ * since it must also work when only HDMI (no LCD) is active. */
+static inline void _spi_dma_wait(spi_inst_t *spi) {
     if (msx_dma_chan >= 0 && dma_channel_is_busy(msx_dma_chan)) {
         dma_channel_wait_for_finish_blocking(msx_dma_chan);
     }
-    spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
-    /* Wait for SPI shift register to finish clocking out the last bytes */
     while (spi_is_busy(spi)) { tight_loop_contents(); }
-    /* Drain SPI RX FIFO (filled with garbage during TX-only DMA) */
     while (spi_is_readable(spi)) { (void)spi_get_hw(spi)->dr; }
-    /* Deassert CS */
-    gpio_put(msx->spi_cs_pin, 1);
+    if (dma_active_cs_pin >= 0) {
+        gpio_put((uint)dma_active_cs_pin, 1);
+        dma_active_cs_pin = -1;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * msx_wait_display — wait for any in-flight DMA transfer (LCD or HDMI,
+ * see _spi_dma_wait()'s comment above) to finish. Exposed to Python;
+ * called after render_to_display_1to1()/render_to_hdmi() and before any
+ * SD card access. Guarded by display_ready (not hdmi_ready) purely for
+ * backward compatibility — callers that only use HDMI must rely on
+ * msx_render_to_hdmi()/etc.'s own internal _spi_dma_wait() instead (this
+ * function is a no-op without an LCD configured).
+ * ----------------------------------------------------------------------- */
+void msx_wait_display(msx_state_t *msx) {
+    if (!msx->display_ready) return;
+    _spi_dma_wait((spi_inst_t *)msx->spi_inst);
 }
 
 /* Nearest-neighbor scale a batch of `n_rows` output rows starting at
@@ -1051,6 +1079,11 @@ void msx_render_to_display(msx_state_t *msx) {
     if (!msx->display_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    /* 2026-09-04: HDMI (msx_render_to_hdmi()) now also leaves a DMA
+     * transfer in-flight on this same shared bus/channel — must drain it
+     * (and deassert its CS) before reconfiguring anything below, in case
+     * the caller didn't already do so via msx_wait_display(). */
+    _spi_dma_wait(spi);
 
     /* Enforce SPI settings — sdcard readblocks() calls machine.SPI.init() which
      * internally calls spi_init(), resetting SPI1 and clearing DMACR.  Re-apply
@@ -1097,6 +1130,7 @@ void msx_render_to_display(msx_state_t *msx) {
     }
     /* Return with the last batch's DMA in-flight — caller does other work
      * while it completes, then calls msx_wait_display(). */
+    dma_active_cs_pin = (int)msx->spi_cs_pin;
 }
 
 /* -----------------------------------------------------------------------
@@ -1107,6 +1141,12 @@ void msx_render_to_display_1to1(msx_state_t *msx) {
     if (!msx->display_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    /* Cheap in the common case (a single dma_channel_is_busy() register
+     * read — actually blocks only if something is genuinely still
+     * in-flight, e.g. a leftover HDMI transfer from hdmi_frame_skip
+     * frames ago, or the emulator-menu race this same check would also
+     * have caught — see main.py's GUI+F7 handler comment). */
+    _spi_dma_wait(spi);
 
     /* (See msx_render_to_display()'s comment above the equivalent lines —
      * a full spi_init() was tried here too when this bus started also
@@ -1143,6 +1183,7 @@ void msx_render_to_display_1to1(msx_state_t *msx) {
         MSX_SCREEN_W * MSX_SCREEN_H * 2u,
         true
     );
+    dma_active_cs_pin = (int)msx->spi_cs_pin;
 }
 
 /* -----------------------------------------------------------------------
@@ -1207,6 +1248,24 @@ static inline void hdmi_apply_spi_settings(msx_state_t *msx, spi_inst_t *spi) {
      * switching on RP2350 remains an open problem. */
     spi_set_baudrate(spi, msx->hdmi_baudrate ? msx->hdmi_baudrate : 10000000u);
     spi_set_format(spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+
+    /* 2026-09-04: msx_render_to_hdmi()'s DMA-driven send (see
+     * hdmi_frame_buf_pal4's comment) relies on the SPI peripheral's DMA
+     * request line and the peripheral itself both being enabled
+     * (SSPDMACR_TXDMAE + SSPCR1_SSE). Until now this function never set
+     * either bit itself — it silently relied on msx_init_display_hardware()
+     * (the LCD path) having already done so at boot, since both paths
+     * share the same spi_inst. That's a real, easy-to-miss coupling: a
+     * boot mode that skips LCD init entirely (display=hdmi with an
+     * exclusive boot — see main.py's boot_exclusive) would leave these
+     * bits never set, and HDMI's DMA transfer would silently never fire
+     * (the FIFO would just sit there — see hdmi_bridge_phase2_report.md's
+     * comment). Set them explicitly here so this function is
+     * self-sufficient regardless of whether the LCD was ever initialized.
+     * Idempotent/harmless to repeat every call (already set = no-op). */
+    hw_set_bits(&spi_get_hw(spi)->dmacr,
+                SPI_SSPDMACR_TXDMAE_BITS | SPI_SSPDMACR_RXDMAE_BITS);
+    hw_set_bits(&spi_get_hw(spi)->cr1, SPI_SSPCR1_SSE_BITS);
 }
 
 /* RGB565 (byte-swapped, as stored in framebuf) -> RGB332 byte. Shared by
@@ -1226,6 +1285,7 @@ void msx_send_hdmi_palette(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    _spi_dma_wait(spi); /* drain any transfer left in-flight by the LCD or a prior HDMI frame */
     hdmi_apply_spi_settings(msx, spi);
 
     uint8_t palette332[16];
@@ -1258,13 +1318,34 @@ void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {
     msx_send_hdmi_palette(msx);
 }
 
-/* Packed-pixel row buffer for the HDMI link (2 pixels/byte, one 128-byte
- * row at a time, not the full 256x192 frame) — this board's RAM is already
- * tight (framebuf alone is 2x256x192x2 bytes); a full-frame scratch buffer
+/* 2026-09-04: Packed-pixel FULL-FRAME buffer for the HDMI link (2 pixels/
+ * byte, 24576 bytes total — MSX_SCREEN_W/2 * MSX_SCREEN_H). Previously a
+ * single 128-byte row buffer reused per row: msx_render_to_hdmi() built one
+ * row, then blocked on spi_write_blocking() for it, 192 times per frame —
+ * this cost ~40ms/frame at the default 10MHz baud (measured on real
+ * hardware, see doc/hdmi_bridge_phase2_report.md), during which the CPU
+ * could do nothing else, dropping FPS from ~44 to ~17 whenever HDMI output
+ * was active (mitigated only by hdmi_frame_skip, i.e. sending less often —
+ * not by making each send itself cheaper).
+ *
+ * Now the whole frame is built into this static buffer first (cheap —
+ * plain palette-index lookups, no bus access), then sent as ONE DMA-driven
+ * SPI transfer that's left in-flight (same pattern already proven by
+ * msx_render_to_display_1to1(), see main.py's run() loop: DMA started,
+ * then msx.run_frame() computes the NEXT frame while it's still clocking
+ * out, then msx.wait_display() only when the bus is needed again). This
+ * lets the SPI transfer time overlap with Z80/VDP emulation instead of
+ * blocking it.
+ *
+ * RAM cost: this used to be flagged as risky ("a full-frame scratch buffer
  * here was found on real hardware to starve MicroPython's GC heap and
- * cause a MemoryError at boot. CS is held low across all 192 row writes
- * below, so the HDMI receiver still sees one continuous packet. */
-static uint8_t hdmi_row_buf[MSX_SCREEN_W / 2];
+ * cause a MemoryError at boot") — but per doc/memory_usage.md this board's
+ * static (.bss) globals like framebuf/hdmi_row_buf do NOT draw from the
+ * MicroPython GC heap (a separate, tighter budget); the earlier MemoryError
+ * was specific to a much bigger *LCD* scratch buffer discussed there.
+ * Verify with msx.debug via gc.mem_free() before/after on real hardware
+ * per doc/dev_guide.md's guidance for any new static buffer regardless. */
+static uint8_t hdmi_frame_buf_pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
 
 /* Reverse-lookup: which of the 16 palette entries does this (byte-swapped)
  * RGB565 pixel match? framebuf only ever contains exact palette565[]
@@ -1286,10 +1367,20 @@ static inline uint8_t hdmi_find_palette_index(const msx_state_t *msx, uint16_t r
     return 0; /* shouldn't happen; falls back to palette entry 0 */
 }
 
+/* 2026-09-04: Now asynchronous — builds the whole frame, kicks off ONE
+ * DMA-driven SPI transfer, and returns with it left in-flight (mirrors
+ * msx_render_to_display_1to1()). The caller (main.py's run() loop) should
+ * call msx.run_frame() (or other CPU work) next, and only touch the
+ * shared SPI bus again — another render, msx.wait_display(), SD access —
+ * after this transfer has had a chance to finish; every such entry point
+ * now calls _spi_dma_wait() internally first regardless, so correctness
+ * doesn't depend on the caller remembering to wait, only performance does
+ * (waiting too soon just gets back today's blocking behavior). */
 void msx_render_to_hdmi(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    _spi_dma_wait(spi); /* drain any transfer left in-flight by the LCD or the previous HDMI frame */
     hdmi_apply_spi_settings(msx, spi);
 
     const uint16_t *fb = msx->framebuf[msx->framebuf_ready_idx];
@@ -1300,18 +1391,42 @@ void msx_render_to_hdmi(msx_state_t *msx) {
         (uint8_t)(MSX_SCREEN_H >> 8), (uint8_t)(MSX_SCREEN_H & 0xFF),
         (uint8_t)HDMI_SCALE, 0 /* reserved */
     };
-    gpio_put(msx->hdmi_cs_pin, 0);
-    spi_write_blocking(spi, header, sizeof(header));
+
+    /* Build the whole frame first (fast, no bus access) ... */
     for (int row = 0; row < MSX_SCREEN_H; row++) {
         const uint16_t *src = fb + (size_t)row * MSX_SCREEN_W;
+        uint8_t *dst = hdmi_frame_buf_pal4 + (size_t)row * (MSX_SCREEN_W / 2);
         for (int x = 0; x < MSX_SCREEN_W; x += 2) {
             uint8_t idx0 = hdmi_find_palette_index(msx, src[x]);
             uint8_t idx1 = hdmi_find_palette_index(msx, src[x + 1]);
-            hdmi_row_buf[x / 2] = (uint8_t)((idx0 << 4) | (idx1 & 0x0Fu));
+            dst[x / 2] = (uint8_t)((idx0 << 4) | (idx1 & 0x0Fu));
         }
-        spi_write_blocking(spi, hdmi_row_buf, sizeof(hdmi_row_buf));
     }
-    gpio_put(msx->hdmi_cs_pin, 1);
+
+    /* ... then send it: header blocking (8 bytes, negligible), payload via
+     * DMA left in-flight (24576 bytes, the actual cost this whole change
+     * targets). */
+    if (msx_dma_chan < 0) {
+        msx_dma_chan = dma_claim_unused_channel(true);
+    }
+    gpio_put(msx->hdmi_cs_pin, 0);
+    spi_write_blocking(spi, header, sizeof(header));
+
+    dma_channel_config cfg = dma_channel_get_default_config(msx_dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&cfg, true);
+    channel_config_set_write_increment(&cfg, false);
+    channel_config_set_dreq(&cfg, spi_get_dreq(spi, true));
+    dma_channel_configure(
+        msx_dma_chan, &cfg,
+        &spi_get_hw(spi)->dr,
+        hdmi_frame_buf_pal4,
+        sizeof(hdmi_frame_buf_pal4),
+        true /* start now */
+    );
+    /* Deliberately NOT waiting / deasserting CS here — see the function
+     * comment above and _spi_dma_wait()'s. */
+    dma_active_cs_pin = (int)msx->hdmi_cs_pin;
 }
 
 /* Row buffer for the RAW332 fallback path — 1 byte/pixel, no palette
@@ -1328,6 +1443,7 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    _spi_dma_wait(spi); /* drain any transfer left in-flight by the LCD or a prior HDMI frame */
     hdmi_apply_spi_settings(msx, spi);
 
     const uint16_t *fb = msx->framebuf[msx->framebuf_ready_idx];
@@ -1372,6 +1488,7 @@ void msx_clear_hdmi(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
     spi_inst_t *spi = (spi_inst_t *)msx->spi_inst;
+    _spi_dma_wait(spi); /* drain any transfer left in-flight by the LCD or a prior HDMI frame */
     hdmi_apply_spi_settings(msx, spi);
 
     uint8_t header[8] = { (uint8_t)HDMI_PKT_CLEAR_SCREEN, 0, 0, 0, 0, 0, 0, 0 };
