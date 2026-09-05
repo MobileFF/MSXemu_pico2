@@ -25,7 +25,7 @@ Z80 CPU・TMS9918A VDP・AY-3-8910 PSGを搭載した MSX1 をエミュレート
 - **Raspberry Pi Pico(初代、RP2040)では動作しません**。性能・RAM容量の都合上、Raspberry Pi Pico 2 (RP2350) が必須です。
 - **メガロム(バンク切替対応の大容量カートリッジ)をHDMI出力と併用すると、動作がやや遅くなることがあります**(内蔵フラッシュキャッシュ読み込みの影響)。実行時メニューの「HDMI Settings」で Skip Frame (`hdmi_frame_skip`) を調整してください。
 - **ジョイスティックポート2 (JOY2) はサポートしていません**。JOY1のみ利用可能です。
-- **LCDとHDMIの同時出力 (`display=both`) は推奨しません**。LCD側の表示が一部乱れる場合があります。片方のみの出力(`display=lcd` または `display=hdmi`)を推奨します。
+- **LCDとHDMIは排他出力です**。同時出力(かつての`display=both`)はSPIモードの毎フレーム切替が実機で不安定だったため廃止しました。`display=lcd`または`display=hdmi`のいずれかを選択してください。
 
 ## クイックスタート
 

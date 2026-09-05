@@ -209,7 +209,7 @@ Returns a read-only, zero-copy reference view of the internal framebuffer (RGB56
 
 ## HDMI Bridge Output
 
-An optional feature that sends frames to a second Pico 2 + PICO-HDMI-PLUS (see `hdmi_bridge/README.md`) over the same SPI1 bus as the LCD/SD (a separate CS pin). Enabled via `hdmi=1` in `config.txt` (see `mp/main.py`).
+An optional feature that sends frames to a second Pico 2 + PICO-HDMI-PLUS (see `hdmi_bridge/README.md`) over the same SPI1 bus as the LCD/SD (a separate CS pin). LCD and HDMI are mutually exclusive outputs; enabled via `display=hdmi` in `msx.ini` (`display=lcd` is the LCD side — see `mp/main.py`).
 
 ### `msx.init_hdmi_output(cs_pin: int, baudrate: int)`
 

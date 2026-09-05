@@ -1,9 +1,9 @@
 """
 msx_display_settings.py — "Display Settings" runtime menu screen
-(LCD panel / rotation / HDMI baud / exclusive boot), split out of
-msx_menu.py and imported lazily (only when the user actually opens this
-menu item) so its compile cost isn't paid at every boot — see
-show_emulator_menu()'s "Display Settings" branch in msx_menu.py.
+(LCD panel / rotation / HDMI baud), split out of msx_menu.py and
+imported lazily (only when the user actually opens this menu item) so
+its compile cost isn't paid at every boot — see show_emulator_menu()'s
+"Display Settings" branch in msx_menu.py.
 """
 
 from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
@@ -25,7 +25,6 @@ def _draw(canvas, cursor, state, msg=""):
         f"LCD Panel: {state['lcd']}",
         f"Rotate: {'180' if state['rotate'] else '0'}",
         f"HDMI Baud: {state['hdmi_baud'] // 1_000_000}MHz",
-        f"Exclusive Boot: {'On' if state['boot_exclusive'] else 'Off'}",
     ]
     y = 20
     for i, label in enumerate(rows):
@@ -36,11 +35,9 @@ def _draw(canvas, cursor, state, msg=""):
             canvas.text(label, 2, y + 1, C_WHITE)
         y += 12
 
-    canvas.text("Excl.Boot needs HDMI Settings:", 2, y + 2, C_GRAY)
-    canvas.text("Display=LCD/HDMI (not Both)", 2, y + 11, C_GRAY)
-    canvas.text("(restart to apply)", 2, y + 22, C_CYAN)
+    canvas.text("(restart to apply)", 2, y + 2, C_CYAN)
     if msg:
-        canvas.text(msg[:31], 2, y + 34, C_CYAN)
+        canvas.text(msg[:31], 2, y + 14, C_CYAN)
 
     canvas.hline(0, canvas.H - 21, canvas.W, C_GRAY)
     canvas.text("LEFT/RIGHT:adjust  UP/DOWN:field", 2, canvas.H - 20, C_GRAY)
@@ -49,10 +46,10 @@ def _draw(canvas, cursor, state, msg=""):
 
 
 def show(msx_module, usb_host_mod, config_path, display_state):
-    """LCD panel/rotation/HDMI baud/exclusive-boot editor — restart-only
-    (none take effect live). display_state: dict with 'lcd' (str, one of
-    _LCD_MODELS), 'rotate' (bool), 'hdmi_baud' (int, Hz), 'boot_exclusive'
-    (bool). Returned so re-opening this menu shows the last-picked values."""
+    """LCD panel/rotation/HDMI baud editor — restart-only (none take
+    effect live). display_state: dict with 'lcd' (str, one of
+    _LCD_MODELS), 'rotate' (bool), 'hdmi_baud' (int, Hz). Returned so
+    re-opening this menu shows the last-picked values."""
     import time
 
     canvas = MenuCanvas(msx_module)
@@ -75,7 +72,7 @@ def show(msx_module, usb_host_mod, config_path, display_state):
 
         msg = ""
         if key == HID_UP or key == HID_DOWN:
-            cursor = (cursor - 1) % 4 if key == HID_UP else (cursor + 1) % 4
+            cursor = (cursor - 1) % 3 if key == HID_UP else (cursor + 1) % 3
         elif key == HID_LEFT or key == HID_RIGHT:
             sign = -1 if key == HID_LEFT else 1
             if cursor == 0:
@@ -84,13 +81,11 @@ def show(msx_module, usb_host_mod, config_path, display_state):
                 state['lcd'] = _LCD_MODELS[idx]
             elif cursor == 1:
                 state['rotate'] = not state['rotate']
-            elif cursor == 2:
+            else:
                 idx = (_HDMI_BAUD_OPTIONS.index(state['hdmi_baud'])
                        if state['hdmi_baud'] in _HDMI_BAUD_OPTIONS else 0)
                 idx = (idx + sign) % len(_HDMI_BAUD_OPTIONS)
                 state['hdmi_baud'] = _HDMI_BAUD_OPTIONS[idx]
-            else:
-                state['boot_exclusive'] = not state['boot_exclusive']
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
             if config_path is None:
@@ -101,7 +96,6 @@ def show(msx_module, usb_host_mod, config_path, display_state):
                         'lcd': state['lcd'],
                         'rotate': '180' if state['rotate'] else '0',
                         'hdmi_baud': str(state['hdmi_baud']),
-                        'boot_exclusive': '1' if state['boot_exclusive'] else '0',
                     })
                     msg = "Saved — restart to apply"
                 except Exception as e:

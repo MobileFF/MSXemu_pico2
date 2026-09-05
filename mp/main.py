@@ -11,7 +11,8 @@ Hardware (matches PB-1000 emulator board):
   Audio PWM        GP14
   HDMI bridge      SPI1: MOSI=GP11  SCK=GP10  CS=GP28  (optional, shares LCD/SD
                    SPI bus; second Pico2+PICO-HDMI-PLUS, see hdmi_bridge/README.md;
-                   opt-in via msx.ini: hdmi=1)
+                   opt-in via msx.ini: display=hdmi — mutually exclusive
+                   with the LCD, see 'display' below)
 
 SD card layout:
   /sd/msx.ini         — optional config (see below; was /sd/msx/config.txt)
@@ -26,9 +27,7 @@ msx.ini format (key=value, # = comment):
   rotate=180
   volume=128
   audio_filter=2
-  hdmi=1
-  display=both
-  boot_exclusive=0
+  display=hdmi
   hdmi_frame_skip=2
   hdmi_baud=8000000
   # omit 'cart' to show the interactive ROM selector at boot (browses from
@@ -43,27 +42,27 @@ msx.ini format (key=value, # = comment):
   # piezo buzzer's overdrive/crackle
   # omit 'audio_filter' to default to 0 (no smoothing); 1-8 = progressively
   # heavier low-pass smoothing
-  # omit 'hdmi' (or 0) to disable the optional HDMI bridge output (second
-  # Pico2+PICO-HDMI-PLUS, see hdmi_bridge/README.md)
-  # omit 'display' to default to 'both' (LCD + HDMI every hdmi_frame_skip-
-  # th frame). 'lcd'/'hdmi' send to only one, recovering the other's
-  # per-frame cost. Only matters when hdmi=1.
-  # omit 'boot_exclusive' (or 0): both LCD and HDMI hardware are always
-  # initialized at boot regardless of 'display'. Set to 1 with
-  # display=lcd or display=hdmi (not 'both') to skip the unused side's
-  # hardware init entirely at boot (real boot-time saving, and the unused
-  # one need not be physically present); can still be turned on live from
-  # the menu afterward. Restart-only.
+  # omit 'display' (or set to 'lcd') to use the LCD panel only — the
+  # optional HDMI bridge output (second Pico2+PICO-HDMI-PLUS, see
+  # hdmi_bridge/README.md) is only initialized at all when display=hdmi.
+  # LCD and HDMI are mutually exclusive: no combined mode (simultaneous
+  # LCD+HDMI was found to corrupt/lose the HDMI signal and glitch the LCD
+  # on real hardware from switching SPI mode every frame — see
+  # doc/hdmi_bridge_phase2_report.md). Only whichever side is skipped at
+  # boot has its hardware init deferred (real boot-time saving, and that
+  # side need not be physically present) — switching 'display' live from
+  # the menu brings the other side up on demand at that point.
   # omit 'hdmi_frame_skip' to default to 2 (send to HDMI every other
-  # frame); 1 = every frame. Only matters when hdmi=1.
+  # frame); 1 = every frame. Only matters when display=hdmi.
   # omit 'hdmi_baud' to default to 8_000_000 (8MHz — 5/8MHz confirmed
   # clean on real hardware, 10MHz corrupts the received palette on this
-  # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when hdmi=1.
+  # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when
+  # display=hdmi.
   #
   # All of the above except bios/cart (ROM selector instead) can be tuned
   # live via GUI+F7 — Audio/HDMI/Display Settings. ENTER writes it back to
-  # msx.ini; audio/hdmi/display/frame_skip take effect live, while
-  # lcd/rotate/hdmi_baud/boot_exclusive need a restart (read once at boot).
+  # msx.ini; audio/display/frame_skip take effect live, while
+  # lcd/rotate/hdmi_baud need a restart (read once at boot).
 
 Joystick (Atari/MSX 9-pin port wired directly to GPIO, PULL_UP/active-low,
 JOY1 only): UP=GP18 DOWN=GP19 LEFT=GP20 RIGHT=GP21 TRIG-A=GP26 TRIG-B=GP27.
@@ -133,7 +132,16 @@ DEFAULT_LCD_MODEL = "ST7796"
 # HDMI bridge output (hdmi_bridge/README.md) — optional second Pico 2 +
 # PICO-HDMI-PLUS. Shares SPI1 (SCK=GP10/MOSI=GP11) with the LCD/SD; GP28 is
 # a new, dedicated CS added only for this link (no existing pin touched).
-# Off by default — enable via msx.ini: hdmi=1
+# LCD and HDMI are mutually exclusive outputs — msx.ini: display=lcd
+# (default) or display=hdmi. No separate on/off flag: HDMI hardware is
+# only ever initialized when display=hdmi (at boot, or live from the
+# HDMI Settings menu — see _init_hdmi_output()/poll_keyboard() below).
+# 2026-09-06: simultaneous LCD+HDMI ('both') used to also be selectable
+# but was found unreliable on real hardware (switching SPI mode every
+# frame between the two eventually corrupts/loses the HDMI signal and
+# glitches the LCD — see msx_core.c's hdmi_apply_spi_settings() comment
+# and doc/hdmi_bridge_phase2_report.md) and was removed rather than kept
+# around as a known-broken option.
 HDMI_CS_PIN = 28
 # 2026-09-05: HDMI receiver hardware-reset line (see
 # hdmi_bridge_receiver's notes/sender_reset_line.md) — a spare GPIO wired
@@ -372,10 +380,7 @@ _cart_path = None  # currently loaded cart's full path, or None (BASIC
                    # save_state()/load_state() (F5/F8) and the runtime
                    # menu's Save/Load State both key off this so each
                    # cart keeps its own rotating save history.
-_hdmi_enabled = False
-_display_mode = 'both'   # 'both' | 'lcd' | 'hdmi' — see HDMI Settings menu
-_boot_exclusive = False  # msx.ini: boot_exclusive=1 (only meaningful with
-                         # display='lcd'/'hdmi', never 'both'); restart-only.
+_display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see HDMI Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
 
@@ -391,8 +396,10 @@ _lcd_model = DEFAULT_LCD_MODEL  # 'ST7796'|'ILI9341'; restart-only, see Display 
 
 def _init_hdmi_output():
     """Callback for the HDMI Settings menu — see msx_menu.show_emulator_menu().
-    Called the moment HDMI is turned on live from Off (e.g. msx.ini had
-    hdmi=0/absent at boot); idempotent, safe to call more than once."""
+    Called the moment 'display' switches to 'hdmi' live (boot may have
+    started on 'lcd', which never initializes HDMI hardware at all — see
+    the exclusive boot logic in run()); idempotent, safe to call more
+    than once (e.g. if HDMI was already the active side at boot)."""
     msx.hdmi_reset_init(HDMI_RESET_PIN)
     msx.hdmi_reset_pulse()
     time.sleep_ms(HDMI_RESET_GRACE_MS)
@@ -402,10 +409,25 @@ def _init_hdmi_output():
     msx.clear_hdmi()
 
 
+def _init_lcd_output():
+    """Callback for the HDMI Settings menu — mirrors _init_hdmi_output()
+    above for the other direction. Called the moment 'display' switches
+    to 'lcd' live (boot may have started on 'hdmi', which skips the LCD
+    panel's own init/reset sequence entirely — see run()). Idempotent:
+    msx.init_display_hardware() always re-runs the full panel reset
+    sequence, harmless to repeat (e.g. if LCD was already the active side
+    at boot)."""
+    msx.init_display_hardware(
+        SPI_ID, SPI_BAUD, SPI_MOSI, SPI_SCK,
+        SPI_CS, SPI_DC, SPI_RST, SPI_BL,
+        _lcd_w, _lcd_h, _rotate_180)
+    msx.set_backlight(True)
+
+
 def poll_keyboard():
     global _last_modifier, _last_keycodes, _save_held, _load_held, _menu_held
-    global _hdmi_enabled, _display_mode, _hdmi_frame_skip
-    global _lcd_model, _rotate_180, _hdmi_baud, _boot_exclusive, _cart_path
+    global _display_mode, _hdmi_frame_skip
+    global _lcd_model, _rotate_180, _hdmi_baud, _cart_path
     if not _usb_ready:
         return
     try:
@@ -466,12 +488,12 @@ def poll_keyboard():
         try:
             hdmi_state, display_state, _cart_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
-                hdmi_state={'enabled': _hdmi_enabled, 'display': _display_mode,
+                hdmi_state={'display': _display_mode,
                             'frame_skip': _hdmi_frame_skip},
                 init_hdmi_output=_init_hdmi_output,
+                init_lcd_output=_init_lcd_output,
                 display_state={'lcd': _lcd_model, 'rotate': _rotate_180,
-                                'hdmi_baud': _hdmi_baud,
-                                'boot_exclusive': _boot_exclusive},
+                                'hdmi_baud': _hdmi_baud},
                 cart_path=_cart_path)
         except Exception as e:
             print(f"Menu crashed: {e!r} — resuming gameplay")
@@ -494,7 +516,10 @@ def poll_keyboard():
             # not pull the rug out from under the SD driver's own SPI
             # object — see that function's comment), but cheap to try
             # before giving up on the display for the rest of the session.
-            if _lcd_w:
+            # Only meaningful if LCD was actually the active side when the
+            # crash hit (display=hdmi never renders to it, so it can't
+            # have been wedged by this).
+            if _display_mode == 'lcd':
                 try:
                     msx.init_display_hardware(
                         SPI_ID, SPI_BAUD, SPI_MOSI, SPI_SCK,
@@ -503,12 +528,10 @@ def poll_keyboard():
                     print("Display re-init attempted after menu crash")
                 except Exception as disp_e:
                     print(f"Display re-init also failed: {disp_e!r}")
-            hdmi_state = {'enabled': _hdmi_enabled, 'display': _display_mode,
+            hdmi_state = {'display': _display_mode,
                           'frame_skip': _hdmi_frame_skip}
             display_state = {'lcd': _lcd_model, 'rotate': _rotate_180,
-                             'hdmi_baud': _hdmi_baud,
-                             'boot_exclusive': _boot_exclusive}
-        _hdmi_enabled    = hdmi_state['enabled']
+                             'hdmi_baud': _hdmi_baud}
         _display_mode    = hdmi_state['display']
         _hdmi_frame_skip = hdmi_state['frame_skip']
         # display_state has no live effect — kept only so Display Settings
@@ -516,8 +539,7 @@ def poll_keyboard():
         _lcd_model      = display_state['lcd']
         _rotate_180     = display_state['rotate']
         _hdmi_baud      = display_state['hdmi_baud']
-        _boot_exclusive = display_state['boot_exclusive']
-        set_display_state(_display_mode, _hdmi_enabled)
+        set_display_state(_display_mode)
         msx.set_backlight(_display_mode != 'hdmi')  # no-op if LCD wasn't initialized
         # Force the next report through regardless of whether it matches
         # what was last applied (keys held during the menu shouldn't leak
@@ -602,29 +624,31 @@ def run():
     has_sd = mount_sd()
 
     # 4 — Read optional config file (before display init: it may select
-    #     panel size — LCD_SIZES — and whether to skip LCD/HDMI init
-    #     entirely for an exclusive boot — see boot_exclusive below).
+    #     panel size — LCD_SIZES — and which side of the exclusive
+    #     LCD/HDMI display= to bring up — see _display_mode below).
     cfg = load_config(CONFIG_PATH) if has_sd else {}
     lcd_model = cfg.get('lcd', DEFAULT_LCD_MODEL)
     lcd_w, lcd_h = LCD_SIZES.get(lcd_model, LCD_SIZES[DEFAULT_LCD_MODEL])
     rotate_180 = cfg.get('rotate', '0').strip() == '180'
 
     # Parsed early (before LCD init) so it can decide whether that runs.
-    # 'both'+boot_exclusive is contradictory, treated as boot_exclusive=0.
-    global _display_mode, _boot_exclusive
-    _display_mode = cfg.get('display', 'both').strip().lower()
-    if _display_mode not in ('both', 'lcd', 'hdmi'):
-        _display_mode = 'both'
-    _boot_exclusive = (cfg.get('boot_exclusive', '0').strip() == '1'
-                       and _display_mode != 'both')
+    # LCD and HDMI are mutually exclusive outputs (see HDMI_CS_PIN's
+    # comment) — display=lcd or display=hdmi only, no combined 'both'.
+    global _display_mode
+    _display_mode = cfg.get('display', 'lcd').strip().lower()
+    if _display_mode not in ('lcd', 'hdmi'):
+        _display_mode = 'lcd'
 
     # 5 — Initialize display AFTER SD: SPI1 is now stable at SPI_BAUD.
-    #     Skipped when boot_exclusive+display=hdmi (msx_core.c's
-    #     hdmi_apply_spi_settings() no longer depends on this having run).
+    #     Skipped entirely when display=hdmi (msx_core.c's
+    #     hdmi_apply_spi_settings() doesn't depend on this having run) —
+    #     _lcd_w/_lcd_h/_rotate_180/_lcd_model are still recorded either
+    #     way so a later live switch to 'lcd' from the HDMI Settings menu
+    #     (_init_lcd_output()) has the right panel parameters on hand.
     global _lcd_w, _lcd_h, _rotate_180, _lcd_model
-    if _boot_exclusive and _display_mode == 'hdmi':
-        print("Display: LCD init skipped (boot_exclusive + display=hdmi)")
-        _lcd_w, _lcd_h, _rotate_180, _lcd_model = 0, 0, False, lcd_model
+    _lcd_w, _lcd_h, _rotate_180, _lcd_model = lcd_w, lcd_h, rotate_180, lcd_model
+    if _display_mode == 'hdmi':
+        print("Display: LCD init skipped (display=hdmi, exclusive)")
     else:
         print(f"Initializing display… ({lcd_model} {lcd_w}x{lcd_h}"
               f"{', rotated 180' if rotate_180 else ''})")
@@ -634,27 +658,20 @@ def run():
             SPI_CS, SPI_DC, SPI_RST, SPI_BL,
             lcd_w, lcd_h, rotate_180
         )
-        _lcd_w, _lcd_h, _rotate_180 = lcd_w, lcd_h, rotate_180
-        _lcd_model = lcd_model
-        # display=hdmi: LCD is initialized (unlike boot_exclusive above)
-        # but never rendered to, so it would otherwise sit lit showing a
-        # stale/frozen image — turn the backlight off. Re-applied whenever
-        # 'display' changes live via the HDMI Settings menu too (see
-        # poll_keyboard()).
-        msx.set_backlight(_display_mode != 'hdmi')
+        msx.set_backlight(True)
 
     # 5.1 — Optional HDMI bridge output (hdmi_bridge/README.md). Must come
-    #       after init_display_hardware() (reuses its SPI1 instance). Off
-    #       by default so users without the second Pico2+PICO-HDMI-PLUS are
-    #       unaffected — msx.ini: hdmi=1. All three settings (hdmi/
-    #       display/hdmi_frame_skip) can also be changed live afterward via
-    #       the GUI+F7 "HDMI Settings" menu (see poll_keyboard()); the
-    #       globals set here are just the msx.ini-driven starting point.
+    #       after init_display_hardware() (reuses its SPI1 instance).
+    #       Only initialized when display=hdmi — users without the second
+    #       Pico2+PICO-HDMI-PLUS just leave display unset/'lcd' and are
+    #       completely unaffected. 'display'/'hdmi_frame_skip' can also be
+    #       changed live afterward via the GUI+F7 "HDMI Settings" menu
+    #       (see poll_keyboard()); the globals set here are just the
+    #       msx.ini-driven starting point.
     #
     #       Initialized here — BEFORE BIOS/cart loading — so a display=hdmi
-    #       (or display=both) setup shows the boot-time interactive ROM
-    #       selector (step 7 below) and any boot error screen on HDMI too,
-    #       not just the LCD.
+    #       setup shows the boot-time interactive ROM selector (step 7
+    #       below) and any boot error screen on HDMI too, not just the LCD.
     #
     #       This used to be placed after BIOS/cart loading instead, to
     #       dodge a real bug: HDMI's SPI mode 3 (CPOL=1,CPHA=1, see
@@ -670,9 +687,8 @@ def run():
     #       above readblocks()) — SD access is now correct regardless of
     #       what else touched the bus beforehand, so HDMI can safely be
     #       initialized this early again.
-    # display/boot_exclusive already parsed above (step 4).
-    global _hdmi_enabled, _hdmi_frame_skip, _hdmi_baud
-    _hdmi_enabled = cfg.get('hdmi', '0').strip() == '1'
+    # display already parsed above (step 4).
+    global _hdmi_frame_skip, _hdmi_baud
 
     try:
         _hdmi_frame_skip = max(1, int(cfg.get('hdmi_frame_skip', HDMI_FRAME_SKIP)))
@@ -684,15 +700,9 @@ def run():
     except (ValueError, TypeError):
         _hdmi_baud = HDMI_BAUD
 
-    # boot_exclusive + display=lcd: skip HDMI init even if hdmi=1 (mirrors
-    # the LCD-skip above); can still be turned on later via the menu.
-    if _hdmi_enabled and _boot_exclusive and _display_mode == 'lcd':
-        print("HDMI bridge: init skipped (boot_exclusive + display=lcd)")
-        _hdmi_enabled = False
-    elif _hdmi_enabled:
+    if _display_mode == 'hdmi':
         print(f"HDMI bridge output enabled (CS=GP{HDMI_CS_PIN}, "
-              f"{_hdmi_baud/1e6:.1f}MHz, display={_display_mode}, "
-              f"frame_skip={_hdmi_frame_skip})")
+              f"{_hdmi_baud/1e6:.1f}MHz, frame_skip={_hdmi_frame_skip})")
         # Hardware-reset the receiver before sending anything — see
         # HDMI_RESET_PIN's comment above. Must come before
         # init_hdmi_output() (which starts sending immediately).
@@ -710,7 +720,7 @@ def run():
     # the GUI+F7 menus, the interactive ROM selector, and the boot error
     # screen below) also updates HDMI instead of only ever repainting the
     # LCD.
-    set_display_state(_display_mode, _hdmi_enabled)
+    set_display_state(_display_mode)
 
     # 5.5 — Joystick GPIO (Atari/MSX 9-pin port, JOY1)
     init_joystick()
@@ -803,8 +813,8 @@ def run():
     # than real time — the game plays fast-forward and audio pitches up.
     # Pace each iteration to a 60fps wall-clock budget by sleeping off
     # whatever's left over when a frame finished early; iterations that
-    # are already at/below 60fps (slower carts, display=both, etc.) are
-    # completely unaffected since there's nothing left to sleep off.
+    # are already at/below 60fps (slower carts, etc.) are completely
+    # unaffected since there's nothing left to sleep off.
     FRAME_BUDGET_US = 1_000_000 // 60
 
     # Mega ROM carts fetch bank-switched pages mid-frame (inside
@@ -827,17 +837,12 @@ def run():
     while True:
         iter_start = time.ticks_us()
 
-        # These read the live globals every iteration (not cached booleans)
-        # so changes made via the GUI+F7 "HDMI Settings" menu take effect
-        # on the very next frame, no restart needed.
-        use_hdmi = _hdmi_enabled and _display_mode in ('both', 'hdmi')
-        # Safety fallback: always fall back to the LCD if HDMI isn't
-        # actually usable right now (e.g. display=hdmi in msx.ini but
-        # hdmi=1 was never set, or HDMI was just turned Off from the menu
-        # while display was still 'hdmi') — otherwise neither output would
-        # render anything and the screen would just freeze with no way to
-        # see what's happening (found on real hardware).
-        use_lcd  = _display_mode in ('both', 'lcd') or not use_hdmi
+        # Reads the live global every iteration (not a cached boolean) so
+        # a change made via the GUI+F7 "HDMI Settings" menu takes effect
+        # on the very next frame, no restart needed. Mutually exclusive —
+        # see _display_mode's comment — so exactly one of these is true.
+        use_hdmi = _display_mode == 'hdmi'
+        use_lcd  = _display_mode == 'lcd'
 
         # Start DMA transfer of the just-completed frame (non-blocking).
         # 1:1 native 256x192 (no 1.5x scaling) — scaling nearly doubled
@@ -880,7 +885,7 @@ def run():
 
         # Sleep off whatever's left of this frame's 60fps budget — see the
         # FRAME_BUDGET_US comment above. A no-op once elapsed already
-        # exceeds the budget (slower carts, display=both, etc.).
+        # exceeds the budget (slower carts, etc.).
         elapsed_us = time.ticks_diff(time.ticks_us(), iter_start)
         if elapsed_us < FRAME_BUDGET_US:
             time.sleep_us(FRAME_BUDGET_US - elapsed_us)

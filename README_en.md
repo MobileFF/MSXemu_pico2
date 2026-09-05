@@ -25,7 +25,7 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - **Does not run on the original Raspberry Pi Pico (RP2040).** A Raspberry Pi Pico 2 (RP2350) is required due to performance and RAM requirements.
 - **Using a Mega ROM together with HDMI output can slightly reduce performance** (due to onboard-flash cache reads). Adjust the Skip Frame setting (`hdmi_frame_skip`) in the runtime "HDMI Settings" menu if needed.
 - **Joystick port 2 (JOY2) is not supported.** Only JOY1 is available.
-- **Simultaneous LCD + HDMI output (`display=both`) is not recommended.** The LCD output may show occasional glitches. Using only one output (`display=lcd` or `display=hdmi`) is recommended.
+- **LCD and HDMI are mutually exclusive outputs.** Simultaneous output (the former `display=both`) was removed — switching SPI mode every frame between the two was found unreliable on real hardware. Choose either `display=lcd` or `display=hdmi`.
 
 ## Quick Start
 

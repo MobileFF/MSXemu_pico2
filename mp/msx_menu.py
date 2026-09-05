@@ -51,15 +51,14 @@ C_RED    = rgb(220, 0,   0)
 # Settings menu changes these values.
 # ---------------------------------------------------------------------------
 
-_display_mode = 'both'
-_hdmi_enabled = False
+_display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see set_display_state()
+_hdmi_suspended = False
 _lcd_suspended = False
 
 
-def set_display_state(display_mode, hdmi_enabled):
-    global _display_mode, _hdmi_enabled
+def set_display_state(display_mode):
+    global _display_mode
     _display_mode = display_mode
-    _hdmi_enabled = hdmi_enabled
 
 
 def hdmi_suspend():
@@ -68,38 +67,36 @@ def hdmi_suspend():
     SPI mode 3 conflicts with the mode 0 that LCD/SD both need, and
     switching between them right around SD access is unreliable on real
     hardware ("frequent same-peripheral SPI mode switching on RP2350
-    remains an open problem" — see msx_core.c). Deliberately does NOT
-    force display_mode to 'lcd': a display=hdmi setup (no LCD in use at
-    all) must keep working without an LCD ever being required — while
-    HDMI is suspended, MenuCanvas.flush()'s own existing safety fallback
-    (use_lcd = ... or not use_hdmi) harmlessly no-ops the LCD render calls
-    if no LCD is actually wired, and HDMI output resumes automatically as
-    soon as hdmi_resume() is called. Returns the previous _hdmi_enabled
-    value; pass it to hdmi_resume() when the SD-heavy operation is done.
+    remains an open problem" — see msx_core.c). Mirrors lcd_suspend()
+    below exactly, just for the other side (display=lcd and display=hdmi
+    are mutually exclusive — see set_display_state() — so at most one of
+    _hdmi_suspended/_lcd_suspended is ever the one actually stopping a
+    render). Returns the previous _hdmi_suspended value; pass it to
+    hdmi_resume() when the SD-heavy operation is done.
 
     Every caller used to fall straight into its SD access the instant this
-    returned, but flipping _hdmi_enabled only stops the next HDMI frame
-    from being sent; it does nothing about a frame whose blocking SPI send
-    was still in flight (or had just finished) the moment this was called.
-    The mode-0 switch the SD driver performs right after then lands with
-    zero settling time in that case, which is exactly the same-peripheral
-    SPI mode switching hazard documented in msx_core.c. A short pause
-    here, before the caller ever touches the SD card, costs nothing during
+    returned, but suspending only stops the next HDMI frame from being
+    sent; it does nothing about a frame whose blocking SPI send was still
+    in flight (or had just finished) the moment this was called. The
+    mode-0 switch the SD driver performs right after then lands with zero
+    settling time in that case, which is exactly the same-peripheral SPI
+    mode switching hazard documented in msx_core.c. A short pause here,
+    before the caller ever touches the SD card, costs nothing during
     normal menu use and gives that in-flight activity (and the peripheral
     itself) a moment to settle first.
     """
-    global _hdmi_enabled
-    prev = _hdmi_enabled
-    _hdmi_enabled = False
-    if prev:
+    global _hdmi_suspended
+    prev = _hdmi_suspended
+    _hdmi_suspended = True
+    if not prev:
         time.sleep_ms(20)
     return prev
 
 
-def hdmi_resume(prev_enabled):
-    """Restore the _hdmi_enabled value hdmi_suspend() returned."""
-    global _hdmi_enabled
-    _hdmi_enabled = prev_enabled
+def hdmi_resume(prev_suspended):
+    """Restore the _hdmi_suspended value hdmi_suspend() returned."""
+    global _hdmi_suspended
+    _hdmi_suspended = prev_suspended
 
 
 def lcd_suspend():
@@ -110,8 +107,8 @@ def lcd_suspend():
     2026-08-29: added while chasing a real-hardware OSError EIO from SD
     reads that reproduces on the very first SD touch after a stretch of
     LCD-only rendering (confirmed independent of HDMI — the same EIO
-    reproduces with hdmi=0, where HDMI's SPI mode 3 never gets used at
-    all, so this isn't the already-known HDMI mode-switch hazard).
+    reproduces with display=lcd, where HDMI's SPI mode 3 never gets used
+    at all, so this isn't the already-known HDMI mode-switch hazard).
     MenuCanvas.flush() already calls msx.wait_display() after every LCD
     render, so an in-flight DMA transfer specifically isn't the
     mechanism — but nothing previously stopped a *fresh* LCD render from
@@ -121,8 +118,8 @@ def lcd_suspend():
 
     Returns the previous _lcd_suspended value; pass it to lcd_resume()
     when the SD-heavy operation is done. Doesn't touch _display_mode, so
-    HDMI (if enabled) keeps rendering independently — only the LCD side
-    goes quiet for the duration.
+    HDMI (if that's the active side) keeps rendering independently — only
+    the LCD side goes quiet for the duration.
     """
     global _lcd_suspended
     prev = _lcd_suspended
@@ -178,22 +175,15 @@ class MenuCanvas:
         #
         # Mirrors main.py's main-loop display-mode logic (see
         # set_display_state() above) so menus/error screens show up on
-        # whichever output(s) are actually active, same as gameplay.
-        # Safety fallback: always use the LCD if HDMI isn't actually usable
-        # right now (e.g. HDMI just toggled Off from this very menu while
-        # display was still 'hdmi') — otherwise flush() would do nothing at
-        # all and the screen would freeze with no way to see what's
-        # happening, even though the emulator keeps running (found on real
-        # hardware navigating this exact menu).
-        #
-        # `and not _lcd_suspended` is the LCD-side counterpart to
-        # `_hdmi_enabled` above — see lcd_suspend()'s docstring. Note this
-        # means an SD-heavy action performed with HDMI unusable (off, or
-        # display=lcd) goes fully blank for that brief window instead of
-        # falling back to anything: there is nothing left to fall back to
-        # once LCD itself is the side being suspended.
-        use_hdmi = _hdmi_enabled and _display_mode in ('both', 'hdmi')
-        use_lcd  = (_display_mode in ('both', 'lcd') or not use_hdmi) and not _lcd_suspended
+        # whichever output is actually active, same as gameplay.
+        # display=lcd/hdmi are mutually exclusive (no more 'both' — see
+        # set_display_state()'s comment), so exactly one of these is true
+        # except during the brief SD-heavy-operation windows where
+        # hdmi_suspend()/lcd_suspend() quiet the active side entirely (the
+        # screen goes blank for that window rather than falling back to
+        # the other side, which may not even be initialized).
+        use_hdmi = (_display_mode == 'hdmi') and not _hdmi_suspended
+        use_lcd  = (_display_mode == 'lcd') and not _lcd_suspended
         if use_lcd:
             self._msx.render_to_display_1to1()
             self._msx.wait_display()
@@ -625,7 +615,7 @@ _FILTER_MAX  = 8
 # HDMI_CS_PIN/HDMI_BAUD. 'display' selects which output(s) get rendered
 # each frame; 'frame_skip' throttles how often the (blocking, ~40ms at
 # 10MHz) HDMI send runs.
-_DISPLAY_MODES = ["both", "lcd", "hdmi"]
+_DISPLAY_MODES = ["lcd", "hdmi"]  # mutually exclusive — no 'both' (see set_display_state())
 _FRAME_SKIP_MAX = 8
 
 def _draw_runtime_menu(canvas, cursor, msg=""):
@@ -743,7 +733,6 @@ def _draw_hdmi_settings(canvas, cursor, state, msg=""):
     canvas.text("HDMI SETTINGS", 2, 2, C_BLACK)
 
     rows = [
-        f"HDMI: {'On' if state['enabled'] else 'Off'}",
         f"Display: {state['display'].upper()}",
         f"Frame Skip: {state['frame_skip']}",
     ]
@@ -766,24 +755,25 @@ def _draw_hdmi_settings(canvas, cursor, state, msg=""):
 
 
 def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
-                              init_hdmi_output):
+                              init_hdmi_output, init_lcd_output):
     """
-    Live-adjustable HDMI/Display/Frame Skip screen (hdmi_bridge/README.md).
+    Live-adjustable Display/Frame Skip screen (hdmi_bridge/README.md).
     Changes take effect immediately, same philosophy as _show_audio_settings_
     menu(): adjusting here affects the running session right away (the
     caller's main loop reads these values every frame), and ENTER additionally
     persists them into msx.ini. ESC returns without writing the file, but
     the live-adjusted values remain in effect for the rest of this session.
 
-    hdmi_state: dict with keys 'enabled' (bool), 'display' ('both'/'lcd'/
-    'hdmi'), 'frame_skip' (int). Returned (possibly modified) so the caller
-    can update its own module-level globals.
+    hdmi_state: dict with keys 'display' ('lcd'/'hdmi' — mutually exclusive,
+    see set_display_state()), 'frame_skip' (int). Returned (possibly
+    modified) so the caller can update its own module-level globals.
 
-    init_hdmi_output: callback taking no args, called the moment HDMI is
-    turned on from Off — mirrors what main.py's boot-time
-    msx.init_hdmi_output() call does, since turning HDMI on for the first
-    time here (if msx.ini had hdmi=0 at boot) needs that same one-time
-    GPIO/SPI setup. Safe/idempotent to call more than once.
+    init_hdmi_output/init_lcd_output: callbacks taking no args, called the
+    moment 'display' switches to that side — since a boot that started on
+    the *other* side never initialized this one's hardware at all (see
+    main.py's exclusive boot logic), switching here needs that same
+    one-time GPIO/SPI setup. Both are safe/idempotent to call more than
+    once (harmless if that side was already initialized, e.g. at boot).
     """
     import time
 
@@ -807,20 +797,18 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
 
         msg = ""
         if key == HID_UP or key == HID_DOWN:
-            cursor = (cursor - 1) % 3 if key == HID_UP else (cursor + 1) % 3
+            cursor = (cursor - 1) % 2 if key == HID_UP else (cursor + 1) % 2
         elif key == HID_LEFT or key == HID_RIGHT:
             sign = -1 if key == HID_LEFT else 1
             if cursor == 0:
-                was_enabled = state['enabled']
-                state['enabled'] = not state['enabled']
-                if state['enabled'] and not was_enabled:
-                    init_hdmi_output()
-                set_display_state(state['display'], state['enabled'])
-            elif cursor == 1:
                 idx = _DISPLAY_MODES.index(state['display'])
                 idx = (idx + sign) % len(_DISPLAY_MODES)
                 state['display'] = _DISPLAY_MODES[idx]
-                set_display_state(state['display'], state['enabled'])
+                set_display_state(state['display'])
+                if state['display'] == 'hdmi':
+                    init_hdmi_output()
+                else:
+                    init_lcd_output()
             else:
                 state['frame_skip'] = max(1, min(_FRAME_SKIP_MAX,
                                                   state['frame_skip'] + sign))
@@ -831,7 +819,6 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
             else:
                 try:
                     save_config(config_path, {
-                        'hdmi': '1' if state['enabled'] else '0',
                         'display': state['display'],
                         'hdmi_frame_skip': str(state['frame_skip']),
                     })
@@ -855,22 +842,21 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
 
 def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                        save_path, config_path=None, hdmi_state=None,
-                       init_hdmi_output=None, display_state=None,
-                       cart_path=None):
+                       init_hdmi_output=None, init_lcd_output=None,
+                       display_state=None, cart_path=None):
     """
     Pause gameplay and show the runtime emulator menu (GUI+F7).
     All actions (cart swap, save/load, reset) are performed directly here;
     the caller just needs to resume its main loop once this returns.
 
-    hdmi_state/init_hdmi_output: see _show_hdmi_settings_menu(). Pass the
-    caller's current HDMI/display/frame_skip state in (a dict with keys
-    'enabled'/'display'/'frame_skip' — the caller should always pass one,
-    defaulting to disabled if the HDMI bridge addon was never configured
-    in msx.ini, so it can still be turned on live from this menu).
+    hdmi_state/init_hdmi_output/init_lcd_output: see
+    _show_hdmi_settings_menu(). Pass the caller's current display/
+    frame_skip state in (a dict with keys 'display' ('lcd'/'hdmi',
+    mutually exclusive — see set_display_state()) and 'frame_skip').
 
     display_state: see msx_display_settings.show(). Pass the caller's
-    current lcd/rotate/hdmi_baud/boot_exclusive state in (a dict, built
-    from whatever it actually initialized at boot).
+    current lcd/rotate/hdmi_baud state in (a dict, built from whatever it
+    actually initialized at boot).
 
     save_path/cart_path: `save_path` is really a fallback save-state BASE
     path (no cart loaded / BASIC-only session) — save_base_for_cart()
@@ -1053,7 +1039,7 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
             elif label == "HDMI Settings":
                 hdmi_state = _show_hdmi_settings_menu(
                     msx_module, usb_host_mod, config_path, hdmi_state,
-                    init_hdmi_output)
+                    init_hdmi_output, init_lcd_output)
                 msg = ""
 
             elif label == "Display Settings":

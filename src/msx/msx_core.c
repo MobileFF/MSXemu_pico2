@@ -1028,11 +1028,12 @@ void msx_wait_display(msx_state_t *msx) {
 }
 
 /* 2026-09-05: LCD backlight on/off — plain GPIO (spi_bl_pin), no bus
- * access. Lets main.py turn the backlight off when display=hdmi (the LCD
- * is initialized but never rendered to, so it would otherwise sit lit
- * showing a stale/frozen image) without needing boot_exclusive (which
- * skips LCD init — and thus the panel itself, not just its light —
- * entirely). No-op if the LCD was never initialized. */
+ * access. Lets main.py turn the backlight off when 'display' is switched
+ * live to 'hdmi' (LCD/HDMI are mutually exclusive — a boot that starts on
+ * 'hdmi' skips LCD init outright, so this only matters after a live
+ * switch away from 'lcd', where the panel was already initialized at
+ * boot and would otherwise just sit lit showing a stale/frozen image).
+ * No-op if the LCD was never initialized. */
 void msx_set_backlight(msx_state_t *msx, bool on) {
     if (!msx->display_ready) return;
     gpio_put(msx->spi_bl_pin, on ? 1 : 0);
@@ -1267,9 +1268,10 @@ static inline void hdmi_apply_spi_settings(msx_state_t *msx, spi_inst_t *spi) {
      * either bit itself — it silently relied on msx_init_display_hardware()
      * (the LCD path) having already done so at boot, since both paths
      * share the same spi_inst. That's a real, easy-to-miss coupling: a
-     * boot mode that skips LCD init entirely (display=hdmi with an
-     * exclusive boot — see main.py's boot_exclusive) would leave these
-     * bits never set, and HDMI's DMA transfer would silently never fire
+     * boot with display=hdmi (LCD/HDMI are mutually exclusive — see
+     * main.py's _display_mode — so this always skips LCD init entirely)
+     * would leave these bits never set, and HDMI's DMA transfer would
+     * silently never fire
      * (the FIFO would just sit there — see hdmi_bridge_phase2_report.md's
      * comment). Set them explicitly here so this function is
      * self-sufficient regardless of whether the LCD was ever initialized.

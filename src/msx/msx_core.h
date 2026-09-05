@@ -439,7 +439,8 @@ void msx_wait_display(msx_state_t *msx);
 
 /* 2026-09-05: LCD backlight on/off (spi_bl_pin GPIO only, no bus access).
  * No-op if the LCD was never initialized (msx->display_ready false —
- * e.g. boot_exclusive skipped it entirely). See msx_core.c's comment. */
+ * e.g. a display=hdmi boot skipped it entirely). See msx_core.c's
+ * comment. */
 void msx_set_backlight(msx_state_t *msx, bool on);
 
 /* 2026-09-05: HDMI receiver hardware-reset line (see

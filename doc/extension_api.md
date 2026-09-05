@@ -208,7 +208,7 @@ MSXネイティブ解像度256×192をそのままパネル中央にDMA転送開
 
 ## HDMIブリッジ出力
 
-第2のPico 2 + PICO-HDMI-PLUS（`hdmi_bridge/README.md`参照）へLCDと同じSPI1バス（別CSピン）経由でフレームを送る、任意搭載のオプション機能。`config.txt`の`hdmi=1`で有効化（`mp/main.py`参照）。
+第2のPico 2 + PICO-HDMI-PLUS（`hdmi_bridge/README.md`参照）へLCDと同じSPI1バス（別CSピン）経由でフレームを送る、任意搭載のオプション機能。LCDとHDMIは排他出力で、`msx.ini`の`display=hdmi`で有効化（`display=lcd`がLCD側、`mp/main.py`参照）。
 
 ### `msx.init_hdmi_output(cs_pin: int, baudrate: int)`
 
