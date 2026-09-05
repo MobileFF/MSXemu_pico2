@@ -89,12 +89,15 @@ def _draw_file_list(canvas, title, items, selected, scroll):
 
 def select(msx_module, directory, title="Select ROM",
           usb_host_mod=None, auto_if_one=True, timeout_ms=5000,
-          exclude_names=()):
+          exclude_names=(), start_dir=None):
     """Interactive ROM file selector with folder navigation. `directory`
-    is also the floor of navigation (ENTER on ".."/ESC there cancels).
-    auto_if_one auto-selects when `directory` itself has exactly one ROM
-    and no subfolders. Returns the selected path, or None if cancelled/
-    nothing found."""
+    is the floor of navigation (ENTER on ".."/ESC there cancels) — always
+    the caller's real ROM root. `start_dir`, if given, is just where
+    browsing initially opens (e.g. the currently-loaded cart's own
+    folder) — the user can still navigate up past it to `directory`.
+    auto_if_one auto-selects when the initial listing has exactly one
+    ROM and no subfolders. Returns the selected path, or None if
+    cancelled/nothing found."""
     import time
 
     root_dir = directory
@@ -124,7 +127,7 @@ def select(msx_module, directory, title="Select ROM",
         time.sleep_ms(2000)
         return None
 
-    cur_dir = directory
+    cur_dir = start_dir if start_dir else directory
     entries = _listing(cur_dir)
 
     if auto_if_one and len(entries) == 1 and not entries[0][1]:
@@ -216,13 +219,13 @@ def select(msx_module, directory, title="Select ROM",
                     _wait_key_release(usb_host_mod)
                     return cur_dir + "/" + name
         elif key == HID_ESC:
-            if has_updir:
-                cur_dir = cur_dir.rsplit('/', 1)[0]
-                entries = _listing(cur_dir)
-                selected = 0
-                scroll = 0
-            else:
-                _wait_key_release(usb_host_mod)
-                return None
+            # Always cancels immediately, regardless of how many folder
+            # levels deep browsing has gone (navigate up via ".." + ENTER
+            # instead) — previously ESC walked up one level at a time when
+            # start_dir put cur_dir below root_dir, so cancelling out of a
+            # subfolder needed one ESC per level. Real-hardware finding,
+            # 2026-09.
+            _wait_key_release(usb_host_mod)
+            return None
 
         _draw_file_list(canvas, title, _display_items(), selected, scroll)

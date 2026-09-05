@@ -333,6 +333,53 @@ def load_state_from(msx_module, path):
     return n_ram == msx_module.RAM_SIZE and n_vram == msx_module.VRAM_SIZE
 
 
+MAX_SAVE_SLOTS = 10  # 2026-09-06: rotating save-state history per cart
+
+
+def save_base_for_cart(cart_path, fallback_base):
+    """Base path (no slot number/extension) for a cart's rotating saves —
+    sits right next to the ROM file itself (e.g. "/sd/games/Foo.ROM" ->
+    "/sd/games/Foo"), so each cart keeps its own save history regardless
+    of where it lives on the card. Falls back to `fallback_base` (main.py's
+    single shared base) when no cart is loaded (BASIC-only session)."""
+    if not cart_path:
+        return fallback_base
+    return cart_path[:-4] if cart_path.lower().endswith('.rom') else cart_path
+
+
+def save_slot_path(base, slot):
+    return f"{base}.{slot}.sav"
+
+
+def rotate_and_save_state(msx_module, base, max_slots=MAX_SAVE_SLOTS):
+    """Shift existing save slots up by one (0->1, 1->2, ..., dropping
+    whatever was in the oldest slot), then write the new state into slot 0
+    (most recent). A missing slot (OSError from rename/remove) is normal —
+    e.g. before max_slots saves have ever been made — and just skipped."""
+    try:
+        uos.remove(save_slot_path(base, max_slots - 1))
+    except OSError:
+        pass
+    for i in range(max_slots - 2, -1, -1):
+        try:
+            uos.rename(save_slot_path(base, i), save_slot_path(base, i + 1))
+        except OSError:
+            pass
+    save_state_to(msx_module, save_slot_path(base, 0))
+
+
+def list_save_slots(base, max_slots=MAX_SAVE_SLOTS):
+    """Existing slot numbers for `base`, most recent (0) first."""
+    slots = []
+    for i in range(max_slots):
+        try:
+            uos.stat(save_slot_path(base, i))
+            slots.append(i)
+        except OSError:
+            pass
+    return slots
+
+
 # ---------------------------------------------------------------------------
 # Cartridge loading (small ROMs in-RAM, Mega ROMs SD-backed/paged)
 # ---------------------------------------------------------------------------
@@ -544,7 +591,7 @@ def load_cart_smart(msx_module, slot, path):
 
 def select_rom(msx_module, directory, title="Select ROM",
                usb_host_mod=None, auto_if_one=True, timeout_ms=5000,
-               exclude_names=()):
+               exclude_names=(), start_dir=None):
     """Thin lazy-import wrapper — see msx_rom_browser.select() for the
     actual implementation (kept out of this module's eager compile path;
     only loaded the first time a ROM actually needs picking)."""
@@ -553,7 +600,8 @@ def select_rom(msx_module, directory, title="Select ROM",
                                   usb_host_mod=usb_host_mod,
                                   auto_if_one=auto_if_one,
                                   timeout_ms=timeout_ms,
-                                  exclude_names=exclude_names)
+                                  exclude_names=exclude_names,
+                                  start_dir=start_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +855,8 @@ def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
 
 def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                        save_path, config_path=None, hdmi_state=None,
-                       init_hdmi_output=None, display_state=None):
+                       init_hdmi_output=None, display_state=None,
+                       cart_path=None):
     """
     Pause gameplay and show the runtime emulator menu (GUI+F7).
     All actions (cart swap, save/load, reset) are performed directly here;
@@ -823,8 +872,17 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     current lcd/rotate/hdmi_baud/boot_exclusive state in (a dict, built
     from whatever it actually initialized at boot).
 
-    Returns (hdmi_state, display_state), both possibly updated, so the
-    caller can update its own globals.
+    save_path/cart_path: `save_path` is really a fallback save-state BASE
+    path (no cart loaded / BASIC-only session) — save_base_for_cart()
+    resolves the actual base (next to whichever cart is currently
+    loaded, `cart_path`, falling back to `save_path` otherwise), and
+    rotate_and_save_state()/list_save_slots() manage up to
+    MAX_SAVE_SLOTS numbered saves under that base (see their docstrings).
+    cart_path is updated here when Swap Cartridge succeeds and returned
+    so the caller can keep it for its own F5/F8 hotkey saves.
+
+    Returns (hdmi_state, display_state, cart_path), all possibly updated,
+    so the caller can update its own globals.
     """
     import time
 
@@ -854,13 +912,13 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
             msg = ""
         elif key == HID_ESC:
             _wait_key_release(usb_host_mod)
-            return hdmi_state, display_state
+            return hdmi_state, display_state, cart_path
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
             label = _RUNTIME_ITEMS[cursor]
 
             if label == "Resume":
-                return hdmi_state, display_state
+                return hdmi_state, display_state, cart_path
 
             elif label == "Swap Cartridge":
                 # select_rom() suspends HDMI internally around its own SD
@@ -876,13 +934,18 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # and killed the whole run() loop (game session lost) for
                 # what should be a recoverable "SD hiccup, try again" case.
                 listdir_failed = False
+                # Open in the currently-loaded cart's own folder (not
+                # always the SD root) — the user can still navigate up
+                # past it via ".."/ESC, since rom_dir remains the floor.
+                start_dir = cart_path.rsplit('/', 1)[0] if cart_path else None
                 try:
                     selected = select_rom(msx_module, rom_dir,
                                           title="Select Cartridge ROM",
                                           usb_host_mod=usb_host_mod,
                                           auto_if_one=False,
                                           timeout_ms=0,
-                                          exclude_names=exclude_names)
+                                          exclude_names=exclude_names,
+                                          start_dir=start_dir)
                 except OSError as e:
                     selected = None
                     listdir_failed = True
@@ -923,6 +986,7 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                             ok = load_cart_smart(msx_module, 0, selected)
                             if ok:
                                 msx_module.reset()
+                                cart_path = selected  # own save-state file from here on
                                 msg = f"Loaded {selected.rsplit('/',1)[-1]}"
                             else:
                                 msg = "load_cart() failed"
@@ -949,7 +1013,7 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 _prev_lcd  = lcd_suspend()
                 _draw_runtime_menu(canvas, cursor, "Saving…")
                 try:
-                    save_state_to(msx_module, save_path)
+                    rotate_and_save_state(msx_module, save_base_for_cart(cart_path, save_path))
                     msg = "State saved"
                 except Exception as e:
                     msg = f"Save failed: {e}"
@@ -958,21 +1022,29 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                     hdmi_resume(_prev_hdmi)
 
             elif label == "Load State":
-                # Reading ~64KB from SD takes a couple of seconds — same
-                # as above, show feedback instead of an apparent freeze,
-                # and same HDMI-suspend-during-SD-access reasoning. LCD
-                # suspended too (lcd_suspend()) — see its docstring.
-                _prev_hdmi = hdmi_suspend()
-                _prev_lcd  = lcd_suspend()
-                _draw_runtime_menu(canvas, cursor, "Loading…")
-                try:
-                    ok = load_state_from(msx_module, save_path)
-                    msg = "State loaded" if ok else "Invalid save file"
-                except Exception as e:
-                    msg = f"Load failed: {e}"
-                finally:
-                    lcd_resume(_prev_lcd)
-                    hdmi_resume(_prev_hdmi)
+                # Slot picker (msx_save_slots.py, lazily imported like
+                # msx_rom_browser.py/msx_display_settings.py) suspends
+                # HDMI/LCD internally only around its own SD stat() calls,
+                # same reasoning as select_rom() — the interactive list
+                # itself is redrawn from RAM, no per-keypress SD access.
+                base = save_base_for_cart(cart_path, save_path)
+                import msx_save_slots
+                chosen = msx_save_slots.select(msx_module, base,
+                                               usb_host_mod=usb_host_mod)
+                if chosen:
+                    _prev_hdmi = hdmi_suspend()
+                    _prev_lcd  = lcd_suspend()
+                    _draw_runtime_menu(canvas, cursor, "Loading…")
+                    try:
+                        ok = load_state_from(msx_module, chosen)
+                        msg = "State loaded" if ok else "Invalid save file"
+                    except Exception as e:
+                        msg = f"Load failed: {e}"
+                    finally:
+                        lcd_resume(_prev_lcd)
+                        hdmi_resume(_prev_hdmi)
+                else:
+                    msg = ""
 
             elif label == "Audio Settings":
                 _show_audio_settings_menu(msx_module, usb_host_mod, config_path)

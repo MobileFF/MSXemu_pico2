@@ -643,6 +643,33 @@ static mp_obj_t msx_py_wait_display(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_wait_display_obj, msx_py_wait_display);
 
 /* -----------------------------------------------------------------------
+ * msx.set_backlight(on) — LCD backlight on/off. No-op if the LCD was
+ * never initialized. See msx_core.c's msx_set_backlight() comment.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_set_backlight(mp_obj_t on_obj) {
+    msx_set_backlight(&msx_state, mp_obj_is_true(on_obj));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_set_backlight_obj, msx_py_set_backlight);
+
+/* -----------------------------------------------------------------------
+ * msx.hdmi_reset_init(reset_pin) / msx.hdmi_reset_pulse()
+ * HDMI receiver hardware-reset line. See msx_core.c's msx_hdmi_reset_init()
+ * comment and hdmi_bridge_receiver's notes/sender_reset_line.md.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_hdmi_reset_init(mp_obj_t reset_pin_obj) {
+    msx_hdmi_reset_init((uint8_t)mp_obj_get_int(reset_pin_obj));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_hdmi_reset_init_obj, msx_py_hdmi_reset_init);
+
+static mp_obj_t msx_py_hdmi_reset_pulse(void) {
+    msx_hdmi_reset_pulse();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_hdmi_reset_pulse_obj, msx_py_hdmi_reset_pulse);
+
+/* -----------------------------------------------------------------------
  * msx.init_hdmi_output(cs_pin, baudrate)
  * Configure the HDMI bridge output (hdmi_bridge/README.md). Call once at
  * startup, after msx.init_display_hardware(). Reuses the LCD/SD's SPI1
@@ -1203,6 +1230,9 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_render_to_display),      MP_ROM_PTR(&msx_py_render_to_display_obj) },
     { MP_ROM_QSTR(MP_QSTR_render_to_display_1to1), MP_ROM_PTR(&msx_py_render_to_display_1to1_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait_display),           MP_ROM_PTR(&msx_py_wait_display_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_backlight),          MP_ROM_PTR(&msx_py_set_backlight_obj) },
+    { MP_ROM_QSTR(MP_QSTR_hdmi_reset_init),        MP_ROM_PTR(&msx_py_hdmi_reset_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_hdmi_reset_pulse),       MP_ROM_PTR(&msx_py_hdmi_reset_pulse_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_framebuf),           MP_ROM_PTR(&msx_py_get_framebuf_obj) },
     /* Display — HDMI bridge (hdmi_bridge/README.md), opt-in via config.txt */
     { MP_ROM_QSTR(MP_QSTR_init_hdmi_output),       MP_ROM_PTR(&msx_py_init_hdmi_output_obj) },

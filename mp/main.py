@@ -96,8 +96,10 @@ gc.collect()  # maximize contiguous free heap before compiling the next
 from msx_keymap import apply_hid_report, HID_F5, HID_F7, HID_F8, MOD_LGUI, MOD_RGUI
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
-                        save_state_to, load_state_from, load_cart_smart,
-                        set_display_state, readinto_chunked)
+                        load_state_from, load_cart_smart,
+                        set_display_state, readinto_chunked,
+                        save_base_for_cart, rotate_and_save_state,
+                        save_slot_path)
 
 # -----------------------------------------------------------------------
 # Pin / peripheral constants
@@ -133,6 +135,16 @@ DEFAULT_LCD_MODEL = "ST7796"
 # a new, dedicated CS added only for this link (no existing pin touched).
 # Off by default — enable via msx.ini: hdmi=1
 HDMI_CS_PIN = 28
+# 2026-09-05: HDMI receiver hardware-reset line (see
+# hdmi_bridge_receiver's notes/sender_reset_line.md) — a spare GPIO wired
+# directly to the receiver Pico 2's RUN pin, pulsed low briefly before
+# init_hdmi_output() to force a real hardware reset. Fixes a real-hardware
+# issue where the receiver can come up in a bad state if it's powered on
+# (or hot-plugged) while the HDMI cable is already connected (suspected
+# backfeed through the TMDS lines' series resistors). Completely free
+# GPIO, not shared with anything else.
+HDMI_RESET_PIN = 13
+HDMI_RESET_GRACE_MS = 100  # let the receiver finish booting before we start sending
 # Real-hardware finding: 10MHz reliably corrupts the received palette on
 # this wiring (electrical margin, not a transport bug — see
 # doc/hdmi_bridge_phase2_report.md); 5/8MHz both confirmed clean, 8MHz
@@ -189,12 +201,18 @@ JOY_TRIG_A_PIN = 26
 JOY_TRIG_B_PIN = 27
 
 # ROM_DIR is the SD root — select_rom() browses subfolders too (see
-# msx_menu.py's _list_dir_entries()/_find_first_rom_recursive()). BIOS/
-# save state stay under /sd/msx/.
+# msx_menu.py's _list_dir_entries()/_find_first_rom_recursive()). BIOS
+# stays under /sd/msx/.
 ROM_DIR      = "/sd"
 CONFIG_PATH  = "/sd/msx.ini"
 DEFAULT_BIOS = "/sd/msx/MSX.ROM"
-SAVE_PATH    = "/sd/msx/save.bin"
+# 2026-09-05/06: per-cartridge saves sit next to the ROM itself, and keep
+# a rotating history of up to msx_menu.MAX_SAVE_SLOTS past states (see
+# save_base_for_cart()/rotate_and_save_state() in msx_menu.py — e.g.
+# "/sd/games/Foo.ROM" -> "/sd/games/Foo.0.sav" (latest), "Foo.1.sav", ...).
+# SAVE_BASE is only the fallback base used when no cart is loaded
+# (BASIC-only session).
+SAVE_BASE    = "/sd/msx/save"
 
 # -----------------------------------------------------------------------
 # Helpers
@@ -298,19 +316,25 @@ def init_usb():
 
 
 def save_state():
-    print("Saving state…")
+    # Rotates the same as the runtime menu's Save State — see
+    # rotate_and_save_state() in msx_menu.py.
+    base = save_base_for_cart(_cart_path, SAVE_BASE)
+    print(f"Saving state (base {base})…")
     try:
-        save_state_to(msx, SAVE_PATH)
-        print(f"State saved to {SAVE_PATH}")
+        rotate_and_save_state(msx, base)
+        print(f"State saved to {save_slot_path(base, 0)}")
     except Exception as e:
         print(f"Save failed: {e}")
 
 
 def load_state():
-    print("Loading state…")
+    # Hotkey always loads the most recent slot (0) — use the runtime
+    # menu's Load State to pick an older one from the rotation.
+    path = save_slot_path(save_base_for_cart(_cart_path, SAVE_BASE), 0)
+    print(f"Loading state from {path}…")
     try:
-        if load_state_from(msx, SAVE_PATH):
-            print(f"State loaded from {SAVE_PATH}")
+        if load_state_from(msx, path):
+            print(f"State loaded from {path}")
         else:
             print("load_state_from() failed — invalid save file?")
     except Exception as e:
@@ -343,6 +367,11 @@ _save_held = False
 _load_held = False
 _menu_held = False
 _bios_name = ""
+_cart_path = None  # currently loaded cart's full path, or None (BASIC
+                   # only) — see save_base_for_cart() in msx_menu.py;
+                   # save_state()/load_state() (F5/F8) and the runtime
+                   # menu's Save/Load State both key off this so each
+                   # cart keeps its own rotating save history.
 _hdmi_enabled = False
 _display_mode = 'both'   # 'both' | 'lcd' | 'hdmi' — see HDMI Settings menu
 _boot_exclusive = False  # msx.ini: boot_exclusive=1 (only meaningful with
@@ -364,6 +393,9 @@ def _init_hdmi_output():
     """Callback for the HDMI Settings menu — see msx_menu.show_emulator_menu().
     Called the moment HDMI is turned on live from Off (e.g. msx.ini had
     hdmi=0/absent at boot); idempotent, safe to call more than once."""
+    msx.hdmi_reset_init(HDMI_RESET_PIN)
+    msx.hdmi_reset_pulse()
+    time.sleep_ms(HDMI_RESET_GRACE_MS)
     msx.init_hdmi_output(HDMI_CS_PIN, _hdmi_baud)
     # Blank whatever the receiver was last showing (e.g. left over from a
     # previous emulator/session) before this emulator's own frames start.
@@ -373,7 +405,7 @@ def _init_hdmi_output():
 def poll_keyboard():
     global _last_modifier, _last_keycodes, _save_held, _load_held, _menu_held
     global _hdmi_enabled, _display_mode, _hdmi_frame_skip
-    global _lcd_model, _rotate_180, _hdmi_baud, _boot_exclusive
+    global _lcd_model, _rotate_180, _hdmi_baud, _boot_exclusive, _cart_path
     if not _usb_ready:
         return
     try:
@@ -432,14 +464,15 @@ def poll_keyboard():
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
         try:
-            hdmi_state, display_state = show_emulator_menu(
-                msx, usb_host, ROM_DIR, {_bios_name}, SAVE_PATH, CONFIG_PATH,
+            hdmi_state, display_state, _cart_path = show_emulator_menu(
+                msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
                 hdmi_state={'enabled': _hdmi_enabled, 'display': _display_mode,
                             'frame_skip': _hdmi_frame_skip},
                 init_hdmi_output=_init_hdmi_output,
                 display_state={'lcd': _lcd_model, 'rotate': _rotate_180,
                                 'hdmi_baud': _hdmi_baud,
-                                'boot_exclusive': _boot_exclusive})
+                                'boot_exclusive': _boot_exclusive},
+                cart_path=_cart_path)
         except Exception as e:
             print(f"Menu crashed: {e!r} — resuming gameplay")
             try:
@@ -485,6 +518,7 @@ def poll_keyboard():
         _hdmi_baud      = display_state['hdmi_baud']
         _boot_exclusive = display_state['boot_exclusive']
         set_display_state(_display_mode, _hdmi_enabled)
+        msx.set_backlight(_display_mode != 'hdmi')  # no-op if LCD wasn't initialized
         # Force the next report through regardless of whether it matches
         # what was last applied (keys held during the menu shouldn't leak
         # into the MSX matrix, and the menu's own key reads may have left
@@ -602,6 +636,12 @@ def run():
         )
         _lcd_w, _lcd_h, _rotate_180 = lcd_w, lcd_h, rotate_180
         _lcd_model = lcd_model
+        # display=hdmi: LCD is initialized (unlike boot_exclusive above)
+        # but never rendered to, so it would otherwise sit lit showing a
+        # stale/frozen image — turn the backlight off. Re-applied whenever
+        # 'display' changes live via the HDMI Settings menu too (see
+        # poll_keyboard()).
+        msx.set_backlight(_display_mode != 'hdmi')
 
     # 5.1 — Optional HDMI bridge output (hdmi_bridge/README.md). Must come
     #       after init_display_hardware() (reuses its SPI1 instance). Off
@@ -653,6 +693,12 @@ def run():
         print(f"HDMI bridge output enabled (CS=GP{HDMI_CS_PIN}, "
               f"{_hdmi_baud/1e6:.1f}MHz, display={_display_mode}, "
               f"frame_skip={_hdmi_frame_skip})")
+        # Hardware-reset the receiver before sending anything — see
+        # HDMI_RESET_PIN's comment above. Must come before
+        # init_hdmi_output() (which starts sending immediately).
+        msx.hdmi_reset_init(HDMI_RESET_PIN)
+        msx.hdmi_reset_pulse()
+        time.sleep_ms(HDMI_RESET_GRACE_MS)
         msx.init_hdmi_output(HDMI_CS_PIN, _hdmi_baud)
         # Blank whatever the receiver was last showing (e.g. left over from
         # a previous emulator/session) before this emulator's own frames
@@ -695,6 +741,7 @@ def run():
     # >32KB) automatically — see msx_menu.py. HDMI is already active at
     # this point (step 5.1 above), so the interactive selector below shows
     # there too, not just on the LCD.
+    global _cart_path
     if 'cart' in cfg:
         # Explicit path from msx.ini
         if has_sd:
@@ -702,6 +749,8 @@ def run():
                 ok = load_cart_smart(msx, 0, cfg['cart'])
             except OSError:
                 ok = False
+            if ok:
+                _cart_path = cfg['cart']  # own rotating save history — see save_base_for_cart()
             print(f"Cart (config): {cfg['cart']}  {'OK' if ok else 'FAILED'}")
         else:
             print(f"WARNING: configured cart not found: {cfg['cart']}")
@@ -718,6 +767,8 @@ def run():
         )
         if selected:
             ok = load_cart_smart(msx, 0, selected)
+            if ok:
+                _cart_path = selected
             print(f"Cart (menu): {selected}  {'OK' if ok else 'FAILED'}")
         else:
             print("No cartridge — booting MSX BASIC")
@@ -742,6 +793,20 @@ def run():
     frame = 0
     t0    = time.ticks_ms()
 
+    # 2026-09-05: MSX_TCYCLES_FRAME (msx_core.h) advances exactly 1/60s of
+    # MSX-clock time per msx.run_frame() call, regardless of how fast the
+    # host actually executes it — that's what keeps game logic speed and
+    # PSG audio pitch correct. The pipelined loop below was originally
+    # always slower than 60fps on real hardware (~44fps LCD-only), so this
+    # never mattered; the HDMI DMA optimization now regularly exceeds
+    # 70fps on non-Mega-ROM carts, meaning MSX-time is advancing faster
+    # than real time — the game plays fast-forward and audio pitches up.
+    # Pace each iteration to a 60fps wall-clock budget by sleeping off
+    # whatever's left over when a frame finished early; iterations that
+    # are already at/below 60fps (slower carts, display=both, etc.) are
+    # completely unaffected since there's nothing left to sleep off.
+    FRAME_BUDGET_US = 1_000_000 // 60
+
     # Mega ROM carts fetch bank-switched pages mid-frame (inside
     # msx.run_frame()) from a copy on the Pico's own onboard flash — see
     # load_cart_smart()'s flash-cache in msx_menu.py. An earlier version
@@ -760,6 +825,8 @@ def run():
     msx.run_frame()
 
     while True:
+        iter_start = time.ticks_us()
+
         # These read the live globals every iteration (not cached booleans)
         # so changes made via the GUI+F7 "HDMI Settings" menu take effect
         # on the very next frame, no restart needed.
@@ -810,6 +877,13 @@ def run():
             msx.render_to_hdmi()
 
         frame += 1
+
+        # Sleep off whatever's left of this frame's 60fps budget — see the
+        # FRAME_BUDGET_US comment above. A no-op once elapsed already
+        # exceeds the budget (slower carts, display=both, etc.).
+        elapsed_us = time.ticks_diff(time.ticks_us(), iter_start)
+        if elapsed_us < FRAME_BUDGET_US:
+            time.sleep_us(FRAME_BUDGET_US - elapsed_us)
 
         if frame % 300 == 0:
             elapsed = time.ticks_diff(time.ticks_ms(), t0)

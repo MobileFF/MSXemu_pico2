@@ -1027,6 +1027,17 @@ void msx_wait_display(msx_state_t *msx) {
     _spi_dma_wait((spi_inst_t *)msx->spi_inst);
 }
 
+/* 2026-09-05: LCD backlight on/off — plain GPIO (spi_bl_pin), no bus
+ * access. Lets main.py turn the backlight off when display=hdmi (the LCD
+ * is initialized but never rendered to, so it would otherwise sit lit
+ * showing a stale/frozen image) without needing boot_exclusive (which
+ * skips LCD init — and thus the panel itself, not just its light —
+ * entirely). No-op if the LCD was never initialized. */
+void msx_set_backlight(msx_state_t *msx, bool on) {
+    if (!msx->display_ready) return;
+    gpio_put(msx->spi_bl_pin, on ? 1 : 0);
+}
+
 /* Nearest-neighbor scale a batch of `n_rows` output rows starting at
  * output row `oy0` (MSX_DISP_W wide each) into `dst`. Source row for each
  * maps as `oy * MSX_SCREEN_H / MSX_DISP_H` (exact 2:3). */
@@ -1281,6 +1292,41 @@ static inline uint8_t hdmi_565be_to_332(uint16_t raw565be) {
     return (uint8_t)((r3 << 5) | (g3 << 2) | b2);
 }
 
+/* 2026-09-05: HDMI receiver hardware-reset line — see
+ * hdmi_bridge_receiver's notes/sender_reset_line.md. Real-hardware
+ * finding: powering up (or hot-plugging) the receiver Pico 2 while the
+ * HDMI cable is already connected can leave it stuck in a bad initial
+ * state — suspected backfeed through the TMDS lines' series resistors
+ * charging the chip's IO rail before VSYS is applied, upsetting
+ * power-on-reset timing. A spare sender GPIO wired directly to the
+ * receiver's RUN pin (RP2350's dedicated hardware reset input, distinct
+ * from GPIO0-29) forces a real power-on-equivalent reset regardless of
+ * whatever firmware state the receiver was stuck in.
+ *
+ * Idle Hi-Z (input) rather than a permanently-driven push-pull output —
+ * the receiver board already has its own pull-up on RUN, so Hi-Z reads
+ * as a stable High; only briefly switched to output-low to assert the
+ * reset, then released back to Hi-Z. Safer across a power-sequencing
+ * mismatch between the two boards than fighting the receiver's own
+ * pull-up (or a floating RUN if the sender resets first) with a
+ * continuously-driven line. */
+static int hdmi_reset_pin = -1;
+
+void msx_hdmi_reset_init(uint8_t reset_pin) {
+    hdmi_reset_pin = (int)reset_pin;
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN); /* idle: Hi-Z, receiver's own pull-up holds RUN High */
+}
+
+void msx_hdmi_reset_pulse(void) {
+    if (hdmi_reset_pin < 0) return;
+    uint pin = (uint)hdmi_reset_pin;
+    gpio_set_dir(pin, GPIO_OUT);
+    gpio_put(pin, 0);
+    sleep_ms(20);
+    gpio_set_dir(pin, GPIO_IN); /* back to Hi-Z; pull-up restores High */
+}
+
 void msx_send_hdmi_palette(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
@@ -1516,6 +1562,9 @@ void msx_init_display_hardware(msx_state_t *msx,
     (void)lcd_w; (void)lcd_h; (void)rotate_180;
 }
 void msx_wait_display(msx_state_t *msx)    { (void)msx; }
+void msx_set_backlight(msx_state_t *msx, bool on) { (void)msx; (void)on; }
+void msx_hdmi_reset_init(uint8_t reset_pin) { (void)reset_pin; }
+void msx_hdmi_reset_pulse(void) { }
 void msx_render_to_display(msx_state_t *msx) { (void)msx; }
 void msx_render_to_display_1to1(msx_state_t *msx) { (void)msx; }
 void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {

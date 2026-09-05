@@ -437,6 +437,22 @@ void msx_render_to_display_1to1(msx_state_t *msx);
 /* Wait for the DMA display transfer to complete (blocking). */
 void msx_wait_display(msx_state_t *msx);
 
+/* 2026-09-05: LCD backlight on/off (spi_bl_pin GPIO only, no bus access).
+ * No-op if the LCD was never initialized (msx->display_ready false —
+ * e.g. boot_exclusive skipped it entirely). See msx_core.c's comment. */
+void msx_set_backlight(msx_state_t *msx, bool on);
+
+/* 2026-09-05: HDMI receiver hardware-reset line (see
+ * hdmi_bridge_receiver's notes/sender_reset_line.md and msx_core.c's
+ * comment). msx_hdmi_reset_init(reset_pin) configures a spare GPIO wired
+ * to the receiver's RUN pin (idle Hi-Z); msx_hdmi_reset_pulse() briefly
+ * drives it low to force a hardware reset, then releases it back to
+ * Hi-Z. Not tied to msx_state_t — independent of display/HDMI-ready
+ * state, since its whole purpose is recovering a receiver that never
+ * came up correctly in the first place. */
+void msx_hdmi_reset_init(uint8_t reset_pin);
+void msx_hdmi_reset_pulse(void);
+
 /* Configure the HDMI bridge output (see hdmi_bridge/README.md). Reuses the
  * same SPI instance already set up for the LCD/SD (msx->spi_inst) — must
  * be called AFTER msx_init_display_hardware(). cs_pin is a new, dedicated

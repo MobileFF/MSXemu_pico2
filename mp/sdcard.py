@@ -247,7 +247,36 @@ class SDCard:
     # following any HDMI activity would silently stay in HDMI's mode 3
     # instead of the mode 0 SD cards require — reproduced on real hardware
     # as "OSError: timeout waiting for response" from readinto() below.
+    #
+    # 2026-09-06: readblocks()/writeblocks() themselves now retry a few
+    # times on OSError before giving up, re-issuing spi.init() each attempt.
+    # Real-hardware finding: a single dropped/malformed R1 response (the
+    # shared-bus timing-margin issue already tracked elsewhere in this
+    # file/msx_menu.py's lcd_suspend()) used to raise OSError(5) straight
+    # out of the *first* failed command, which uos.mount()'s VFS layer then
+    # treated as fatal for the whole card — every subsequent SD access for
+    # the rest of the session failed the same way (observed as the runtime
+    # menu becoming permanently inaccessible after one such hiccup, even
+    # though the very next SPI transaction on its own usually succeeds
+    # fine). A handful of retries costs nothing on the common case (they
+    # never trigger) and turns a one-off marginal bus glitch back into a
+    # transient, recoverable hiccup instead of a session-ending failure.
+    _RETRY_COUNT = 3
+    _RETRY_DELAY_MS = 5
+
     def readblocks(self, block_num, buf):
+        last_exc = None
+        for attempt in range(self._RETRY_COUNT):
+            if attempt:
+                time.sleep_ms(self._RETRY_DELAY_MS)
+            try:
+                self._readblocks_once(block_num, buf)
+                return
+            except OSError as e:
+                last_exc = e
+        raise last_exc
+
+    def _readblocks_once(self, block_num, buf):
         self.spi.init(baudrate=self.baudrate, polarity=0, phase=0)
         try:
             nblocks = len(buf) // 512
@@ -279,6 +308,18 @@ class SDCard:
             self.spi.init(baudrate=self.restore_baudrate, polarity=0, phase=0)
 
     def writeblocks(self, block_num, buf):
+        last_exc = None
+        for attempt in range(self._RETRY_COUNT):
+            if attempt:
+                time.sleep_ms(self._RETRY_DELAY_MS)
+            try:
+                self._writeblocks_once(block_num, buf)
+                return
+            except OSError as e:
+                last_exc = e
+        raise last_exc
+
+    def _writeblocks_once(self, block_num, buf):
         self.spi.init(baudrate=self.baudrate, polarity=0, phase=0)
         try:
             nblocks = len(buf) // 512
@@ -287,7 +328,7 @@ class SDCard:
                 # CMD24: set write address for single block
                 if self.cmd(24, block_num * self.cdv, 0) != 0:
                     raise OSError(5)  # EIO
-    
+
                 # send the data
                 self.write(_TOKEN_DATA, buf)
             else:
