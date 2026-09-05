@@ -14,7 +14,7 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - **External Keyboard**: Supports USB HID keyboards in host mode.
 - **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM via a cache on the Pico 2's own onboard flash.
 - **Storage**: Loads the BIOS/cartridge ROM from an SD card, and supports zero-copy save/load state (including RAM and VRAM).
-- **Runtime Menu**: GUI+F7 on a USB keyboard opens an on-screen menu for swapping cartridges, saving/loading state, resetting, adjusting volume/audio filter, and HDMI settings — all without stopping gameplay.
+- **Runtime Menu**: GUI+F7 on a USB keyboard opens an on-screen menu for swapping cartridges, saving/loading state, resetting, adjusting volume/audio filter, and display settings (including switching between LCD/HDMI) — all without stopping gameplay.
 - **Joystick Support**: Supports an Atari/MSX 9-pin joystick (JOY1) — directions and trigger A/B.
 - **Optional HDMI Output**: Video can also be output over HDMI using a second Pico 2 + PICO-HDMI-PLUS (see [hdmi_bridge/README.md](hdmi_bridge/README.md)).
 
@@ -23,7 +23,7 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - **MSX1 only.** MSX2/2+/turboR emulation is not supported.
 - **Only one cartridge slot can be used at a time.** Loading two cartridges simultaneously is not supported.
 - **Does not run on the original Raspberry Pi Pico (RP2040).** A Raspberry Pi Pico 2 (RP2350) is required due to performance and RAM requirements.
-- **Using a Mega ROM together with HDMI output can slightly reduce performance** (due to onboard-flash cache reads). Adjust the Skip Frame setting (`hdmi_frame_skip`) in the runtime "HDMI Settings" menu if needed.
+- **Using a Mega ROM together with HDMI output can slightly reduce performance** (due to onboard-flash cache reads). Adjust the Frame Skip setting (`hdmi_frame_skip`) in the runtime "Display Settings" menu if needed.
 - **Joystick port 2 (JOY2) is not supported.** Only JOY1 is available.
 - **LCD and HDMI are mutually exclusive outputs.** Simultaneous output (the former `display=both`) was removed — switching SPI mode every frame between the two was found unreliable on real hardware. Choose either `display=lcd` or `display=hdmi`.
 

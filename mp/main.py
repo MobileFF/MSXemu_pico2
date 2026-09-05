@@ -60,9 +60,11 @@ msx.ini format (key=value, # = comment):
   # display=hdmi.
   #
   # All of the above except bios/cart (ROM selector instead) can be tuned
-  # live via GUI+F7 — Audio/HDMI/Display Settings. ENTER writes it back to
+  # live via GUI+F7 — Audio/Display Settings. ENTER writes it back to
   # msx.ini; audio/display/frame_skip take effect live, while
-  # lcd/rotate/hdmi_baud need a restart (read once at boot).
+  # lcd/rotate/hdmi_baud need a restart (read once at boot; the same menu
+  # also offers a "Reinit ... now" action for the active side, no restart
+  # needed — see msx_display_settings.py).
 
 Joystick (Atari/MSX 9-pin port wired directly to GPIO, PULL_UP/active-low,
 JOY1 only): UP=GP18 DOWN=GP19 LEFT=GP20 RIGHT=GP21 TRIG-A=GP26 TRIG-B=GP27.
@@ -135,7 +137,7 @@ DEFAULT_LCD_MODEL = "ST7796"
 # LCD and HDMI are mutually exclusive outputs — msx.ini: display=lcd
 # (default) or display=hdmi. No separate on/off flag: HDMI hardware is
 # only ever initialized when display=hdmi (at boot, or live from the
-# HDMI Settings menu — see _init_hdmi_output()/poll_keyboard() below).
+# Display Settings menu — see _init_hdmi_output()/poll_keyboard() below).
 # 2026-09-06: simultaneous LCD+HDMI ('both') used to also be selectable
 # but was found unreliable on real hardware (switching SPI mode every
 # frame between the two eventually corrupts/loses the HDMI signal and
@@ -380,7 +382,7 @@ _cart_path = None  # currently loaded cart's full path, or None (BASIC
                    # save_state()/load_state() (F5/F8) and the runtime
                    # menu's Save/Load State both key off this so each
                    # cart keeps its own rotating save history.
-_display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see HDMI Settings menu
+_display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see Display Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
 
@@ -395,11 +397,14 @@ _rotate_180 = False
 _lcd_model = DEFAULT_LCD_MODEL  # 'ST7796'|'ILI9341'; restart-only, see Display Settings.
 
 def _init_hdmi_output():
-    """Callback for the HDMI Settings menu — see msx_menu.show_emulator_menu().
-    Called the moment 'display' switches to 'hdmi' live (boot may have
-    started on 'lcd', which never initializes HDMI hardware at all — see
-    the exclusive boot logic in run()); idempotent, safe to call more
-    than once (e.g. if HDMI was already the active side at boot)."""
+    """Callback for the Display Settings menu (msx_display_settings.py) —
+    see msx_menu.show_emulator_menu(). Called the moment 'display'
+    switches to 'hdmi' live (boot may have started on 'lcd', which never
+    initializes HDMI hardware at all — see the exclusive boot logic in
+    run()); idempotent, safe to call more than once (e.g. if HDMI was
+    already the active side at boot, or the user picked "Reinit HDMI
+    now" — see msx_display_settings.py's show() docstring for why that
+    exists)."""
     msx.hdmi_reset_init(HDMI_RESET_PIN)
     msx.hdmi_reset_pulse()
     time.sleep_ms(HDMI_RESET_GRACE_MS)
@@ -410,13 +415,13 @@ def _init_hdmi_output():
 
 
 def _init_lcd_output():
-    """Callback for the HDMI Settings menu — mirrors _init_hdmi_output()
+    """Callback for the Display Settings menu — mirrors _init_hdmi_output()
     above for the other direction. Called the moment 'display' switches
     to 'lcd' live (boot may have started on 'hdmi', which skips the LCD
     panel's own init/reset sequence entirely — see run()). Idempotent:
     msx.init_display_hardware() always re-runs the full panel reset
     sequence, harmless to repeat (e.g. if LCD was already the active side
-    at boot)."""
+    at boot, or the user picked "Reinit LCD now")."""
     msx.init_display_hardware(
         SPI_ID, SPI_BAUD, SPI_MOSI, SPI_SCK,
         SPI_CS, SPI_DC, SPI_RST, SPI_BL,
@@ -486,13 +491,13 @@ def poll_keyboard():
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
         try:
-            hdmi_state, display_state, _cart_path = show_emulator_menu(
+            display_state, _cart_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
-                hdmi_state={'display': _display_mode,
-                            'frame_skip': _hdmi_frame_skip},
                 init_hdmi_output=_init_hdmi_output,
                 init_lcd_output=_init_lcd_output,
-                display_state={'lcd': _lcd_model, 'rotate': _rotate_180,
+                display_state={'display': _display_mode,
+                                'frame_skip': _hdmi_frame_skip,
+                                'lcd': _lcd_model, 'rotate': _rotate_180,
                                 'hdmi_baud': _hdmi_baud},
                 cart_path=_cart_path)
         except Exception as e:
@@ -528,14 +533,14 @@ def poll_keyboard():
                     print("Display re-init attempted after menu crash")
                 except Exception as disp_e:
                     print(f"Display re-init also failed: {disp_e!r}")
-            hdmi_state = {'display': _display_mode,
-                          'frame_skip': _hdmi_frame_skip}
-            display_state = {'lcd': _lcd_model, 'rotate': _rotate_180,
+            display_state = {'display': _display_mode,
+                             'frame_skip': _hdmi_frame_skip,
+                             'lcd': _lcd_model, 'rotate': _rotate_180,
                              'hdmi_baud': _hdmi_baud}
-        _display_mode    = hdmi_state['display']
-        _hdmi_frame_skip = hdmi_state['frame_skip']
-        # display_state has no live effect — kept only so Display Settings
-        # shows the last-picked values if reopened this session.
+        _display_mode    = display_state['display']
+        _hdmi_frame_skip = display_state['frame_skip']
+        # lcd/rotate/hdmi_baud have no live effect — kept only so Display
+        # Settings shows the last-picked values if reopened this session.
         _lcd_model      = display_state['lcd']
         _rotate_180     = display_state['rotate']
         _hdmi_baud      = display_state['hdmi_baud']
@@ -643,7 +648,7 @@ def run():
     #     Skipped entirely when display=hdmi (msx_core.c's
     #     hdmi_apply_spi_settings() doesn't depend on this having run) —
     #     _lcd_w/_lcd_h/_rotate_180/_lcd_model are still recorded either
-    #     way so a later live switch to 'lcd' from the HDMI Settings menu
+    #     way so a later live switch to 'lcd' from the Display Settings menu
     #     (_init_lcd_output()) has the right panel parameters on hand.
     global _lcd_w, _lcd_h, _rotate_180, _lcd_model
     _lcd_w, _lcd_h, _rotate_180, _lcd_model = lcd_w, lcd_h, rotate_180, lcd_model
@@ -665,7 +670,7 @@ def run():
     #       Only initialized when display=hdmi — users without the second
     #       Pico2+PICO-HDMI-PLUS just leave display unset/'lcd' and are
     #       completely unaffected. 'display'/'hdmi_frame_skip' can also be
-    #       changed live afterward via the GUI+F7 "HDMI Settings" menu
+    #       changed live afterward via the GUI+F7 "Display Settings" menu
     #       (see poll_keyboard()); the globals set here are just the
     #       msx.ini-driven starting point.
     #
@@ -838,7 +843,7 @@ def run():
         iter_start = time.ticks_us()
 
         # Reads the live global every iteration (not a cached boolean) so
-        # a change made via the GUI+F7 "HDMI Settings" menu takes effect
+        # a change made via the GUI+F7 "Display Settings" menu takes effect
         # on the very next frame, no restart needed. Mutually exclusive —
         # see _display_mode's comment — so exactly one of these is true.
         use_hdmi = _display_mode == 'hdmi'

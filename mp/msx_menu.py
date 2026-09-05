@@ -44,7 +44,7 @@ C_RED    = rgb(220, 0,   0)
 # ---------------------------------------------------------------------------
 # HDMI bridge state (hdmi_bridge/README.md), mirrored here from main.py's
 # globals so MenuCanvas.flush() can also update the HDMI output — otherwise
-# every screen in this file (runtime menu, Audio/HDMI Settings, ROM
+# every screen in this file (runtime menu, Audio/Display Settings, ROM
 # selector, boot error screen) would only ever repaint the LCD, leaving
 # HDMI frozen on the last gameplay frame while a menu is open. main.py
 # calls set_display_state() once at boot and again whenever the HDMI
@@ -209,7 +209,8 @@ def _echo_msg(msg):
     (not on every redraw of the same screen, since these draw functions
     get called repeatedly while a message stays on screen). The LCD's
     small font truncates messages (canvas.text(msg[:31], ...) below and
-    in _draw_runtime_menu()/_draw_audio_settings()/_draw_hdmi_settings()),
+    in _draw_runtime_menu()/_draw_audio_settings()/msx_display_settings.py's
+    _draw()),
     so a long error (e.g. a full OSError's text) is otherwise only ever
     partially readable on-screen."""
     global _last_printed_msg
@@ -601,7 +602,7 @@ def select_rom(msx_module, directory, title="Select ROM",
 # ---------------------------------------------------------------------------
 
 _RUNTIME_ITEMS = ["Swap Cartridge", "Save State", "Load State",
-                  "Audio Settings", "HDMI Settings", "Display Settings",
+                  "Audio Settings", "Display Settings",
                   "Reset MSX", "Resume"]
 
 # Volume steps in 16-unit increments (0-256; 256 = original full-scale
@@ -610,13 +611,6 @@ _RUNTIME_ITEMS = ["Swap Cartridge", "Save State", "Load State",
 _VOLUME_STEP = 16
 _VOLUME_MAX  = 256
 _FILTER_MAX  = 8
-
-# HDMI bridge output settings (hdmi_bridge/README.md) — see main.py's
-# HDMI_CS_PIN/HDMI_BAUD. 'display' selects which output(s) get rendered
-# each frame; 'frame_skip' throttles how often the (blocking, ~40ms at
-# 10MHz) HDMI send runs.
-_DISPLAY_MODES = ["lcd", "hdmi"]  # mutually exclusive — no 'both' (see set_display_state())
-_FRAME_SKIP_MAX = 8
 
 def _draw_runtime_menu(canvas, cursor, msg=""):
     _echo_msg(msg)
@@ -726,122 +720,15 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
         _draw_audio_settings(canvas, cursor, volume, filt, msg)
 
 
-def _draw_hdmi_settings(canvas, cursor, state, msg=""):
-    _echo_msg(msg)
-    canvas.clear(C_BLACK)
-    canvas.rect(0, 0, canvas.W, 12, C_YELLOW, fill=True)
-    canvas.text("HDMI SETTINGS", 2, 2, C_BLACK)
-
-    rows = [
-        f"Display: {state['display'].upper()}",
-        f"Frame Skip: {state['frame_skip']}",
-    ]
-    y = 20
-    for i, label in enumerate(rows):
-        if i == cursor:
-            canvas.rect(0, y, canvas.W, 10, C_GREEN, fill=True)
-            canvas.text(label, 2, y + 1, C_BLACK)
-        else:
-            canvas.text(label, 2, y + 1, C_WHITE)
-        y += 12
-
-    if msg:
-        canvas.text(msg[:31], 2, y + 6, C_CYAN)
-
-    canvas.hline(0, canvas.H - 21, canvas.W, C_GRAY)
-    canvas.text("LEFT/RIGHT:adjust  UP/DOWN:field", 2, canvas.H - 20, C_GRAY)
-    canvas.text("ENTER:save  ESC:back(no save)", 2, canvas.H - 10, C_GRAY)
-    canvas.flush()
-
-
-def _show_hdmi_settings_menu(msx_module, usb_host_mod, config_path, hdmi_state,
-                              init_hdmi_output, init_lcd_output):
-    """
-    Live-adjustable Display/Frame Skip screen (hdmi_bridge/README.md).
-    Changes take effect immediately, same philosophy as _show_audio_settings_
-    menu(): adjusting here affects the running session right away (the
-    caller's main loop reads these values every frame), and ENTER additionally
-    persists them into msx.ini. ESC returns without writing the file, but
-    the live-adjusted values remain in effect for the rest of this session.
-
-    hdmi_state: dict with keys 'display' ('lcd'/'hdmi' — mutually exclusive,
-    see set_display_state()), 'frame_skip' (int). Returned (possibly
-    modified) so the caller can update its own module-level globals.
-
-    init_hdmi_output/init_lcd_output: callbacks taking no args, called the
-    moment 'display' switches to that side — since a boot that started on
-    the *other* side never initialized this one's hardware at all (see
-    main.py's exclusive boot logic), switching here needs that same
-    one-time GPIO/SPI setup. Both are safe/idempotent to call more than
-    once (harmless if that side was already initialized, e.g. at boot).
-    """
-    import time
-
-    canvas = MenuCanvas(msx_module)
-    cursor = 0
-    state = dict(hdmi_state)
-    msg = ""
-
-    _draw_hdmi_settings(canvas, cursor, state, msg)
-    _wait_key_release(usb_host_mod)
-
-    last_key = 0
-    while True:
-        time.sleep_ms(30)
-        key = _get_key(usb_host_mod)
-        if key == last_key:
-            continue
-        last_key = key
-        if key == 0:
-            continue
-
-        msg = ""
-        if key == HID_UP or key == HID_DOWN:
-            cursor = (cursor - 1) % 2 if key == HID_UP else (cursor + 1) % 2
-        elif key == HID_LEFT or key == HID_RIGHT:
-            sign = -1 if key == HID_LEFT else 1
-            if cursor == 0:
-                idx = _DISPLAY_MODES.index(state['display'])
-                idx = (idx + sign) % len(_DISPLAY_MODES)
-                state['display'] = _DISPLAY_MODES[idx]
-                set_display_state(state['display'])
-                if state['display'] == 'hdmi':
-                    init_hdmi_output()
-                else:
-                    init_lcd_output()
-            else:
-                state['frame_skip'] = max(1, min(_FRAME_SKIP_MAX,
-                                                  state['frame_skip'] + sign))
-        elif key == HID_ENTER:
-            _wait_key_release(usb_host_mod)
-            if config_path is None:
-                msg = "No config path — not saved"
-            else:
-                try:
-                    save_config(config_path, {
-                        'display': state['display'],
-                        'hdmi_frame_skip': str(state['frame_skip']),
-                    })
-                    msg = "Saved to msx.ini"
-                except Exception as e:
-                    msg = f"Save failed: {e}"
-            _draw_hdmi_settings(canvas, cursor, state, msg)
-            time.sleep_ms(800)
-            return state
-        elif key == HID_ESC:
-            _wait_key_release(usb_host_mod)
-            return state
-
-        _draw_hdmi_settings(canvas, cursor, state, msg)
-
-
-# "Display Settings" (LCD panel/rotation/HDMI baud/exclusive boot) lives
-# in msx_display_settings.py, imported lazily below only when the user
-# actually opens it — see show_emulator_menu()'s "Display Settings" branch.
+# "Display Settings" (display routing/frame skip/LCD panel/rotation/HDMI
+# baud/manual reinit — unified into one screen, see its module docstring)
+# lives in msx_display_settings.py, imported lazily below only when the
+# user actually opens it — see show_emulator_menu()'s "Display Settings"
+# branch.
 
 
 def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
-                       save_path, config_path=None, hdmi_state=None,
+                       save_path, config_path=None,
                        init_hdmi_output=None, init_lcd_output=None,
                        display_state=None, cart_path=None):
     """
@@ -849,14 +736,11 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     All actions (cart swap, save/load, reset) are performed directly here;
     the caller just needs to resume its main loop once this returns.
 
-    hdmi_state/init_hdmi_output/init_lcd_output: see
-    _show_hdmi_settings_menu(). Pass the caller's current display/
-    frame_skip state in (a dict with keys 'display' ('lcd'/'hdmi',
-    mutually exclusive — see set_display_state()) and 'frame_skip').
-
-    display_state: see msx_display_settings.show(). Pass the caller's
-    current lcd/rotate/hdmi_baud state in (a dict, built from whatever it
-    actually initialized at boot).
+    display_state/init_hdmi_output/init_lcd_output: see
+    msx_display_settings.show(). Pass the caller's current display/
+    frame_skip/lcd/rotate/hdmi_baud state in (a dict, built from whatever
+    it actually initialized at boot — 'display' is 'lcd'/'hdmi', mutually
+    exclusive, see set_display_state()).
 
     save_path/cart_path: `save_path` is really a fallback save-state BASE
     path (no cart loaded / BASIC-only session) — save_base_for_cart()
@@ -867,8 +751,8 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     cart_path is updated here when Swap Cartridge succeeds and returned
     so the caller can keep it for its own F5/F8 hotkey saves.
 
-    Returns (hdmi_state, display_state, cart_path), all possibly updated,
-    so the caller can update its own globals.
+    Returns (display_state, cart_path), both possibly updated, so the
+    caller can update its own globals.
     """
     import time
 
@@ -898,13 +782,13 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
             msg = ""
         elif key == HID_ESC:
             _wait_key_release(usb_host_mod)
-            return hdmi_state, display_state, cart_path
+            return display_state, cart_path
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
             label = _RUNTIME_ITEMS[cursor]
 
             if label == "Resume":
-                return hdmi_state, display_state, cart_path
+                return display_state, cart_path
 
             elif label == "Swap Cartridge":
                 # select_rom() suspends HDMI internally around its own SD
@@ -1036,16 +920,12 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                 _show_audio_settings_menu(msx_module, usb_host_mod, config_path)
                 msg = ""
 
-            elif label == "HDMI Settings":
-                hdmi_state = _show_hdmi_settings_menu(
-                    msx_module, usb_host_mod, config_path, hdmi_state,
-                    init_hdmi_output, init_lcd_output)
-                msg = ""
-
             elif label == "Display Settings":
                 import msx_display_settings  # lazy — see its own docstring
                 display_state = msx_display_settings.show(
-                    msx_module, usb_host_mod, config_path, display_state)
+                    msx_module, usb_host_mod, config_path, display_state,
+                    init_hdmi_output=init_hdmi_output,
+                    init_lcd_output=init_lcd_output)
                 msg = ""
 
             elif label == "Reset MSX":
