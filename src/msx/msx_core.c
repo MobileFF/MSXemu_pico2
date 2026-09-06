@@ -1349,6 +1349,27 @@ void msx_send_hdmi_palette(msx_state_t *msx) {
 }
 
 void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {
+    /* 2026-09-06: msx->spi_inst is otherwise only ever set by
+     * msx_init_display_hardware() (the LCD path) — every HDMI send
+     * function (msx_send_hdmi_palette()/msx_render_to_hdmi()/
+     * msx_clear_hdmi()/msx_render_to_hdmi_raw332()) reads it back via
+     * `(spi_inst_t *)msx->spi_inst` with no null check. That was a latent
+     * gap even before display=lcd/hdmi became strictly exclusive (an
+     * explicit boot_exclusive+display=hdmi combo hit it too), but a
+     * display=hdmi boot now *always* skips msx_init_display_hardware()
+     * entirely, making it unconditional: msx->spi_inst stayed NULL and
+     * the very first HDMI send (right here, msx_send_hdmi_palette()
+     * below) dereferenced it — spi_write_blocking(NULL, ...) with no
+     * fault handler installed hangs the whole board with no further
+     * serial output, exactly matching the real-hardware report ("HDMI
+     * bridge output enabled..." printed, then nothing — no boot ROM
+     * selector on either output). This project always wires the HDMI
+     * bridge onto SPI1 (shared with the LCD/SD, see HDMI_CS_PIN's
+     * comment in main.py) regardless of which side ends up owning
+     * display=lcd/hdmi at boot, so spi1 is always the correct value here
+     * — harmless to (re)assign even if msx_init_display_hardware() also
+     * set it to the same instance. */
+    msx->spi_inst = spi1;
     msx->hdmi_cs_pin  = cs_pin;
     msx->hdmi_baudrate = baudrate;
     /* Idle high (deasserted) — matches the HDMI receiver's SPI0 slave CSn
