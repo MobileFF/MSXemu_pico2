@@ -72,7 +72,7 @@ def show(msx_module, usb_host_mod, config_path, display_state,
     menu shows the last-picked values if reopened.
 
     'Display' and 'Frame Skip' take effect immediately (same philosophy
-    as _show_audio_settings_menu() in msx_menu.py) and are only persisted
+    as _show_audio_settings_menu() in msx_runtime_menu.py) and are only persisted
     to msx.ini when ENTER is pressed; 'LCD Panel'/'Rotate'/'HDMI Baud' are
     restart-only (read once at boot).
 
