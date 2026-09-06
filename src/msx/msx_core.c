@@ -1413,8 +1413,23 @@ void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {
  * MicroPython GC heap (a separate, tighter budget); the earlier MemoryError
  * was specific to a much bigger *LCD* scratch buffer discussed there.
  * Verify with msx.debug via gc.mem_free() before/after on real hardware
- * per doc/dev_guide.md's guidance for any new static buffer regardless. */
-static uint8_t hdmi_frame_buf_pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
+ * per doc/dev_guide.md's guidance for any new static buffer regardless.
+ *
+ * 2026-09-06: shares its storage (via this union) with the RAW332 menu
+ * frame buffer below — game frames (this member) and menu/UI frames
+ * (the other) are never being built at the same time, so there's no
+ * reason to pay for both at once. A first attempt at giving RAW332 its
+ * own separate 49152-byte buffer actually failed to link ("GcHeap is too
+ * small") on this board — confirming the earlier "static .bss doesn't
+ * pressure the GC heap" note only holds up to a point; the union keeps
+ * the combined cost at just the larger member's size (49152 bytes,
+ * RAW332's own requirement) instead of both sizes added together. */
+static union {
+    uint8_t pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
+    uint8_t raw332[MSX_SCREEN_W * MSX_SCREEN_H];
+} hdmi_frame_buf;
+#define hdmi_frame_buf_pal4   hdmi_frame_buf.pal4
+#define hdmi_frame_buf_raw332 hdmi_frame_buf.raw332
 
 /* Reverse-lookup: which of the 16 palette entries does this (byte-swapped)
  * RGB565 pixel match? framebuf only ever contains exact palette565[]
@@ -1498,15 +1513,32 @@ void msx_render_to_hdmi(msx_state_t *msx) {
     dma_active_cs_pin = (int)msx->hdmi_cs_pin;
 }
 
-/* Row buffer for the RAW332 fallback path — 1 byte/pixel, no palette
- * constraint. Used for the menu/UI screens (MenuCanvas in msx_menu.py),
- * which draw directly into the same C framebuf as the game screen but use
- * arbitrary UI colors outside the MSX's fixed 16-color hardware palette
- * (borders, highlights, etc.) — hdmi_find_palette_index() can't represent
- * those, so PAL4 would render everything that isn't an exact palette match
- * as black. The game's own render path (msx_render_to_hdmi() above) never
- * needs this: the VDP only ever writes exact palette565[] values. */
-static uint8_t hdmi_row_buf_raw332[MSX_SCREEN_W];
+/* RAW332 menu/UI frame path — see hdmi_frame_buf's comment above for the
+ * shared-storage union it uses (hdmi_frame_buf_raw332). Used for the
+ * menu/UI screens (MenuCanvas in msx_menu.py), which draw directly into
+ * the same C framebuf as the game screen but use arbitrary UI colors
+ * outside the MSX's fixed 16-color hardware palette (borders,
+ * highlights, etc.) — hdmi_find_palette_index() can't represent those,
+ * so PAL4 would render everything that isn't an exact palette match as
+ * black. The game's own render path (msx_render_to_hdmi() above) never
+ * needs this: the VDP only ever writes exact palette565[] values.
+ *
+ * 2026-09-06: this used to be a single per-row buffer, blocking on
+ * spi_write_blocking() 192 times per call — the exact same fully-blocking,
+ * one-row-at-a-time pattern msx_render_to_hdmi() itself used before its
+ * own 2026-09-04 DMA conversion (see hdmi_frame_buf's comment above), and
+ * this path never got the same treatment. Real-hardware finding: opening
+ * the runtime menu (GUI+F7) during a display=hdmi session — the first
+ * thing to ever call this function after a stretch of msx_render_to_hdmi()
+ * calls — reliably dropped the receiver to "No Signal". This project has
+ * an established real-hardware precedent for exactly this failure mode:
+ * msx_clear_hdmi()'s own comment already documents that a full ~49KB
+ * blocking PKT_FRAME send (as opposed to its own ~9-byte dedicated
+ * command) "was also implicated in the receiver intermittently losing
+ * HDMI sync" — this function was sending exactly that, every single menu
+ * redraw. Converted to the same build-full-frame-then-one-DMA-transfer
+ * pattern as msx_render_to_hdmi() for consistency and to remove the long
+ * CPU-blocking window entirely. */
 
 void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
@@ -1523,16 +1555,39 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
         (uint8_t)(MSX_SCREEN_H >> 8), (uint8_t)(MSX_SCREEN_H & 0xFF),
         (uint8_t)HDMI_SCALE, 0 /* reserved */
     };
-    gpio_put(msx->hdmi_cs_pin, 0);
-    spi_write_blocking(spi, header, sizeof(header));
+
+    /* Build the whole frame first (fast, no bus access) ... */
     for (int row = 0; row < MSX_SCREEN_H; row++) {
         const uint16_t *src = fb + (size_t)row * MSX_SCREEN_W;
+        uint8_t *dst = hdmi_frame_buf_raw332 + (size_t)row * MSX_SCREEN_W;
         for (int x = 0; x < MSX_SCREEN_W; x++) {
-            hdmi_row_buf_raw332[x] = hdmi_565be_to_332(src[x]);
+            dst[x] = hdmi_565be_to_332(src[x]);
         }
-        spi_write_blocking(spi, hdmi_row_buf_raw332, sizeof(hdmi_row_buf_raw332));
     }
-    gpio_put(msx->hdmi_cs_pin, 1);
+
+    /* ... then send it: header blocking (8 bytes, negligible), payload via
+     * DMA left in-flight — same pattern as msx_render_to_hdmi() above. */
+    if (msx_dma_chan < 0) {
+        msx_dma_chan = dma_claim_unused_channel(true);
+    }
+    gpio_put(msx->hdmi_cs_pin, 0);
+    spi_write_blocking(spi, header, sizeof(header));
+
+    dma_channel_config cfg = dma_channel_get_default_config(msx_dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&cfg, true);
+    channel_config_set_write_increment(&cfg, false);
+    channel_config_set_dreq(&cfg, spi_get_dreq(spi, true));
+    dma_channel_configure(
+        msx_dma_chan, &cfg,
+        &spi_get_hw(spi)->dr,
+        hdmi_frame_buf_raw332,
+        sizeof(hdmi_frame_buf_raw332),
+        true /* start now */
+    );
+    /* Deliberately NOT waiting / deasserting CS here — see
+     * msx_render_to_hdmi()'s comment and _spi_dma_wait()'s. */
+    dma_active_cs_pin = (int)msx->hdmi_cs_pin;
 }
 
 /* Sends the receiver's dedicated PKT_CLEAR_SCREEN command (header-only,
