@@ -100,7 +100,8 @@ import gc
 gc.collect()  # maximize contiguous free heap before compiling the next
               # (larger) imports below — non-compacting GC, so this is
               # cheap insurance against a marginal MemoryError here.
-from msx_keymap import apply_hid_report, HID_F5, HID_F7, HID_F8, MOD_LGUI, MOD_RGUI
+from msx_keymap import (apply_hid_report, HID_F5, HID_F7, HID_F8, HID_P,
+                       HID_ESC, MOD_LGUI, MOD_RGUI)
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
                         load_state_from, load_cart_smart,
@@ -392,6 +393,8 @@ _last_keycodes = b'\x00' * 6
 _save_held = False
 _load_held = False
 _menu_held = False
+_display_held = False  # GUI+P
+_reinit_held = False   # GUI+ESC
 _bios_name = ""
 _cart_path = None  # currently loaded cart's full path, or None (BASIC
                    # only) — see save_base_for_cart() in msx_menu.py;
@@ -447,6 +450,7 @@ def _init_lcd_output():
 
 def poll_keyboard():
     global _last_modifier, _last_keycodes, _save_held, _load_held, _menu_held
+    global _display_held, _reinit_held
     global _display_mode, _hdmi_frame_skip
     global _lcd_model, _rotate_180, _hdmi_baud, _cart_path
     if not _usb_ready:
@@ -472,9 +476,58 @@ def poll_keyboard():
     _save_held = f5_down
     _load_held = f8_down
 
+    gui_down = (mod & (MOD_LGUI | MOD_RGUI)) != 0
+
+    # GUI+P: toggle display=lcd/hdmi live, without opening any menu (and
+    # so without importing msx_runtime_menu.py/msx_display_settings.py —
+    # see their own MemoryError-under-heap-pressure history). Same effect
+    # as Display Settings' "Display" field, just reachable in one
+    # keystroke. Edge-triggered so holding the combo doesn't keep
+    # toggling.
+    display_toggle_down = gui_down and HID_P in kc
+    if display_toggle_down and not _display_held:
+        # Drain whatever the *previous* frame's render_to_hdmi() left
+        # in-flight before init_display_hardware()/init_hdmi_output()
+        # reconfigure the shared SPI1 peripheral out from under it —
+        # msx_init_display_hardware() doesn't drain this itself (unlike
+        # msx_send_hdmi_palette(), which init_hdmi_output() calls
+        # internally and which already does). Same reasoning as GUI+F7's
+        # wait_display() call below.
+        msx.wait_display()
+        _display_mode = 'lcd' if _display_mode == 'hdmi' else 'hdmi'
+        set_display_state(_display_mode)
+        if _display_mode == 'hdmi':
+            _init_hdmi_output()
+        else:
+            _init_lcd_output()
+        msx.set_backlight(_display_mode != 'hdmi')
+    _display_held = display_toggle_down
+    if display_toggle_down:
+        return  # don't forward GUI/P to the MSX matrix while held
+
+    # GUI+ESC: reinit the *currently active* display side in place —
+    # same action as Display Settings' "Reinit ... now" row, without
+    # opening any menu. Added for real-hardware "No Signal" recovery
+    # during long display=hdmi sessions (see msx_send_hdmi_palette()'s
+    # comment in msx_core.c for the suspected desync this resends) —
+    # reaching it via the menu means importing two lazy modules first,
+    # slower and heap-hungrier than this needs to be for what's meant to
+    # be a quick recovery action. Edge-triggered.
+    reinit_down = gui_down and HID_ESC in kc
+    if reinit_down and not _reinit_held:
+        # See GUI+P's identical wait_display() comment above.
+        msx.wait_display()
+        if _display_mode == 'hdmi':
+            _init_hdmi_output()
+        else:
+            _init_lcd_output()
+    _reinit_held = reinit_down
+    if reinit_down:
+        return  # don't forward GUI/ESC to the MSX matrix while held
+
     # GUI+F7: runtime emulator menu (cart swap, save/load, reset).
     # Edge-triggered so holding the combo doesn't reopen the menu.
-    menu_down = (mod & (MOD_LGUI | MOD_RGUI)) != 0 and HID_F7 in kc
+    menu_down = gui_down and HID_F7 in kc
     if menu_down and not _menu_held:
         # 2026-08-29: poll_keyboard() (this function) is deliberately called
         # from run()'s main loop *while the current frame's LCD DMA transfer

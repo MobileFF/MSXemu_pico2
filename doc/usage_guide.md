@@ -66,6 +66,8 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 | F5 | クイックセーブ |
 | F8 | クイックロード |
 | GUI（Win/Cmd）+ F7 | 実行時メニューを開く |
+| GUI（Win/Cmd）+ P | LCD/HDMI表示をその場で切り替え（メニューを開かない） |
+| GUI（Win/Cmd）+ ESC | 現在使用中の表示（LCD/HDMI）を再初期化（メニューを開かない。HDMIの長時間プレイ後のNo Signal復旧用） |
 
 詳細は `ext_hooks_guide.md` を参照。
 
