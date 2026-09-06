@@ -585,6 +585,11 @@ def select_rom(msx_module, directory, title="Select ROM",
     """Thin lazy-import wrapper — see msx_rom_browser.select() for the
     actual implementation (kept out of this module's eager compile path;
     only loaded the first time a ROM actually needs picking)."""
+    import gc
+    gc.collect()  # defragment before compiling msx_rom_browser.py — real-
+                  # hardware finding: this can be imported mid-gameplay
+                  # (Swap Cartridge), where cart/emulation state has
+                  # already fragmented the heap more than at a fresh boot.
     import msx_rom_browser
     return msx_rom_browser.select(msx_module, directory, title=title,
                                   usb_host_mod=usb_host_mod,
@@ -609,6 +614,13 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     # Thin lazy-import wrapper — see msx_runtime_menu.show() for the
     # actual implementation (kept out of this module's eager compile
     # path; only loaded the first time GUI+F7 is actually pressed).
+    import gc
+    gc.collect()  # defragment before compiling msx_runtime_menu.py — this
+                  # first GUI+F7 press happens mid-gameplay, where cart/
+                  # emulation state has already fragmented the heap more
+                  # than at a fresh boot (real-hardware finding — see the
+                  # same reasoning for msx_display_settings.py's own lazy
+                  # import inside msx_runtime_menu.py).
     import msx_runtime_menu
     return msx_runtime_menu.show(msx_module, usb_host_mod, rom_dir,
                                  exclude_names, save_path,

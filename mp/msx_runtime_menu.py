@@ -1,20 +1,23 @@
-"""
-msx_runtime_menu.py — the GUI+F7 runtime emulator menu (cart swap, save/
-load, reset, Audio/Display Settings dispatch), split out of msx_menu.py
-and imported lazily (only the first time GUI+F7 is actually pressed) so
-its compile cost isn't paid at every boot — see msx_menu.py's
-show_emulator_menu() thin wrapper.
-
-2026-09-06: split out after a MemoryError reappeared compiling msx_menu.py
-at boot (main.py had grown enough this session that the combined peak —
-main.py's already-compiled/retained footprint plus msx_menu.py's own
-compile-time cost — exceeded the heap again, independent of msx_menu.py's
-absolute size). This was the single largest remaining eagerly-compiled
-chunk of msx_menu.py (everything else left there — MenuCanvas, save-state
-plumbing, cart loading, config I/O — is needed unconditionally at boot,
-so it can't be deferred the same way). Mirrors the exact pattern already
-used for msx_display_settings.py/msx_rom_browser.py/msx_save_slots.py.
-"""
+# msx_runtime_menu.py — the GUI+F7 runtime emulator menu (cart swap,
+# save/load, reset, Audio/Display Settings dispatch), split out of
+# msx_menu.py and imported lazily (only the first time GUI+F7 is
+# actually pressed) so its compile cost isn't paid at every boot — see
+# msx_menu.py's show_emulator_menu() thin wrapper.
+#
+# 2026-09-06: split out after a MemoryError reappeared compiling
+# msx_menu.py at boot (main.py had grown enough this session that the
+# combined peak — main.py's already-compiled/retained footprint plus
+# msx_menu.py's own compile-time cost — exceeded the heap again,
+# independent of msx_menu.py's absolute size). This was the single
+# largest remaining eagerly-compiled chunk of msx_menu.py (everything
+# else left there — MenuCanvas, save-state plumbing, cart loading,
+# config I/O — is needed unconditionally at boot, so it can't be
+# deferred the same way). Mirrors the exact pattern already used for
+# msx_display_settings.py/msx_rom_browser.py/msx_save_slots.py. (Also
+# converted from a docstring to comments — a real-hardware MemoryError
+# in the *next* lazy import, msx_display_settings.py, right after this
+# one had already loaded, showed every byte still matters here too: a
+# docstring is a retained string constant, a comment costs nothing.)
 
 from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
                       C_CYAN, C_GRAY, _echo_msg, _get_key, _wait_key_release,
@@ -312,6 +315,12 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # same reasoning as select_rom() — the interactive list
                 # itself is redrawn from RAM, no per-keypress SD access.
                 base = save_base_for_cart(cart_path, save_path)
+                import gc
+                gc.collect()  # defragment before compiling msx_save_slots.py
+                              # — real-hardware finding: this always happens
+                              # mid-gameplay, where cart/emulation state has
+                              # already fragmented the heap more than at a
+                              # fresh boot.
                 import msx_save_slots
                 chosen = msx_save_slots.select(msx_module, base,
                                                usb_host_mod=usb_host_mod)
@@ -335,6 +344,13 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 msg = ""
 
             elif label == "Display Settings":
+                import gc
+                gc.collect()  # defragment before compiling
+                              # msx_display_settings.py — real-hardware
+                              # finding (MemoryError here): this always
+                              # happens mid-gameplay, where cart/emulation
+                              # state has already fragmented the heap more
+                              # than at a fresh boot.
                 import msx_display_settings  # lazy — see its own docstring
                 display_state = msx_display_settings.show(
                     msx_module, usb_host_mod, config_path, display_state,

@@ -1,18 +1,20 @@
-"""
-msx_display_settings.py — unified "Display Settings" runtime menu screen
-(display routing / frame skip / LCD panel / rotation / HDMI baud / manual
-reinit), split out of msx_menu.py and imported lazily (only when the user
-actually opens this menu item) so its compile cost isn't paid at every
-boot — see show_emulator_menu()'s "Display Settings" branch in
-msx_menu.py.
-
-2026-09-06: this used to be two separate screens ("HDMI Settings":
-display/frame_skip, live; "Display Settings": lcd/rotate/hdmi_baud,
-restart-only) split back when 'display' had a third 'both' value and a
-separate hdmi=0/1 enable flag existed alongside it. Now that LCD/HDMI are
-strictly mutually exclusive (see msx_menu.set_display_state()) there's
-barely anything left to justify two menus, so they're merged into one.
-"""
+# msx_display_settings.py — unified "Display Settings" runtime menu
+# screen (display routing / frame skip / LCD panel / rotation / HDMI
+# baud / manual reinit), split out of msx_menu.py and imported lazily
+# (only when the user actually opens this menu item) so its compile
+# cost isn't paid at every boot — see show_emulator_menu()'s "Display
+# Settings" branch in msx_menu.py.
+#
+# 2026-09-06: this used to be two separate screens ("HDMI Settings":
+# display/frame_skip, live; "Display Settings": lcd/rotate/hdmi_baud,
+# restart-only) split back when 'display' had a third 'both' value and
+# a separate hdmi=0/1 enable flag existed alongside it. Now that
+# LCD/HDMI are strictly mutually exclusive (see
+# msx_menu.set_display_state()) there's barely anything left to justify
+# two menus, so they're merged into one. (Also: converted from a
+# docstring to comments here, and below, after a real-hardware
+# MemoryError compiling this exact module mid-gameplay — a docstring is
+# a retained string constant, a comment costs nothing at runtime.)
 
 from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
                       C_CYAN, C_GRAY, _echo_msg, _wait_key_release, _get_key,
@@ -63,36 +65,36 @@ def _draw(canvas, cursor, state, msg=""):
 
 def show(msx_module, usb_host_mod, config_path, display_state,
          init_hdmi_output=None, init_lcd_output=None):
-    """Unified Display/Frame Skip/LCD Panel/Rotate/HDMI Baud/Reinit editor.
-
-    display_state: dict with 'display' ('lcd'/'hdmi', mutually exclusive
-    — see set_display_state()), 'frame_skip' (int), 'lcd' (str, one of
-    _LCD_MODELS), 'rotate' (bool), 'hdmi_baud' (int, Hz). Returned
-    (possibly modified) so the caller can update its own globals and this
-    menu shows the last-picked values if reopened.
-
-    'Display' and 'Frame Skip' take effect immediately (same philosophy
-    as _show_audio_settings_menu() in msx_runtime_menu.py) and are only persisted
-    to msx.ini when ENTER is pressed; 'LCD Panel'/'Rotate'/'HDMI Baud' are
-    restart-only (read once at boot).
-
-    init_hdmi_output/init_lcd_output: callbacks taking no args, called
-    the moment 'Display' switches to that side — since a boot that
-    started on the *other* side never initialized this one's hardware at
-    all (see main.py's exclusive boot logic), switching here needs that
-    same one-time GPIO/SPI setup. Both are safe/idempotent to call more
-    than once (harmless if that side was already initialized, e.g. at
-    boot) — also reused directly by the last row ("Reinit ... now"),
-    added after real-hardware reports of the HDMI picture going black
-    and staying that way during long play sessions even though the menu
-    itself (which uses a different, palette-independent send path) still
-    draws fine — symptoms consistent with the receiver's color palette
-    table (sent once, at init — see msx_send_hdmi_palette()) getting
-    desynced somehow over a long session. Re-running the same init
-    resends it, a plausible real fix and not just a cosmetic no-op;
-    re-running the LCD's init similarly re-issues its full panel reset
-    sequence, a real recovery attempt for a wedged panel/peripheral.
-    """
+    # Unified Display/Frame Skip/LCD Panel/Rotate/HDMI Baud/Reinit editor.
+    #
+    # display_state: dict with 'display' ('lcd'/'hdmi', mutually
+    # exclusive — see set_display_state()), 'frame_skip' (int), 'lcd'
+    # (str, one of _LCD_MODELS), 'rotate' (bool), 'hdmi_baud' (int, Hz).
+    # Returned (possibly modified) so the caller can update its own
+    # globals and this menu shows the last-picked values if reopened.
+    #
+    # 'Display' and 'Frame Skip' take effect immediately (same
+    # philosophy as _show_audio_settings_menu() in msx_runtime_menu.py)
+    # and are only persisted to msx.ini when ENTER is pressed; 'LCD
+    # Panel'/'Rotate'/'HDMI Baud' are restart-only (read once at boot).
+    #
+    # init_hdmi_output/init_lcd_output: callbacks taking no args, called
+    # the moment 'Display' switches to that side — since a boot that
+    # started on the *other* side never initialized this one's hardware
+    # at all (see main.py's exclusive boot logic), switching here needs
+    # that same one-time GPIO/SPI setup. Both are safe/idempotent to
+    # call more than once (harmless if that side was already
+    # initialized, e.g. at boot) — also reused directly by the last row
+    # ("Reinit ... now"), added after real-hardware reports of the HDMI
+    # picture going black and staying that way during long play sessions
+    # even though the menu itself (a different, palette-independent send
+    # path) still draws fine — symptoms consistent with the receiver's
+    # color palette table (sent once, at init — see
+    # msx_send_hdmi_palette()) getting desynced somehow over a long
+    # session. Re-running the same init resends it, a plausible real fix
+    # and not just a cosmetic no-op; re-running the LCD's init similarly
+    # re-issues its full panel reset sequence, a real recovery attempt
+    # for a wedged panel/peripheral.
     import time
 
     canvas = MenuCanvas(msx_module)
