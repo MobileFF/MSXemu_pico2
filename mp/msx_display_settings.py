@@ -158,6 +158,11 @@ def show(msx_module, usb_host_mod, config_path, display_state,
                 # before backing out with ESC.
             else:
                 _wait_key_release(usb_host_mod)
+                # The previous redraw (display=hdmi) may still have a DMA
+                # transfer in-flight — drain it before save_config() below
+                # touches SD. See msx_wait_display()'s comment in
+                # msx_core.c. Cheap/no-op when display=lcd.
+                msx_module.wait_display()
                 if config_path is None:
                     msg = "No config path — not saved"
                 else:

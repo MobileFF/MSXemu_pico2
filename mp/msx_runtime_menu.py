@@ -124,6 +124,11 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
                 msx_module.set_audio_filter(filt)
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
+            # The previous redraw (display=hdmi) may still have a DMA
+            # transfer in-flight — drain it before save_config() below
+            # touches SD. See msx_wait_display()'s comment in msx_core.c.
+            # Cheap/no-op when display=lcd.
+            msx_module.wait_display()
             if config_path is None:
                 msg = "No config path — not saved"
             else:
@@ -253,6 +258,12 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                         # (shared bus with the LCD) — without this, the screen
                         # just freezes on the file list and looks hung.
                         _draw_runtime_menu(canvas, cursor, "Loading…")
+                        # This draw's own DMA transfer (display=hdmi) is left
+                        # in-flight — drain it before the SD-heavy work below
+                        # reconfigures the same shared SPI1 peripheral out
+                        # from under it. See msx_wait_display()'s comment in
+                        # msx_core.c. Cheap/no-op when display=lcd.
+                        msx_module.wait_display()
                         try:
                             import gc
                             # Eject the previous cart FIRST: if it was a paged
@@ -296,6 +307,11 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 _prev_hdmi = hdmi_suspend()
                 _prev_lcd  = lcd_suspend()
                 _draw_runtime_menu(canvas, cursor, "Saving…")
+                # Drain this draw's own in-flight DMA transfer (display=
+                # hdmi) before the SD write below — see the "Loading…"
+                # comment above / msx_wait_display()'s comment in
+                # msx_core.c. Cheap/no-op when display=lcd.
+                msx_module.wait_display()
                 try:
                     rotate_and_save_state(msx_module, save_base_for_cart(cart_path, save_path))
                     msg = "State saved"
@@ -319,6 +335,12 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                     _prev_hdmi = hdmi_suspend()
                     _prev_lcd  = lcd_suspend()
                     _draw_runtime_menu(canvas, cursor, "Loading…")
+                    # Drain this draw's own in-flight DMA transfer
+                    # (display=hdmi) before the SD read below — see the
+                    # Swap Cartridge branch's identical comment above /
+                    # msx_wait_display()'s comment in msx_core.c. Cheap/
+                    # no-op when display=lcd.
+                    msx_module.wait_display()
                     try:
                         ok = load_state_from(msx_module, chosen)
                         msg = "State loaded" if ok else "Invalid save file"

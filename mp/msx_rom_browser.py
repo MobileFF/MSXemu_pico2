@@ -106,6 +106,14 @@ def select(msx_module, directory, title="Select ROM",
     def _listing(d):
         # Suspended only around the actual SD listing; the browsing loop
         # itself just redraws `entries` from RAM (no per-keypress SD access).
+        # wait_display() first: the PREVIOUS _draw_file_list() call leaves
+        # its DMA transfer in-flight (display=hdmi, ~49ms at 8MHz for a
+        # full frame) — hdmi_suspend()'s own fixed 20ms settling pause
+        # isn't nearly enough to guarantee it's actually finished before
+        # uos.ilistdir() below reconfigures the same shared SPI1
+        # peripheral. See msx_wait_display()'s comment in msx_core.c.
+        # Cheap/no-op when display=lcd.
+        msx_module.wait_display()
         _prev_hdmi = hdmi_suspend()
         _prev_lcd  = lcd_suspend()
         try:

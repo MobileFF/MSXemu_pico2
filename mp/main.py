@@ -333,7 +333,15 @@ def init_usb():
 
 def save_state():
     # Rotates the same as the runtime menu's Save State — see
-    # rotate_and_save_state() in msx_menu.py.
+    # rotate_and_save_state() in msx_menu.py. Called from poll_keyboard()
+    # (F5), which runs before this frame's own render_to_hdmi() but while
+    # a *previous* frame's DMA transfer may still be in-flight (display=
+    # hdmi, ~25ms at 8MHz for a full palette-indexed frame — easily longer
+    # than one frame's budget at hdmi_frame_skip=1) — drain it first so
+    # the SD write below doesn't reconfigure the same shared SPI1
+    # peripheral out from under it. See msx_wait_display()'s comment in
+    # msx_core.c. Cheap/no-op when display=lcd.
+    msx.wait_display()
     base = save_base_for_cart(_cart_path, SAVE_BASE)
     print(f"Saving state (base {base})…")
     try:
@@ -345,7 +353,9 @@ def save_state():
 
 def load_state():
     # Hotkey always loads the most recent slot (0) — use the runtime
-    # menu's Load State to pick an older one from the rotation.
+    # menu's Load State to pick an older one from the rotation. See
+    # save_state()'s comment above for why wait_display() comes first.
+    msx.wait_display()
     path = save_slot_path(save_base_for_cart(_cart_path, SAVE_BASE), 0)
     print(f"Loading state from {path}…")
     try:
@@ -787,6 +797,14 @@ def run():
             auto_if_one=not _usb_ready,   # auto-select when no keyboard
             exclude_names={_bios_name},
         )
+        # select_rom()'s last menu redraw (display=hdmi) leaves its DMA
+        # transfer in-flight (~49ms at 8MHz for a full frame) — drain it
+        # before load_cart_smart()'s SD read reconfigures the same shared
+        # SPI1 peripheral out from under it. See msx_wait_display()'s
+        # comment in msx_core.c for the real-hardware symptom this fixes
+        # (picture corruption -> "No Signal" right after the boot ROM
+        # selector). Cheap/no-op when display=lcd or nothing was pending.
+        msx.wait_display()
         if selected:
             ok = load_cart_smart(msx, 0, selected)
             if ok:

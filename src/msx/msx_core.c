@@ -1017,13 +1017,32 @@ static inline void _spi_dma_wait(spi_inst_t *spi) {
  * msx_wait_display — wait for any in-flight DMA transfer (LCD or HDMI,
  * see _spi_dma_wait()'s comment above) to finish. Exposed to Python;
  * called after render_to_display_1to1()/render_to_hdmi() and before any
- * SD card access. Guarded by display_ready (not hdmi_ready) purely for
- * backward compatibility — callers that only use HDMI must rely on
- * msx_render_to_hdmi()/etc.'s own internal _spi_dma_wait() instead (this
- * function is a no-op without an LCD configured).
+ * SD card access.
+ *
+ * 2026-09-06: now also checks hdmi_ready, not just display_ready. Used to
+ * be display_ready-only "purely for backward compatibility", documented
+ * right here as meaning "a no-op without an LCD configured" — real-
+ * hardware finding: that gap is a genuine bug, not a harmless
+ * simplification. msx_render_to_hdmi_raw332() (menu/UI frames) leaves its
+ * DMA transfer in-flight the same way msx_render_to_hdmi() does — at
+ * 8MHz baud, a full ~49KB frame takes ~49ms to actually finish clocking
+ * out. Every caller that shows a menu screen then immediately does
+ * SD-heavy work right after (the boot-time ROM selector -> load_cart_
+ * smart(), or msx_runtime_menu.py's "Loading…"/"Saving…" draws ->
+ * cart/state I/O) calls this function expecting it to actually drain
+ * that transfer first — hdmi_suspend()'s own fixed 20ms settling pause
+ * (msx_menu.py) is nowhere near enough. With the old display_ready-only
+ * guard, a display=hdmi (no LCD) session got no draining at all here:
+ * the SD driver's spi.init() call could reconfigure the same physical
+ * SPI1 peripheral's baud/mode registers *while* the previous menu
+ * frame's DMA transfer was still actively clocking bits out — observed
+ * on real hardware as picture corruption right after the boot ROM
+ * selector, degrading into a full "No Signal". msx->spi_inst is
+ * guaranteed non-NULL whenever hdmi_ready is true (msx_init_hdmi_output()
+ * sets it unconditionally — see its own comment), so this is safe.
  * ----------------------------------------------------------------------- */
 void msx_wait_display(msx_state_t *msx) {
-    if (!msx->display_ready) return;
+    if (!msx->display_ready && !msx->hdmi_ready) return;
     _spi_dma_wait((spi_inst_t *)msx->spi_inst);
 }
 
