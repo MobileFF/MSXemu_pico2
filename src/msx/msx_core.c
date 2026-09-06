@@ -1542,23 +1542,33 @@ void msx_render_to_hdmi(msx_state_t *msx) {
  * black. The game's own render path (msx_render_to_hdmi() above) never
  * needs this: the VDP only ever writes exact palette565[] values.
  *
- * 2026-09-06: this used to be a single per-row buffer, blocking on
+ * 2026-09-06: originally a single per-row buffer, blocking on
  * spi_write_blocking() 192 times per call — the exact same fully-blocking,
  * one-row-at-a-time pattern msx_render_to_hdmi() itself used before its
- * own 2026-09-04 DMA conversion (see hdmi_frame_buf's comment above), and
- * this path never got the same treatment. Real-hardware finding: opening
- * the runtime menu (GUI+F7) during a display=hdmi session — the first
- * thing to ever call this function after a stretch of msx_render_to_hdmi()
- * calls — reliably dropped the receiver to "No Signal". This project has
- * an established real-hardware precedent for exactly this failure mode:
- * msx_clear_hdmi()'s own comment already documents that a full ~49KB
- * blocking PKT_FRAME send (as opposed to its own ~9-byte dedicated
- * command) "was also implicated in the receiver intermittently losing
- * HDMI sync" — this function was sending exactly that, every single menu
- * redraw. Converted to the same build-full-frame-then-one-DMA-transfer
- * pattern as msx_render_to_hdmi() for consistency and to remove the long
- * CPU-blocking window entirely. */
-
+ * own 2026-09-04 DMA conversion (see hdmi_frame_buf's comment above). A
+ * same-day fix converted it to the identical build-full-frame-then-DMA-
+ * left-in-flight pattern as msx_render_to_hdmi() — which fixed the
+ * original "No Signal every menu redraw" symptom, but then needed an
+ * explicit msx.wait_display()/wait_display() call added at every single
+ * site that draws a menu screen and then immediately touches SD right
+ * after (the boot ROM selector, folder navigation, Save/Load State,
+ * Audio/Display Settings — see msx_wait_display()'s comment for the
+ * fragile bug class this created and the growing list of call sites it
+ * needed touching).
+ *
+ * Real insight: unlike msx_render_to_hdmi() (called every frame, where
+ * overlapping the SPI transfer with the next frame's Z80/VDP emulation
+ * is the entire point), menu/UI screens have no FPS target to protect —
+ * they sit idle polling the keyboard every 30ms between redraws. There
+ * is no reason to leave this transfer in-flight at all. Reverted to
+ * fully synchronous: one spi_write_blocking() call for the whole
+ * 49152-byte payload (still far cheaper than 192 separate per-row calls
+ * — the CPU-time argument for DMA specifically was about *overlapping*
+ * with other work, which doesn't apply here) that blocks until
+ * genuinely done and leaves CS deasserted before returning. This
+ * guarantees every caller sees a fully-idle bus the moment this function
+ * returns, by construction — no call site anywhere needs to know or
+ * care that a menu was just drawn before doing its own SD access. */
 void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
@@ -1584,29 +1594,13 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
         }
     }
 
-    /* ... then send it: header blocking (8 bytes, negligible), payload via
-     * DMA left in-flight — same pattern as msx_render_to_hdmi() above. */
-    if (msx_dma_chan < 0) {
-        msx_dma_chan = dma_claim_unused_channel(true);
-    }
+    /* ... then send it, fully blocking: header (8 bytes) + the whole
+     * payload in one spi_write_blocking() call. Returns only once every
+     * bit has actually finished clocking out and CS is back high. */
     gpio_put(msx->hdmi_cs_pin, 0);
     spi_write_blocking(spi, header, sizeof(header));
-
-    dma_channel_config cfg = dma_channel_get_default_config(msx_dma_chan);
-    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&cfg, true);
-    channel_config_set_write_increment(&cfg, false);
-    channel_config_set_dreq(&cfg, spi_get_dreq(spi, true));
-    dma_channel_configure(
-        msx_dma_chan, &cfg,
-        &spi_get_hw(spi)->dr,
-        hdmi_frame_buf_raw332,
-        sizeof(hdmi_frame_buf_raw332),
-        true /* start now */
-    );
-    /* Deliberately NOT waiting / deasserting CS here — see
-     * msx_render_to_hdmi()'s comment and _spi_dma_wait()'s. */
-    dma_active_cs_pin = (int)msx->hdmi_cs_pin;
+    spi_write_blocking(spi, hdmi_frame_buf_raw332, sizeof(hdmi_frame_buf_raw332));
+    gpio_put(msx->hdmi_cs_pin, 1);
 }
 
 /* Sends the receiver's dedicated PKT_CLEAR_SCREEN command (header-only,

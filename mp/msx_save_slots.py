@@ -41,13 +41,6 @@ def select(msx_module, base, title="Load State", usb_host_mod=None):
     or None if cancelled / no saves exist."""
     import time
 
-    # The caller's own last menu redraw (display=hdmi) leaves its DMA
-    # transfer in-flight (~49ms at 8MHz for a full frame) — drain it
-    # before list_save_slots()'s uos.stat() calls below reconfigure the
-    # same shared SPI1 peripheral. hdmi_suspend()'s fixed 20ms settling
-    # pause alone isn't enough. See msx_wait_display()'s comment in
-    # msx_core.c. Cheap/no-op when display=lcd.
-    msx_module.wait_display()
     _prev_hdmi = hdmi_suspend()
     _prev_lcd  = lcd_suspend()
     try:

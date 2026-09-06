@@ -797,14 +797,6 @@ def run():
             auto_if_one=not _usb_ready,   # auto-select when no keyboard
             exclude_names={_bios_name},
         )
-        # select_rom()'s last menu redraw (display=hdmi) leaves its DMA
-        # transfer in-flight (~49ms at 8MHz for a full frame) — drain it
-        # before load_cart_smart()'s SD read reconfigures the same shared
-        # SPI1 peripheral out from under it. See msx_wait_display()'s
-        # comment in msx_core.c for the real-hardware symptom this fixes
-        # (picture corruption -> "No Signal" right after the boot ROM
-        # selector). Cheap/no-op when display=lcd or nothing was pending.
-        msx.wait_display()
         if selected:
             ok = load_cart_smart(msx, 0, selected)
             if ok:
