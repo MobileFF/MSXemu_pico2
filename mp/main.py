@@ -1,76 +1,82 @@
-"""
-MSX1 Emulator — Main entry point
-Raspberry Pi Pico 2 (RP2350) + MicroPython
-
-Hardware (matches PB-1000 emulator board):
-  LCD              SPI1: MOSI=GP11  SCK=GP10  CS=GP9  DC=GP8  RST=GP7   BL=GP22
-                   ST7796 480x320 (MSP4021) or ILI9341 320x240 (MSP2402) —
-                   same wiring/init sequence for both, see LCD_SIZES below.
-  SD card          SPI1: MOSI=GP11  SCK=GP10  MISO=GP12 CS=GP15  (shared with LCD SPI)
-  USB keyboard     native host (GP24/25)
-  Audio PWM        GP14
-  HDMI bridge      SPI1: MOSI=GP11  SCK=GP10  CS=GP28  (optional, shares LCD/SD
-                   SPI bus; second Pico2+PICO-HDMI-PLUS, see hdmi_bridge/README.md;
-                   opt-in via msx.ini: display=hdmi — mutually exclusive
-                   with the LCD, see 'display' below)
-
-SD card layout:
-  /sd/msx.ini         — optional config (see below; was /sd/msx/config.txt)
-  /sd/msx/MSX.ROM     — 32KB MSX BIOS+BASIC (required)
-  /sd/<anywhere>/<name>.ROM — cartridge ROM (selector browses from the
-                        card root, subfolders included)
-
-msx.ini format (key=value, # = comment):
-  bios=/sd/msx/MSX.ROM
-  cart=/sd/msx/CART.ROM
-  lcd=ILI9341
-  rotate=180
-  volume=128
-  audio_filter=2
-  display=hdmi
-  hdmi_frame_skip=2
-  hdmi_baud=8000000
-  # omit 'cart' to show the interactive ROM selector at boot (browses from
-  # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
-  # a ROM, ESC goes up a level/cancels at the root)
-  # omit 'lcd' to default to ST7796 (see LCD_SIZES for valid names)
-  # omit 'rotate' (or 0) for normal orientation; 180 flips the panel. Only
-  # 0/180 supported (landscape MADCTL flip only, not a true 90/270
-  # rotation); invalid values silently fall back to 0. LCD-only — has no
-  # effect on HDMI output.
-  # omit 'volume' to default to 256; lower (e.g. 128) reduces a passive
-  # piezo buzzer's overdrive/crackle
-  # omit 'audio_filter' to default to 0 (no smoothing); 1-8 = progressively
-  # heavier low-pass smoothing
-  # omit 'display' (or set to 'lcd') to use the LCD panel only — the
-  # optional HDMI bridge output (second Pico2+PICO-HDMI-PLUS, see
-  # hdmi_bridge/README.md) is only initialized at all when display=hdmi.
-  # LCD and HDMI are mutually exclusive: no combined mode (simultaneous
-  # LCD+HDMI was found to corrupt/lose the HDMI signal and glitch the LCD
-  # on real hardware from switching SPI mode every frame — see
-  # doc/hdmi_bridge_phase2_report.md). Only whichever side is skipped at
-  # boot has its hardware init deferred (real boot-time saving, and that
-  # side need not be physically present) — switching 'display' live from
-  # the menu brings the other side up on demand at that point.
-  # omit 'hdmi_frame_skip' to default to 2 (send to HDMI every other
-  # frame); 1 = every frame. Only matters when display=hdmi.
-  # omit 'hdmi_baud' to default to 8_000_000 (8MHz — 5/8MHz confirmed
-  # clean on real hardware, 10MHz corrupts the received palette on this
-  # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when
-  # display=hdmi.
-  #
-  # All of the above except bios/cart (ROM selector instead) can be tuned
-  # live via GUI+F7 — Audio/Display Settings. ENTER writes it back to
-  # msx.ini; audio/display/frame_skip take effect live, while
-  # lcd/rotate/hdmi_baud need a restart (read once at boot; the same menu
-  # also offers a "Reinit ... now" action for the active side, no restart
-  # needed — see msx_display_settings.py).
-
-Joystick (Atari/MSX 9-pin port wired directly to GPIO, PULL_UP/active-low,
-JOY1 only): UP=GP18 DOWN=GP19 LEFT=GP20 RIGHT=GP21 TRIG-A=GP26 TRIG-B=GP27.
-Read via the PSG I/O ports (register 14/15, port 0xA1/0xA2) exactly like
-real MSX hardware — see msx_set_joystick()/poll_joystick() below.
-"""
+# MSX1 Emulator — Main entry point
+# Raspberry Pi Pico 2 (RP2350) + MicroPython
+#
+# Hardware (matches PB-1000 emulator board):
+#   LCD              SPI1: MOSI=GP11  SCK=GP10  CS=GP9  DC=GP8  RST=GP7   BL=GP22
+#                    ST7796 480x320 (MSP4021) or ILI9341 320x240 (MSP2402) —
+#                    same wiring/init sequence for both, see LCD_SIZES below.
+#   SD card          SPI1: MOSI=GP11  SCK=GP10  MISO=GP12 CS=GP15  (shared with LCD SPI)
+#   USB keyboard     native host (GP24/25)
+#   Audio PWM        GP14
+#   HDMI bridge      SPI1: MOSI=GP11  SCK=GP10  CS=GP28  (optional, shares LCD/SD
+#                    SPI bus; second Pico2+PICO-HDMI-PLUS, see hdmi_bridge/README.md;
+#                    opt-in via msx.ini: display=hdmi — mutually exclusive
+#                    with the LCD, see 'display' below)
+#
+# SD card layout:
+#   /sd/msx.ini         — optional config (see below; was /sd/msx/config.txt)
+#   /sd/msx/MSX.ROM     — 32KB MSX BIOS+BASIC (required)
+#   /sd/<anywhere>/<name>.ROM — cartridge ROM (selector browses from the
+#                         card root, subfolders included)
+#
+# msx.ini format (key=value, # = comment):
+#   bios=/sd/msx/MSX.ROM
+#   cart=/sd/msx/CART.ROM
+#   lcd=ILI9341
+#   rotate=180
+#   volume=128
+#   audio_filter=2
+#   display=hdmi
+#   hdmi_frame_skip=2
+#   hdmi_baud=8000000
+#   # omit 'cart' to show the interactive ROM selector at boot (browses from
+#   # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
+#   # a ROM, ESC goes up a level/cancels at the root)
+#   # omit 'lcd' to default to ST7796 (see LCD_SIZES for valid names)
+#   # omit 'rotate' (or 0) for normal orientation; 180 flips the panel. Only
+#   # 0/180 supported (landscape MADCTL flip only, not a true 90/270
+#   # rotation); invalid values silently fall back to 0. LCD-only — has no
+#   # effect on HDMI output.
+#   # omit 'volume' to default to 256; lower (e.g. 128) reduces a passive
+#   # piezo buzzer's overdrive/crackle
+#   # omit 'audio_filter' to default to 0 (no smoothing); 1-8 = progressively
+#   # heavier low-pass smoothing
+#   # omit 'display' (or set to 'lcd') to use the LCD panel only — the
+#   # optional HDMI bridge output (second Pico2+PICO-HDMI-PLUS, see
+#   # hdmi_bridge/README.md) is only initialized at all when display=hdmi.
+#   # LCD and HDMI are mutually exclusive: no combined mode (simultaneous
+#   # LCD+HDMI was found to corrupt/lose the HDMI signal and glitch the LCD
+#   # on real hardware from switching SPI mode every frame — see
+#   # doc/hdmi_bridge_phase2_report.md). Only whichever side is skipped at
+#   # boot has its hardware init deferred (real boot-time saving, and that
+#   # side need not be physically present) — switching 'display' live from
+#   # the menu brings the other side up on demand at that point.
+#   # omit 'hdmi_frame_skip' to default to 2 (send to HDMI every other
+#   # frame); 1 = every frame. Only matters when display=hdmi.
+#   # omit 'hdmi_baud' to default to 8_000_000 (8MHz — 5/8MHz confirmed
+#   # clean on real hardware, 10MHz corrupts the received palette on this
+#   # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when
+#   # display=hdmi.
+#   #
+#   # All of the above except bios/cart (ROM selector instead) can be tuned
+#   # live via GUI+F7 — Audio/Display Settings. ENTER writes it back to
+#   # msx.ini; audio/display/frame_skip take effect live, while
+#   # lcd/rotate/hdmi_baud need a restart (read once at boot; the same menu
+#   # also offers a "Reinit ... now" action for the active side, no restart
+#   # needed — see msx_display_settings.py).
+#
+# Joystick (Atari/MSX 9-pin port wired directly to GPIO, PULL_UP/active-low,
+# JOY1 only): UP=GP18 DOWN=GP19 LEFT=GP20 RIGHT=GP21 TRIG-A=GP26 TRIG-B=GP27.
+# Read via the PSG I/O ports (register 14/15, port 0xA1/0xA2) exactly like
+# real MSX hardware — see msx_set_joystick()/poll_joystick() below.
+#
+# 2026-09-06: this header used to be a triple-quoted module docstring —
+# converted to plain '#' comments after a MemoryError re-emerged compiling
+# this file at boot. A docstring is compiled into a real, retained string
+# constant; a '#' comment is skipped entirely by the lexer and costs
+# nothing at runtime (same principle already applied to msx_menu.py during
+# its own MemoryError fix earlier this session). Purely mechanical — no
+# code depends on main.py.__doc__.
 
 import sys
 import time
@@ -287,7 +293,7 @@ def load_bios_file(path):
 
 
 def init_usb():
-    """Initialize USB host once; idempotent."""
+    # Initialize USB host once; idempotent.
     global _usb_ready
     if usb_host is None or _usb_ready:
         return
@@ -352,7 +358,7 @@ def load_state():
 
 
 def _show_error(msg1, msg2=""):
-    """Display a simple error screen and return."""
+    # Display a simple error screen and return.
     try:
         from msx_menu import MenuCanvas, C_RED, C_WHITE, C_GRAY
         c = MenuCanvas(msx)
@@ -397,14 +403,14 @@ _rotate_180 = False
 _lcd_model = DEFAULT_LCD_MODEL  # 'ST7796'|'ILI9341'; restart-only, see Display Settings.
 
 def _init_hdmi_output():
-    """Callback for the Display Settings menu (msx_display_settings.py) —
-    see msx_menu.show_emulator_menu(). Called the moment 'display'
-    switches to 'hdmi' live (boot may have started on 'lcd', which never
-    initializes HDMI hardware at all — see the exclusive boot logic in
-    run()); idempotent, safe to call more than once (e.g. if HDMI was
-    already the active side at boot, or the user picked "Reinit HDMI
-    now" — see msx_display_settings.py's show() docstring for why that
-    exists)."""
+    # Callback for the Display Settings menu (msx_display_settings.py) —
+    # see msx_menu.show_emulator_menu(). Called the moment 'display'
+    # switches to 'hdmi' live (boot may have started on 'lcd', which never
+    # initializes HDMI hardware at all — see the exclusive boot logic in
+    # run()); idempotent, safe to call more than once (e.g. if HDMI was
+    # already the active side at boot, or the user picked "Reinit HDMI
+    # now" — see msx_display_settings.py's show() docstring for why that
+    # exists).
     msx.hdmi_reset_init(HDMI_RESET_PIN)
     msx.hdmi_reset_pulse()
     time.sleep_ms(HDMI_RESET_GRACE_MS)
@@ -415,13 +421,13 @@ def _init_hdmi_output():
 
 
 def _init_lcd_output():
-    """Callback for the Display Settings menu — mirrors _init_hdmi_output()
-    above for the other direction. Called the moment 'display' switches
-    to 'lcd' live (boot may have started on 'hdmi', which skips the LCD
-    panel's own init/reset sequence entirely — see run()). Idempotent:
-    msx.init_display_hardware() always re-runs the full panel reset
-    sequence, harmless to repeat (e.g. if LCD was already the active side
-    at boot, or the user picked "Reinit LCD now")."""
+    # Callback for the Display Settings menu — mirrors _init_hdmi_output()
+    # above for the other direction. Called the moment 'display' switches
+    # to 'lcd' live (boot may have started on 'hdmi', which skips the LCD
+    # panel's own init/reset sequence entirely — see run()). Idempotent:
+    # msx.init_display_hardware() always re-runs the full panel reset
+    # sequence, harmless to repeat (e.g. if LCD was already the active side
+    # at boot, or the user picked "Reinit LCD now").
     msx.init_display_hardware(
         SPI_ID, SPI_BAUD, SPI_MOSI, SPI_SCK,
         SPI_CS, SPI_DC, SPI_RST, SPI_BL,
@@ -569,9 +575,9 @@ def poll_keyboard():
 _joy_pins = None
 
 def init_joystick():
-    """Configure joystick GPIO as PULL_UP inputs. Safe to call even if the
-    port isn't physically connected — floating/pulled-up pins just read as
-    permanently released, which is the correct 'no joystick' state."""
+    # Configure joystick GPIO as PULL_UP inputs. Safe to call even if the
+    # port isn't physically connected — floating/pulled-up pins just read
+    # as permanently released, which is the correct 'no joystick' state.
     global _joy_pins
     try:
         pull = machine.Pin.PULL_UP
@@ -589,9 +595,10 @@ def init_joystick():
 
 
 def poll_joystick():
-    """Read GPIO state into the PSG-visible joystick register (JOY1).
-    Pin.value() is already 1=released/0=pressed with PULL_UP wiring, which
-    matches the MSX joystick register's active-low bit convention directly."""
+    # Read GPIO state into the PSG-visible joystick register (JOY1).
+    # Pin.value() is already 1=released/0=pressed with PULL_UP wiring,
+    # which matches the MSX joystick register's active-low bit convention
+    # directly.
     if _joy_pins is None:
         return
     up, down, left, right, trig_a, trig_b = (p.value() for p in _joy_pins)
