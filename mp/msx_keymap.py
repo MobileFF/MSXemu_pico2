@@ -18,9 +18,11 @@ Matrix layout (active-low: bit=0 means key pressed):
 """
 
 # HID keycodes exported for special handling in main.py
-HID_F5  = 0x3E   # save state
+# 2026-09-08: HID_F5/HID_F8 used to be exported here too, for F5/F8
+# quick-save/load hotkeys — removed (see poll_keyboard()'s comment in
+# main.py); F5/F8 now only ever reach HID_TO_MSX below, as ordinary MSX
+# keys, same as any other key.
 HID_F7  = 0x40   # GUI+F7: runtime emulator menu
-HID_F8  = 0x41   # load state
 HID_P   = 0x13   # GUI+P: toggle display=lcd/hdmi live (no menu needed)
 HID_ESC = 0x29   # GUI+ESC: reinit the active display side (recover from
                  # HDMI "No Signal" without opening/navigating a menu —

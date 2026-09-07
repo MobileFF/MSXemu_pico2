@@ -404,9 +404,23 @@ _prefix_buf = None
 def get_rom_load_buf():
     """Return the shared Mega-ROM-mapper-detection scratch buffer (8KB),
     allocating it on first call. See the comment above for why this is
-    lazy rather than a module-level `= bytearray(...)`."""
+    lazy rather than a module-level `= bytearray(...)`.
+
+    2026-09-08: that laziness cuts both ways — "first call" can now
+    happen well into a long session (e.g. a normal in-RAM cart loaded
+    first, *then* a Mega ROM swapped in later via the runtime menu),
+    by which point msx_runtime_menu.py/msx_rom_browser.py have already
+    been lazily imported and gameplay has already run for a while,
+    leaving the heap considerably more fragmented than at a fresh boot
+    — real-hardware finding: "MemoryError ... allocating 8192 bytes"
+    from exactly this allocation in that scenario. gc.collect() first,
+    same defensive pattern already used before every other cart-sized
+    allocation in this file (msx_module.cart_alloc() above,
+    msx_runtime_menu.py's eject-then-collect before Swap Cartridge)."""
     global _prefix_buf
     if _prefix_buf is None:
+        import gc
+        gc.collect()
         _prefix_buf = bytearray(_PREFIX_BUF_SIZE)
     return _prefix_buf
 

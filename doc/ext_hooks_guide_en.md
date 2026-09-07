@@ -36,11 +36,13 @@ Volume ranges 0-256 (in steps of 16); Filter ranges 0-8 (in steps of 1).
 
 | Key | Action |
 | :--- | :--- |
-| **F5** | Quick save (same as "Save State", to `save.bin` on the SD card) |
-| **F8** | Quick load (same as "Load State") |
 | **GUI + F7** | Opens the runtime menu (above) |
+| **GUI + P** | Toggles the LCD/HDMI display live, without opening a menu |
+| **GUI + ESC** | Reinitializes the currently active display (LCD/HDMI) in place, without opening a menu — recovers from "No Signal" during long `display=hdmi` sessions |
 
-F5/F8 are edge-triggered (fire once per physical key press), so holding them down does not repeatedly trigger the action.
+All of these are edge-triggered (fire once per physical key press), so holding them down does not repeatedly trigger the action.
+
+Save/Load are done from the runtime menu's `Save State` / `Load State` (2026-09-08: the standalone F5/F8 hotkeys were removed — saving/loading also forwarded the F5/F8 keypress to the MSX itself, which could conflict with MSX software that uses F5/F8 for its own purposes).
 
 ---
 

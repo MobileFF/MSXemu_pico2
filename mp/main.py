@@ -100,14 +100,11 @@ import gc
 gc.collect()  # maximize contiguous free heap before compiling the next
               # (larger) imports below — non-compacting GC, so this is
               # cheap insurance against a marginal MemoryError here.
-from msx_keymap import (apply_hid_report, HID_F5, HID_F7, HID_F8, HID_P,
-                       HID_ESC, MOD_LGUI, MOD_RGUI)
+from msx_keymap import (apply_hid_report, HID_F7, HID_P, HID_ESC,
+                       MOD_LGUI, MOD_RGUI)
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
-                        load_state_from, load_cart_smart,
-                        set_display_state, readinto_chunked,
-                        save_base_for_cart, rotate_and_save_state,
-                        save_slot_path)
+                        load_cart_smart, set_display_state, readinto_chunked)
 
 # -----------------------------------------------------------------------
 # Pin / peripheral constants
@@ -332,42 +329,6 @@ def init_usb():
         print(f"USB host bg timer failed: {e}")
 
 
-def save_state():
-    # Rotates the same as the runtime menu's Save State — see
-    # rotate_and_save_state() in msx_menu.py. Called from poll_keyboard()
-    # (F5), which runs before this frame's own render_to_hdmi() but while
-    # a *previous* frame's DMA transfer may still be in-flight (display=
-    # hdmi, ~25ms at 8MHz for a full palette-indexed frame — easily longer
-    # than one frame's budget at hdmi_frame_skip=1) — drain it first so
-    # the SD write below doesn't reconfigure the same shared SPI1
-    # peripheral out from under it. See msx_wait_display()'s comment in
-    # msx_core.c. Cheap/no-op when display=lcd.
-    msx.wait_display()
-    base = save_base_for_cart(_cart_path, SAVE_BASE)
-    print(f"Saving state (base {base})…")
-    try:
-        rotate_and_save_state(msx, base)
-        print(f"State saved to {save_slot_path(base, 0)}")
-    except Exception as e:
-        print(f"Save failed: {e}")
-
-
-def load_state():
-    # Hotkey always loads the most recent slot (0) — use the runtime
-    # menu's Load State to pick an older one from the rotation. See
-    # save_state()'s comment above for why wait_display() comes first.
-    msx.wait_display()
-    path = save_slot_path(save_base_for_cart(_cart_path, SAVE_BASE), 0)
-    print(f"Loading state from {path}…")
-    try:
-        if load_state_from(msx, path):
-            print(f"State loaded from {path}")
-        else:
-            print("load_state_from() failed — invalid save file?")
-    except Exception as e:
-        print(f"Load failed: {e}")
-
-
 def _show_error(msg1, msg2=""):
     # Display a simple error screen and return.
     try:
@@ -390,17 +351,16 @@ def _show_error(msg1, msg2=""):
 _last_modifier = 0
 _last_keycodes = b'\x00' * 6
 
-_save_held = False
-_load_held = False
 _menu_held = False
 _display_held = False  # GUI+P
 _reinit_held = False   # GUI+ESC
 _bios_name = ""
 _cart_path = None  # currently loaded cart's full path, or None (BASIC
-                   # only) — see save_base_for_cart() in msx_menu.py;
-                   # save_state()/load_state() (F5/F8) and the runtime
-                   # menu's Save/Load State both key off this so each
-                   # cart keeps its own rotating save history.
+                   # only) — see save_base_for_cart() in msx_menu.py; the
+                   # runtime menu's Save/Load State keys off this so each
+                   # cart keeps its own rotating save history. (2026-09-08:
+                   # F5/F8 used to double as quick-save/load hotkeys here
+                   # too, but were removed — see poll_keyboard()'s comment.)
 _display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see Display Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
@@ -449,7 +409,7 @@ def _init_lcd_output():
 
 
 def poll_keyboard():
-    global _last_modifier, _last_keycodes, _save_held, _load_held, _menu_held
+    global _last_modifier, _last_keycodes, _menu_held
     global _display_held, _reinit_held
     global _display_mode, _hdmi_frame_skip
     global _lcd_model, _rotate_180, _hdmi_baud, _cart_path
@@ -465,17 +425,15 @@ def poll_keyboard():
     mod = report[0]
     kc  = report[2:8]
 
-    # Intercept F5 (save) and F8 (load) before passing to MSX matrix.
-    # Edge-triggered: only fire once per physical key-press.
-    f5_down = HID_F5 in kc
-    f8_down = HID_F8 in kc
-    if f5_down and not _save_held:
-        save_state()
-    if f8_down and not _load_held:
-        load_state()
-    _save_held = f5_down
-    _load_held = f8_down
-
+    # 2026-09-08: F5/F8 used to be intercepted here as quick-save/load
+    # hotkeys (edge-triggered, mirroring GUI+F7 below) — removed, since
+    # they were *also* still forwarded to the MSX matrix as ordinary F5/
+    # F8 keypresses afterward (apply_hid_report() doesn't know they'd
+    # already been consumed), meaning any MSX software that itself uses
+    # F5/F8 for something would see an unwanted keystroke every time the
+    # emulator saved/loaded. Save/Load State remain available from the
+    # runtime menu (GUI+F7) instead, which doesn't have this problem
+    # (GUI+F7 is never forwarded to the matrix — see below).
     gui_down = (mod & (MOD_LGUI | MOD_RGUI)) != 0
 
     # GUI+P: toggle display=lcd/hdmi live, without opening any menu (and

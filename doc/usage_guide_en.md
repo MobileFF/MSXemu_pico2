@@ -63,9 +63,9 @@ The USB keyboard's HID reports are mapped directly onto MSX's keyboard matrix. T
 
 | Key | Action |
 | :--- | :--- |
-| F5 | Quick save |
-| F8 | Quick load |
 | GUI (Win/Cmd) + F7 | Opens the runtime menu |
+| GUI (Win/Cmd) + P | Toggles the LCD/HDMI display live, without opening a menu |
+| GUI (Win/Cmd) + ESC | Reinitializes the currently active display (LCD/HDMI) in place, without opening a menu — recovers from "No Signal" during long `display=hdmi` sessions |
 
 See `ext_hooks_guide_en.md` for details.
 
@@ -103,7 +103,7 @@ The first time you select one, it takes a few seconds to copy to the Pico 2's on
 
 ## 7. Save State
 
-Using the `F5` (save) / `F8` (load) hotkeys, or the runtime menu's `Save State` / `Load State`, you can save/restore the entire CPU, VDP, RAM, and VRAM state to/from `save.bin` on the SD card. The save file is roughly 80KB. There is only one slot (no multiple save slots).
+Using the runtime menu's (GUI+F7) `Save State` / `Load State`, you can save/restore the entire CPU, VDP, RAM, and VRAM state to/from the SD card. The save file is roughly 80KB. Saves rotate per-cartridge, next to the ROM itself (e.g. `Foo.ROM` → `Foo.0.sav`), keeping up to 10 generations — `Load State` lets you pick an older one.
 
 ---
 
