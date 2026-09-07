@@ -13,15 +13,16 @@
 ### SDカードのディレクトリ構造
 
 ```
-/sd/msx/
-  MSX_jp.rom       # BIOS ROM（ファイル名は任意、config.txtで指定）
-  ANTADV.ROM       # カートリッジROM（任意、複数可）
-  NEMESIS.ROM       # 大容量（メガロム）カートリッジも同じ場所に置いてよい
-  config.txt        # 設定ファイル（任意、無くても動作する）
-  save.bin          # セーブステート（自動生成、初回セーブ時に作成される）
+/sd/
+  msx.ini            # 設定ファイル（任意、無くても動作する。SDカードのルート直下）
+  msx/
+    MSX_jp.rom       # BIOS ROM（ファイル名は任意、msx.iniで指定）
+    ANTADV.ROM       # カートリッジROM（任意、複数可。サブフォルダに置いてもよい）
+    NEMESIS.ROM      # 大容量（メガロム）カートリッジも同じ場所に置いてよい
+    ANTADV.0.sav     # セーブステート（自動生成、カートリッジごとに最大10世代ローテーション）
 ```
 
-### `config.txt` の書き方
+### `msx.ini` の書き方
 
 ```ini
 bios=/sd/msx/MSX_jp.rom
@@ -30,9 +31,10 @@ lcd=ST7796
 rotate=0
 volume=256
 audio_filter=0
+display=lcd
 ```
 
-全キー省略可能。省略時のデフォルトや各キーの詳細は `ext_hooks_guide.md` の「`config.txt` 完全リファレンス」を参照してください。`cart` を省略すると、起動時にSDカード上のROM一覧から選ぶメニューが表示されます。
+全キー省略可能。省略時のデフォルトや各キーの詳細は `ext_hooks_guide.md` の「`msx.ini` 完全リファレンス」を参照してください。`cart` を省略すると、起動時にSDカード上のROM一覧（サブフォルダ含む）から選ぶメニューが表示されます。
 
 ---
 
@@ -44,10 +46,10 @@ audio_filter=0
    - クロック調整・UARTコンソール準備
    - USBホスト初期化（キーボード検出開始）
    - SDカードマウント
-   - `config.txt` 読み込み
-   - LCD初期化（パネル種別・回転設定を反映）
+   - `msx.ini` 読み込み
+   - 表示初期化（`display=lcd`ならLCD、`display=hdmi`ならHDMIブリッジ — 排他、両方が起動時に初期化されることはない）
    - BIOS ROM ロード
-   - カートリッジロード（`config.txt` 指定 → 対話式選択 → 未選択ならMSX BASIC起動）
+   - カートリッジロード（`msx.ini` 指定 → 対話式選択 → 未選択ならMSX BASIC起動）
    - オーディオセットアップ
 4. MSXが起動し、BASICプロンプトまたはカートリッジのゲームが開始される
 
@@ -84,6 +86,7 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 - **Swap Cartridge** — 別のカートリッジに差し替える（メガロムも選択可能）
 - **Save State** / **Load State** — 現在の状態をSDカードに保存/復元する
 - **Audio Settings** — 音量・音質をリアルタイム調整する
+- **Display Settings** — LCD/HDMI表示の切替・フレームスキップ・パネル種別・回転・HDMIボーレートを調整する
 - **Reset MSX** — Z80をリセットする
 - **Resume** — ゲームプレイに戻る
 
@@ -113,7 +116,7 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 | :--- | :--- |
 | 起動画面が真っ暗 | LCDとSDカードは配線を共有しているため、まず物理配線を確認（`hardware_guide.md`）。SDカードも同時に認識しない場合はほぼ配線不良 |
 | キーボードが反応しない | USB OTGアダプタの接続を確認。ファームウェア側の `usb_host.start_bg_timer(8)` 呼び出し忘れが原因のこともある（開発者向け、`build_guide.md` 参照） |
-| 音が割れる・耳障り | `config.txt` の `volume=` を下げる、`audio_filter=` を上げる（実行時メニューのAudio Settingsからも調整可）。根本的な改善にはハードウェアのRCフィルタ追加を推奨（`hardware_guide.md`） |
+| 音が割れる・耳障り | `msx.ini` の `volume=` を下げる、`audio_filter=` を上げる（実行時メニューのAudio Settingsからも調整可）。根本的な改善にはハードウェアのRCフィルタ追加を推奨（`hardware_guide.md`） |
 | 音程が違って聞こえる | 過去に実際にあったバグ（PSGクロック設定ミス）は修正済み。最新のファームウェアを使用しているか確認 |
 | メガロムの読み込みに時間がかかる | 初回選択時のみSD→内蔵フラッシュコピーが発生するため正常（数秒程度）。2回目以降は高速 |
 | セーブ/ロードでエラーになる | SDカードの空き容量・書き込み可否を確認。それでも解決しない場合はSDカードの物理的な接触不良の可能性 |
@@ -124,5 +127,5 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 
 - `hardware_guide.md` — 配線・部品
 - `build_guide.md` — ビルド・書き込み手順
-- `ext_hooks_guide.md` — 実行時メニュー・ホットキー・`config.txt` の詳細リファレンス
+- `ext_hooks_guide.md` — 実行時メニュー・ホットキー・`msx.ini` の詳細リファレンス
 - `architecture.md` / `memory_map.md` / `extension_api.md` / `dev_guide.md` — 開発者向け技術資料

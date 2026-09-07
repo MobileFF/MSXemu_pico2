@@ -109,7 +109,7 @@ A typical test `.c` file drives `msx_init()` -> `msx_load_bios()` -> `msx_reset(
 
 ---
 
-## 7. Adding a New `config.txt` Key
+## 7. Adding a New `msx.ini` Key
 
 `mp/msx_menu.py`'s `load_config()` is a simple `key=value` parser; the meaning of each key is up to the caller (`main.py`). To add a new key:
 

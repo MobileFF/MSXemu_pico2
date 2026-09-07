@@ -10,7 +10,7 @@ Z80 CPU・TMS9918A VDP・AY-3-8910 PSGを搭載した MSX1 をエミュレート
 
 - **高性能エミュレーションコア**: Z80 CPU([superzazu/z80](https://github.com/superzazu/z80))・TMS9918A VDP([vrEmuTms9918](https://github.com/visrealm/vrEmuTms9918))・AY-3-8910 PSG([emu2149](https://github.com/digital-sound-antiques/emu2149))をいずれもC言語で実装し、パイプライン化された描画処理により実機相当のフレームレート(実測 約64FPS)を達成。
 - **MicroPython フレームワーク**: 起動フロー・UI・設定ロジックを MicroPython で記述しており、カスタマイズが容易。
-- **表示サポート**: ST7796 (480×320) / ILI9341 (320×240) のTFT LCDに対応、`config.txt`で切替可能。画面180度回転にも対応。
+- **表示サポート**: ST7796 (480×320) / ILI9341 (320×240) のTFT LCDに対応、`msx.ini`で切替可能。画面180度回転にも対応。
 - **外部キーボード対応**: USB HIDキーボード(Hostモード)による入力をサポート。
 - **カートリッジ対応**: PLAIN / ASCII-8 / ASCII-16 / KONAMIマッパーに対応(自動判定あり)。128KB以上のバンク切替カートリッジ(メガロム)は、Pico 2内蔵フラッシュへのキャッシュ経由でRAM容量を超えるサイズにも対応。
 - **ストレージ**: SDカードからのBIOS/カートリッジROM読み込み、ゼロコピー設計によるステートセーブ/ロード(RAM・VRAM込み)をサポート。

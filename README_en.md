@@ -10,7 +10,7 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 
 - **High-Performance Emulation Core**: Z80 CPU ([superzazu/z80](https://github.com/superzazu/z80)), TMS9918A VDP ([vrEmuTms9918](https://github.com/visrealm/vrEmuTms9918)), and AY-3-8910 PSG ([emu2149](https://github.com/digital-sound-antiques/emu2149)) all implemented in C, with a pipelined rendering design achieving real-hardware-class frame rates (measured ~64 FPS).
 - **MicroPython Framework**: Boot flow, UI, and configuration logic are written in MicroPython for easy customization.
-- **Display Support**: Supports ST7796 (480×320) and ILI9341 (320×240) TFT LCDs, switchable via `config.txt`. 180° screen rotation is also supported.
+- **Display Support**: Supports ST7796 (480×320) and ILI9341 (320×240) TFT LCDs, switchable via `msx.ini`. 180° screen rotation is also supported.
 - **External Keyboard**: Supports USB HID keyboards in host mode.
 - **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM via a cache on the Pico 2's own onboard flash.
 - **Storage**: Loads the BIOS/cartridge ROM from an SD card, and supports zero-copy save/load state (including RAM and VRAM).

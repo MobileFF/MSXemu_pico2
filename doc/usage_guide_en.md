@@ -13,15 +13,16 @@
 ### SD Card Directory Layout
 
 ```
-/sd/msx/
-  MSX_jp.rom        # BIOS ROM (any filename, specified in config.txt)
-  ANTADV.ROM        # cartridge ROM(s), optional, multiple allowed
-  NEMESIS.ROM        # large (Mega ROM) cartridges go in the same place
-  config.txt         # config file (optional — works fine without one)
-  save.bin           # save state (auto-created on first save)
+/sd/
+  msx.ini             # config file (optional — works fine without one; SD card root)
+  msx/
+    MSX_jp.rom        # BIOS ROM (any filename, specified in msx.ini)
+    ANTADV.ROM        # cartridge ROM(s), optional, multiple allowed, subfolders OK
+    NEMESIS.ROM       # large (Mega ROM) cartridges go in the same place
+    ANTADV.0.sav      # save state (auto-created; rotates up to 10 generations per cartridge)
 ```
 
-### Writing `config.txt`
+### Writing `msx.ini`
 
 ```ini
 bios=/sd/msx/MSX_jp.rom
@@ -30,9 +31,10 @@ lcd=ST7796
 rotate=0
 volume=256
 audio_filter=0
+display=lcd
 ```
 
-Every key is optional. See "Complete `config.txt` Reference" in `ext_hooks_guide_en.md` for defaults and details on each key. Omitting `cart` shows a menu at boot to pick a ROM from the SD card.
+Every key is optional. See "Complete `msx.ini` Reference" in `ext_hooks_guide_en.md` for defaults and details on each key. Omitting `cart` shows a menu at boot to pick a ROM from the SD card (subfolders included).
 
 ---
 
@@ -44,10 +46,10 @@ Every key is optional. See "Complete `config.txt` Reference" in `ext_hooks_guide
    - Clock tuning, UART console setup
    - USB host init (keyboard detection begins)
    - SD card mount
-   - Read `config.txt`
-   - LCD init (applying panel model/rotation settings)
+   - Read `msx.ini`
+   - Display init (LCD for `display=lcd`, the HDMI bridge for `display=hdmi` — mutually exclusive, never both initialized at boot)
    - Load the BIOS ROM
-   - Load the cartridge (`config.txt`'s setting -> interactive selector -> boot straight to MSX BASIC if none chosen)
+   - Load the cartridge (`msx.ini`'s setting -> interactive selector -> boot straight to MSX BASIC if none chosen)
    - Audio setup
 4. MSX starts, showing either the BASIC prompt or the cartridge's game.
 
@@ -84,6 +86,7 @@ Pressing **GUI + F7** during gameplay opens a menu with:
 - **Swap Cartridge** — swap in a different cartridge (Mega ROMs selectable too)
 - **Save State** / **Load State** — save/restore the current state to the SD card
 - **Audio Settings** — adjust volume and audio quality live
+- **Display Settings** — switch between LCD/HDMI output, frame skip, panel model, rotation, and HDMI baud
 - **Reset MSX** — resets the Z80
 - **Resume** — returns to gameplay
 
@@ -113,7 +116,7 @@ Using the runtime menu's (GUI+F7) `Save State` / `Load State`, you can save/rest
 | :--- | :--- |
 | Boot screen is black | The LCD and SD card share wiring — check the physical connections first (`hardware_guide_en.md`). If the SD card also isn't recognized, it's almost certainly a wiring fault |
 | Keyboard doesn't respond | Check the USB OTG adapter connection. Can also be caused by a missing `usb_host.start_bg_timer(8)` call in firmware (developer-facing — see `build_guide_en.md`) |
-| Sound is distorted/harsh | Lower `volume=` in `config.txt`, or raise `audio_filter=` (also adjustable from the runtime menu's Audio Settings). For a real fix, add a hardware RC filter (`hardware_guide_en.md`) |
+| Sound is distorted/harsh | Lower `volume=` in `msx.ini`, or raise `audio_filter=` (also adjustable from the runtime menu's Audio Settings). For a real fix, add a hardware RC filter (`hardware_guide_en.md`) |
 | Pitch sounds wrong | A real bug (an incorrect PSG clock setting) that existed earlier has been fixed — make sure you're running the latest firmware |
 | A Mega ROM takes a while to load | Normal — the first selection triggers an SD-to-onboard-flash copy (a few seconds). Subsequent loads are fast |
 | Save/load fails with an error | Check the SD card's free space and write permission. If it persists, suspect a physical SD card contact issue |
@@ -124,5 +127,5 @@ Using the runtime menu's (GUI+F7) `Save State` / `Load State`, you can save/rest
 
 - `hardware_guide_en.md` — wiring and parts
 - `build_guide_en.md` — build and flash instructions
-- `ext_hooks_guide_en.md` — detailed reference for the runtime menu, hotkeys, and `config.txt`
+- `ext_hooks_guide_en.md` — detailed reference for the runtime menu, hotkeys, and `msx.ini`
 - `architecture_en.md` / `memory_map_en.md` / `extension_api_en.md` / `dev_guide_en.md` — developer-facing technical docs

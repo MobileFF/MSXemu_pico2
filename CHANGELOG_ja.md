@@ -84,3 +84,7 @@
 ### 削除(2026-09-08)
 
 - **単体のF5(クイックセーブ)/F8(クイックロード)ホットキー**: これらを押すと、セーブ/ロード処理の後に通常のF5/F8キー入力もそのままMSX本体に転送されてしまっていた(`apply_hid_report()`には、そのキーが既にセーブ/ロード用に「消費」済みかどうかを知る手段がないため)。これはF5/F8を自身の機能に使うMSXソフトと衝突しうる。セーブ/ロードは引き続き実行時メニュー(GUI+F7)の`Save State`/`Load State`から利用可能 — GUI+F7自体はMSXキーマトリクスへ転送されることが一切ないため、この問題は起こらない。`msx_keymap.py`の特別扱い用エクスポートから`HID_F5`/`HID_F8`を削除(F5/F8は`HID_TO_MSX`経由の通常のMSXキーとしては引き続き動作し、影響なし)。`main.py`の`save_state()`/`load_state()`関数は、他に呼び出し元がなくなったため呼び出し箇所ごと削除。`doc/usage_guide.md`/`_en.md`、`doc/ext_hooks_guide.md`/`_en.md`のドキュメントも合わせて更新(後者2つは元々抜けていたGUI+P/GUI+ESCの行も追加)。
+
+### ドキュメント(2026-09-08)
+
+- **今週一連の設定・メニュー変更に、ユーザー向けドキュメントを追従させた**: `README.md`/`_en.md`、`doc/usage_guide.md`/`_en.md`、`doc/ext_hooks_guide.md`/`_en.md`、`doc/dev_guide.md`/`_en.md`が、数日前に`msx.ini`へ改名・SDルートへ移動したはずの`config.txt`のままだったり、カートリッジごとのローテーション式セーブに置き換わったはずの単一`save.bin`のままだったり、そもそも「Display Settings」メニュー項目とその`msx.ini`キー一式(`display`/`hdmi_frame_skip`/`hdmi_baud`)がまるごと記載漏れになっていたりした。特に`ext_hooks_guide.md`/`_en.md`の「完全リファレンス」節(設定キーの唯一の正式な一覧)は大幅に書き直し、HDMI関連3キーの追加、再起動要否の注記、Display Settingsサブ画面の解説(既存のAudio Settings解説と同じ形式)、廃止済みの`hdmi`/`boot_exclusive`キーと`display=both`値についての明記を行った。

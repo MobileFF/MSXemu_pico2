@@ -109,7 +109,7 @@ gcc -I. -o test_boot my_test.c msx/msx_core.c msx/z80/z80.c \
 
 ---
 
-## 7. 設定ファイル（`config.txt`）に新しいキーを追加する
+## 7. 設定ファイル（`msx.ini`）に新しいキーを追加する
 
 `mp/msx_menu.py` の `load_config()` はシンプルな `key=value` パーサで、キーの意味づけは呼び出し側（`main.py`）が行う。新しいキーを追加する場合:
 
