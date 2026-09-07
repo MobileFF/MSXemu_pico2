@@ -392,31 +392,38 @@ _CART_INRAM_MAX = 0x8000  # 32KB
 # the GC heap, so an eager 32KB allocation immediately after failed
 # outright: "MemoryError ... allocating 32768 bytes" at "msx_menu.py, line
 # NNN, in <module>"). The only remaining use for a scratch buffer here is
-# the small (<=8KB) Mega ROM mapper-detection prefix read below, which
-# doesn't have a natural C-side destination to read directly into (it's
-# just a peek at the ROM header before deciding how to load it) — kept
-# lazy (allocated on first actual use, not at import time) for the same
-# reason, but sized to just 8KB now that nothing here needs 32KB anymore.
-_PREFIX_BUF_SIZE = 8192
+# the small Mega ROM mapper-detection prefix read below, which doesn't
+# have a natural C-side destination to read directly into (it's just a
+# peek at the ROM header before deciding how to load it) — kept lazy
+# (allocated on first actual use, not at import time) for the same
+# reason.
+#
+# 2026-09-08: "first actual use" turned out to matter — real-hardware
+# finding: loading a normal (in-RAM) cart first, then a Mega ROM later
+# via Swap Cartridge, means this allocation's actual first attempt now
+# happens well into a session (gameplay already run, msx_runtime_menu.py/
+# msx_rom_browser.py already imported for the swap), on a heap
+# considerably more fragmented than at a fresh boot — a gc.collect()
+# right before allocating (see get_rom_load_buf()) wasn't enough to fix
+# it on its own ("MemoryError ... allocating 8192 bytes" persisted).
+# Shrunk 8KB -> 4KB (mapper-select bank-switch code is reliably within
+# the first few KB of real Mega ROMs, and get_rom_load_buf()'s caller
+# already tolerates a failed/incomplete detection via the KONAMI
+# fallback — see load_cart_smart()'s comment) to make the allocation
+# itself easier to satisfy, and load_cart_smart() now also tolerates
+# this allocation failing outright (falls back to KONAMI instead of
+# aborting the whole cart load) as a last resort.
+_PREFIX_BUF_SIZE = 4096
 _prefix_buf = None
 
 
 def get_rom_load_buf():
-    """Return the shared Mega-ROM-mapper-detection scratch buffer (8KB),
-    allocating it on first call. See the comment above for why this is
-    lazy rather than a module-level `= bytearray(...)`.
-
-    2026-09-08: that laziness cuts both ways — "first call" can now
-    happen well into a long session (e.g. a normal in-RAM cart loaded
-    first, *then* a Mega ROM swapped in later via the runtime menu),
-    by which point msx_runtime_menu.py/msx_rom_browser.py have already
-    been lazily imported and gameplay has already run for a while,
-    leaving the heap considerably more fragmented than at a fresh boot
-    — real-hardware finding: "MemoryError ... allocating 8192 bytes"
-    from exactly this allocation in that scenario. gc.collect() first,
-    same defensive pattern already used before every other cart-sized
-    allocation in this file (msx_module.cart_alloc() above,
-    msx_runtime_menu.py's eject-then-collect before Swap Cartridge)."""
+    """Return the shared Mega-ROM-mapper-detection scratch buffer
+    (_PREFIX_BUF_SIZE bytes), allocating it on first call. See the
+    comment above for why this is lazy rather than a module-level
+    `= bytearray(...)`, and for why it's tolerated failing outright
+    (load_cart_smart()'s MemoryError fallback) even after the
+    gc.collect() below and the 8KB->4KB shrink."""
     global _prefix_buf
     if _prefix_buf is None:
         import gc
@@ -570,16 +577,28 @@ def load_cart_smart(msx_module, slot, path):
         # reasons as the in-RAM cart path above — this file position isn't
         # relied on afterward (cart_fetch_from_pyfile() in modmsx.c always
         # seeks explicitly before reading a page).
-        buf = get_rom_load_buf()
-        prefix_len = min(size, 8192)
-        n = readinto_chunked(f, buf, prefix_len)
-        mapper = msx_module.detect_mapper(memoryview(buf)[:n])
-        if mapper == msx_module.MAPPER_PLAIN:
-            # Heuristic found no bank-switch pattern despite the ROM
-            # being large — fall back to KONAMI (the most common Mega
-            # ROM mapper) rather than refusing to load at all; a game
-            # that never actually switches banks still runs fine paged.
-            mapper = msx_module.MAPPER_KONAMI
+        #
+        # 2026-09-08: get_rom_load_buf()'s own allocation can itself still
+        # fail on a sufficiently fragmented heap (real-hardware finding —
+        # see its comment) even after shrinking it and adding a
+        # gc.collect(). Rather than let that MemoryError abort the whole
+        # cart load, treat it exactly like "heuristic found no pattern"
+        # below: fall back to KONAMI (the most common Mega ROM mapper) —
+        # a load with a guessed mapper beats no load at all.
+        mapper = msx_module.MAPPER_KONAMI
+        try:
+            buf = get_rom_load_buf()
+            prefix_len = min(size, _PREFIX_BUF_SIZE)
+            n = readinto_chunked(f, buf, prefix_len)
+            detected = msx_module.detect_mapper(memoryview(buf)[:n])
+            if detected != msx_module.MAPPER_PLAIN:
+                mapper = detected
+            # else: heuristic found no bank-switch pattern despite the ROM
+            # being large — keep the KONAMI fallback above rather than
+            # refusing to load at all; a game that never actually
+            # switches banks still runs fine paged.
+        except MemoryError:
+            pass  # keep the KONAMI fallback above
         ok = msx_module.load_cart_paged(slot, f, size, mapper)
     except Exception:
         f.close()
