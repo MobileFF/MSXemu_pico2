@@ -1434,21 +1434,17 @@ void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {
  * Verify with msx.debug via gc.mem_free() before/after on real hardware
  * per doc/dev_guide.md's guidance for any new static buffer regardless.
  *
- * 2026-09-06: shares its storage (via this union) with the RAW332 menu
- * frame buffer below — game frames (this member) and menu/UI frames
- * (the other) are never being built at the same time, so there's no
- * reason to pay for both at once. A first attempt at giving RAW332 its
- * own separate 49152-byte buffer actually failed to link ("GcHeap is too
- * small") on this board — confirming the earlier "static .bss doesn't
- * pressure the GC heap" note only holds up to a point; the union keeps
- * the combined cost at just the larger member's size (49152 bytes,
- * RAW332's own requirement) instead of both sizes added together. */
-static union {
-    uint8_t pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
-    uint8_t raw332[MSX_SCREEN_W * MSX_SCREEN_H];
-} hdmi_frame_buf;
-#define hdmi_frame_buf_pal4   hdmi_frame_buf.pal4
-#define hdmi_frame_buf_raw332 hdmi_frame_buf.raw332
+ * 2026-09-06: briefly shared storage with a RAW332 full-frame buffer
+ * (see msx_render_to_hdmi_raw332()'s own comment) via a union, after a
+ * first attempt giving RAW332 its own separate 49152-byte buffer failed
+ * to link ("GcHeap is too small") on this board — confirming the
+ * earlier "static .bss doesn't pressure the GC heap" note only holds up
+ * to a point. 2026-09-08: RAW332 went back to a small per-row buffer
+ * instead (menu/UI frames have no FPS target to protect, so there was
+ * never a real need for a full-frame buffer there — see its own
+ * comment), so this union is gone too; back to a plain array, its own
+ * 24576 bytes. */
+static uint8_t hdmi_frame_buf_pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
 
 /* Reverse-lookup: which of the 16 palette entries does this (byte-swapped)
  * RGB565 pixel match? framebuf only ever contains exact palette565[]
@@ -1532,43 +1528,38 @@ void msx_render_to_hdmi(msx_state_t *msx) {
     dma_active_cs_pin = (int)msx->hdmi_cs_pin;
 }
 
-/* RAW332 menu/UI frame path — see hdmi_frame_buf's comment above for the
- * shared-storage union it uses (hdmi_frame_buf_raw332). Used for the
- * menu/UI screens (MenuCanvas in msx_menu.py), which draw directly into
- * the same C framebuf as the game screen but use arbitrary UI colors
- * outside the MSX's fixed 16-color hardware palette (borders,
- * highlights, etc.) — hdmi_find_palette_index() can't represent those,
- * so PAL4 would render everything that isn't an exact palette match as
- * black. The game's own render path (msx_render_to_hdmi() above) never
- * needs this: the VDP only ever writes exact palette565[] values.
+/* RAW332 menu/UI frame path. Used for the menu/UI screens (MenuCanvas in
+ * msx_menu.py), which draw directly into the same C framebuf as the
+ * game screen but use arbitrary UI colors outside the MSX's fixed
+ * 16-color hardware palette (borders, highlights, etc.) —
+ * hdmi_find_palette_index() can't represent those, so PAL4 would render
+ * everything that isn't an exact palette match as black. The game's own
+ * render path (msx_render_to_hdmi() above) never needs this: the VDP
+ * only ever writes exact palette565[] values.
  *
- * 2026-09-06: originally a single per-row buffer, blocking on
- * spi_write_blocking() 192 times per call — the exact same fully-blocking,
- * one-row-at-a-time pattern msx_render_to_hdmi() itself used before its
- * own 2026-09-04 DMA conversion (see hdmi_frame_buf's comment above). A
- * same-day fix converted it to the identical build-full-frame-then-DMA-
- * left-in-flight pattern as msx_render_to_hdmi() — which fixed the
- * original "No Signal every menu redraw" symptom, but then needed an
- * explicit msx.wait_display()/wait_display() call added at every single
- * site that draws a menu screen and then immediately touches SD right
- * after (the boot ROM selector, folder navigation, Save/Load State,
- * Audio/Display Settings — see msx_wait_display()'s comment for the
- * fragile bug class this created and the growing list of call sites it
- * needed touching).
+ * 2026-09-06: this used to be converted to the same build-full-frame-
+ * then-DMA-left-in-flight pattern as msx_render_to_hdmi(), to fix a real
+ * "No Signal every menu redraw" bug from the original per-row blocking
+ * version below — but leaving the transfer in-flight then needed an
+ * explicit msx.wait_display() call added at every single site that
+ * draws a menu screen and then immediately touches SD right after (the
+ * boot ROM selector, folder navigation, Save/Load State, Audio/Display
+ * Settings), and cost a dedicated 49152-byte full-frame buffer.
  *
- * Real insight: unlike msx_render_to_hdmi() (called every frame, where
- * overlapping the SPI transfer with the next frame's Z80/VDP emulation
- * is the entire point), menu/UI screens have no FPS target to protect —
- * they sit idle polling the keyboard every 30ms between redraws. There
- * is no reason to leave this transfer in-flight at all. Reverted to
- * fully synchronous: one spi_write_blocking() call for the whole
- * 49152-byte payload (still far cheaper than 192 separate per-row calls
- * — the CPU-time argument for DMA specifically was about *overlapping*
- * with other work, which doesn't apply here) that blocks until
- * genuinely done and leaves CS deasserted before returning. This
- * guarantees every caller sees a fully-idle bus the moment this function
- * returns, by construction — no call site anywhere needs to know or
- * care that a menu was just drawn before doing its own SD access. */
+ * 2026-09-08: reverted to this per-row blocking version instead — same
+ * fix for the "No Signal" bug (still fully synchronous end to end,
+ * still leaves CS deasserted before returning, so every caller still
+ * sees a fully-idle bus the instant this returns), but without the
+ * full-frame buffer's cost. Real insight: unlike msx_render_to_hdmi()
+ * (called every frame, where overlapping the SPI transfer with the next
+ * frame's Z80/VDP emulation is the entire point of leaving it
+ * in-flight), menu/UI screens have no FPS target to protect — they sit
+ * idle polling the keyboard every 30ms between redraws. 192 separate
+ * spi_write_blocking() calls costing more CPU time than one big call
+ * doesn't matter here the way it matters for gameplay; the RAM it saves
+ * (49152 -> 256 bytes) does. */
+static uint8_t hdmi_row_buf_raw332[MSX_SCREEN_W];
+
 void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
@@ -1584,22 +1575,15 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
         (uint8_t)(MSX_SCREEN_H >> 8), (uint8_t)(MSX_SCREEN_H & 0xFF),
         (uint8_t)HDMI_SCALE, 0 /* reserved */
     };
-
-    /* Build the whole frame first (fast, no bus access) ... */
-    for (int row = 0; row < MSX_SCREEN_H; row++) {
-        const uint16_t *src = fb + (size_t)row * MSX_SCREEN_W;
-        uint8_t *dst = hdmi_frame_buf_raw332 + (size_t)row * MSX_SCREEN_W;
-        for (int x = 0; x < MSX_SCREEN_W; x++) {
-            dst[x] = hdmi_565be_to_332(src[x]);
-        }
-    }
-
-    /* ... then send it, fully blocking: header (8 bytes) + the whole
-     * payload in one spi_write_blocking() call. Returns only once every
-     * bit has actually finished clocking out and CS is back high. */
     gpio_put(msx->hdmi_cs_pin, 0);
     spi_write_blocking(spi, header, sizeof(header));
-    spi_write_blocking(spi, hdmi_frame_buf_raw332, sizeof(hdmi_frame_buf_raw332));
+    for (int row = 0; row < MSX_SCREEN_H; row++) {
+        const uint16_t *src = fb + (size_t)row * MSX_SCREEN_W;
+        for (int x = 0; x < MSX_SCREEN_W; x++) {
+            hdmi_row_buf_raw332[x] = hdmi_565be_to_332(src[x]);
+        }
+        spi_write_blocking(spi, hdmi_row_buf_raw332, sizeof(hdmi_row_buf_raw332));
+    }
     gpio_put(msx->hdmi_cs_pin, 1);
 }
 

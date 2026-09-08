@@ -22,6 +22,22 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Heap diagnostics — 2026-09-08, added after chasing several real-hardware
+# MemoryErrors this week (main.py itself, this module, mid-gameplay lazy
+# imports, a Mega ROM scratch buffer) mostly by trial and error. Cheap,
+# always-on visibility into gc.mem_free() at the key points where a lazy
+# .py file is about to be compiled (the actual moment these failures hit)
+# beats reactively guessing after the next real-hardware report. Printed
+# to the console only — no SD/file access, no extra heap cost beyond the
+# f-string itself.
+# ---------------------------------------------------------------------------
+
+def log_mem(tag):
+    import gc
+    print(f"MEM {tag}: {gc.mem_free()} bytes free")
+
+
+# ---------------------------------------------------------------------------
 # Color helpers
 # ---------------------------------------------------------------------------
 
@@ -624,6 +640,7 @@ def select_rom(msx_module, directory, title="Select ROM",
                   # (Swap Cartridge), where cart/emulation state has
                   # already fragmented the heap more than at a fresh boot.
     import msx_rom_browser
+    log_mem("after msx_rom_browser import")
     return msx_rom_browser.select(msx_module, directory, title=title,
                                   usb_host_mod=usb_host_mod,
                                   auto_if_one=auto_if_one,
@@ -655,6 +672,7 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                   # same reasoning for msx_display_settings.py's own lazy
                   # import inside msx_runtime_menu.py).
     import msx_runtime_menu
+    log_mem("after msx_runtime_menu import")
     return msx_runtime_menu.show(msx_module, usb_host_mod, rom_dir,
                                  exclude_names, save_path,
                                  config_path=config_path,

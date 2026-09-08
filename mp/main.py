@@ -104,7 +104,9 @@ from msx_keymap import (apply_hid_report, HID_F7, HID_P, HID_ESC,
                        MOD_LGUI, MOD_RGUI)
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
-                        load_cart_smart, set_display_state, readinto_chunked)
+                        load_cart_smart, set_display_state, readinto_chunked,
+                        log_mem)
+log_mem("boot, after main.py/msx_menu.py compiled")
 
 # -----------------------------------------------------------------------
 # Pin / peripheral constants
@@ -779,6 +781,8 @@ def run():
         _show_error("MSX BIOS not found", DEFAULT_BIOS)
         return
 
+    log_mem("after BIOS load")
+
     # 7 — Load cartridge (config file → interactive selector → none → BASIC)
     # load_cart_smart() picks in-RAM vs SD-backed paged loading (Mega ROM,
     # >32KB) automatically — see msx_menu.py. HDMI is already active at
@@ -815,6 +819,8 @@ def run():
             print(f"Cart (menu): {selected}  {'OK' if ok else 'FAILED'}")
         else:
             print("No cartridge — booting MSX BASIC")
+
+    log_mem("after cart load")
 
     # 8 — Audio: PWM + 22050 Hz repeating timer (ISR feeds ring buffer)
     msx.setup_audio_pwm(AUDIO_PIN)

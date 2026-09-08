@@ -24,7 +24,8 @@ from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
                       HID_UP, HID_DOWN, HID_LEFT, HID_RIGHT, HID_ENTER, HID_ESC,
                       hdmi_suspend, hdmi_resume, lcd_suspend, lcd_resume,
                       select_rom, load_cart_smart, load_state_from,
-                      save_config, save_base_for_cart, rotate_and_save_state)
+                      save_config, save_base_for_cart, rotate_and_save_state,
+                      log_mem)
 
 _RUNTIME_ITEMS = ["Swap Cartridge", "Save State", "Load State",
                   "Audio Settings", "Display Settings",
@@ -270,6 +271,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                             # got lucky; 32KB ones reliably didn't).
                             msx_module.eject_cart(0)
                             gc.collect()  # defragment before the cart-sized read
+                            log_mem("before Swap Cartridge load_cart_smart()")
                             ok = load_cart_smart(msx_module, 0, selected)
                             if ok:
                                 msx_module.reset()
@@ -322,6 +324,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                               # already fragmented the heap more than at a
                               # fresh boot.
                 import msx_save_slots
+                log_mem("after msx_save_slots import")
                 chosen = msx_save_slots.select(msx_module, base,
                                                usb_host_mod=usb_host_mod)
                 if chosen:
@@ -352,6 +355,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                               # state has already fragmented the heap more
                               # than at a fresh boot.
                 import msx_display_settings  # lazy — see its own docstring
+                log_mem("after msx_display_settings import")
                 display_state = msx_display_settings.show(
                     msx_module, usb_host_mod, config_path, display_state,
                     init_hdmi_output=init_hdmi_output,
