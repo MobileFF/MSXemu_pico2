@@ -575,6 +575,21 @@ def poll_keyboard():
         _hdmi_baud      = display_state['hdmi_baud']
         set_display_state(_display_mode)
         msx.set_backlight(_display_mode != 'hdmi')  # no-op if LCD wasn't initialized
+        # Lightweight preventive re-assert of HDMI state on every menu
+        # exit (display=hdmi only): re-applies the HDMI SPI settings and
+        # re-sends the fixed 16-colour palette, nothing else — no reset
+        # pulse, no clear_hdmi(), so it's invisible (~24 bytes blocking,
+        # microseconds) with no black flash. Counters a receiver-side
+        # palette/SPI-mode drift that the menu's raw332 draws +
+        # hdmi_suspend()/lcd_suspend() cycling could plausibly leave
+        # behind (the suspected cause of the long-session "goes black on
+        # HDMI" reports). LCD deliberately not re-inited here — it's
+        # reliable, and init_display_hardware()'s panel SWRESET *would*
+        # flash. A full HDMI reinit (with the receiver reset pulse) is
+        # still available on demand via GUI+ESC / Display Settings'
+        # "Reinit ... now".
+        if _display_mode == 'hdmi':
+            msx.init_hdmi_output(HDMI_CS_PIN, _hdmi_baud)
         # Force the next report through regardless of whether it matches
         # what was last applied (keys held during the menu shouldn't leak
         # into the MSX matrix, and the menu's own key reads may have left
