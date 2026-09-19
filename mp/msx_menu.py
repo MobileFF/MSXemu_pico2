@@ -629,11 +629,13 @@ def load_cart_smart(msx_module, slot, path):
 # ---------------------------------------------------------------------------
 
 def select_rom(msx_module, directory, title="Select ROM",
-               usb_host_mod=None, auto_if_one=True, timeout_ms=5000,
-               exclude_names=(), start_dir=None):
+               usb_host_mod=None, timeout_ms=5000,
+               exclude_names=(), start_dir=None, ext='.rom'):
     """Thin lazy-import wrapper — see msx_rom_browser.select() for the
     actual implementation (kept out of this module's eager compile path;
-    only loaded the first time a ROM actually needs picking)."""
+    only loaded the first time a ROM actually needs picking). `ext`
+    selects which file extension is browsable ('.rom' cartridges by
+    default, '.dsk' for the virtual FDD's disk-image browser)."""
     import gc
     gc.collect()  # defragment before compiling msx_rom_browser.py — real-
                   # hardware finding: this can be imported mid-gameplay
@@ -643,10 +645,9 @@ def select_rom(msx_module, directory, title="Select ROM",
     log_mem("after msx_rom_browser import")
     return msx_rom_browser.select(msx_module, directory, title=title,
                                   usb_host_mod=usb_host_mod,
-                                  auto_if_one=auto_if_one,
                                   timeout_ms=timeout_ms,
                                   exclude_names=exclude_names,
-                                  start_dir=start_dir)
+                                  start_dir=start_dir, ext=ext)
 
 
 # ---------------------------------------------------------------------------
@@ -660,10 +661,13 @@ def select_rom(msx_module, directory, title="Select ROM",
 def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                        save_path, config_path=None,
                        init_hdmi_output=None, init_lcd_output=None,
-                       display_state=None, cart_path=None):
+                       display_state=None, cart_path=None,
+                       fdd_mode=False, disk_path=None):
     # Thin lazy-import wrapper — see msx_runtime_menu.show() for the
     # actual implementation (kept out of this module's eager compile
     # path; only loaded the first time GUI+F7 is actually pressed).
+    # fdd_mode/disk_path: mode=disk (see mp/msx_fdd.py) — "Swap Cartridge"
+    # becomes "Swap Disk" and browses .DSK files instead of .ROM.
     import gc
     gc.collect()  # defragment before compiling msx_runtime_menu.py — this
                   # first GUI+F7 press happens mid-gameplay, where cart/
@@ -679,7 +683,8 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                                  init_hdmi_output=init_hdmi_output,
                                  init_lcd_output=init_lcd_output,
                                  display_state=display_state,
-                                 cart_path=cart_path)
+                                 cart_path=cart_path,
+                                 fdd_mode=fdd_mode, disk_path=disk_path)
 
 
 def load_config(config_path):

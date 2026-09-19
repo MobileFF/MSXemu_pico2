@@ -23,6 +23,7 @@ target_sources(msx_lib INTERFACE
     # MSX system
     ${CMAKE_CURRENT_LIST_DIR}/msx_core.c
     ${CMAKE_CURRENT_LIST_DIR}/modmsx.c
+    ${CMAKE_CURRENT_LIST_DIR}/wd179x.c
 
     # Z80 CPU core (superzazu/z80, MIT)
     ${CMAKE_CURRENT_LIST_DIR}/z80/z80.c

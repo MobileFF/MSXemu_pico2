@@ -13,9 +13,11 @@ from msx_menu import (MenuCanvas, C_BLACK, C_GREEN, C_WHITE, C_GRAY, C_RED,
                       hdmi_suspend, hdmi_resume, lcd_suspend, lcd_resume)
 
 
-def _list_dir_entries(directory, exclude_names=()):
-    """[(name, is_dir), ...] for `directory`: dirs first, then .ROM files,
-    each sorted. exclude_names filters files only, never dirs."""
+def _list_dir_entries(directory, exclude_names=(), ext='.rom'):
+    """[(name, is_dir), ...] for `directory`: dirs first, then matching
+    files (by `ext`, default .ROM cartridges; pass '.dsk' for the virtual
+    FDD's disk-image browser), each sorted. exclude_names filters files
+    only, never dirs."""
     try:
         entries = list(uos.ilistdir(directory))
     except (OSError, UnicodeError):
@@ -28,32 +30,13 @@ def _list_dir_entries(directory, exclude_names=()):
         return []
     # type & 0x4000 = dir (S_IFDIR)
     dirs = sorted(e[0] for e in entries if (e[1] & 0x4000))
-    roms = sorted(e[0] for e in entries
-                  if not (e[1] & 0x4000) and e[0].lower().endswith('.rom')
-                  and e[0].lower() not in exclude_names)
-    return [(d, True) for d in dirs] + [(r, False) for r in roms]
+    files = sorted(e[0] for e in entries
+                   if not (e[1] & 0x4000) and e[0].lower().endswith(ext)
+                   and e[0].lower() not in exclude_names)
+    return [(d, True) for d in dirs] + [(f, False) for f in files]
 
 
-def _find_first_rom_recursive(directory, exclude_names=(), max_depth=6):
-    """Depth-first (files before subfolders) search for the first .ROM
-    under `directory` — used when there's no keyboard to browse with.
-    max_depth bounds runaway recursion. Returns a path or None."""
-    if max_depth <= 0:
-        return None
-    entries = _list_dir_entries(directory, exclude_names=exclude_names)
-    for name, is_dir in entries:
-        if not is_dir:
-            return directory + "/" + name
-    for name, is_dir in entries:
-        if is_dir:
-            found = _find_first_rom_recursive(
-                directory + "/" + name, exclude_names, max_depth - 1)
-            if found:
-                return found
-    return None
-
-
-def _draw_file_list(canvas, title, items, selected, scroll):
+def _draw_file_list(canvas, title, items, selected, scroll, ext='.rom'):
     """Render a scrollable file list menu."""
     canvas.clear(C_BLACK)
 
@@ -82,22 +65,24 @@ def _draw_file_list(canvas, title, items, selected, scroll):
         canvas.text("ENTER:select  ESC:skip", 2, canvas.H - 10, C_GRAY)
         canvas.text(status, canvas.W - len(status) * 8 - 2, canvas.H - 10, C_CYAN)
     else:
-        canvas.text("No .ROM files found", 2, canvas.H - 10, C_RED)
+        canvas.text(f"No {ext.upper()} files found", 2, canvas.H - 10, C_RED)
 
     canvas.flush()
 
 
 def select(msx_module, directory, title="Select ROM",
-          usb_host_mod=None, auto_if_one=True, timeout_ms=5000,
-          exclude_names=(), start_dir=None):
-    """Interactive ROM file selector with folder navigation. `directory`
+          usb_host_mod=None, timeout_ms=5000,
+          exclude_names=(), start_dir=None, ext='.rom'):
+    """Interactive file selector with folder navigation. `directory`
     is the floor of navigation (ENTER on ".."/ESC there cancels) — always
     the caller's real ROM root. `start_dir`, if given, is just where
     browsing initially opens (e.g. the currently-loaded cart's own
     folder) — the user can still navigate up past it to `directory`.
-    auto_if_one auto-selects when the initial listing has exactly one
-    ROM and no subfolders. Returns the selected path, or None if
-    cancelled/nothing found."""
+    `ext` selects which file extension is browsable (default '.rom' for
+    cartridges; '.dsk' for the virtual FDD's disk-image browser — see
+    msx_fdd.py). Returns the selected path, or None if cancelled/no
+    keyboard/nothing found/timed out (all treated as "no selection" by
+    callers — see the no-keyboard and timeout comments below)."""
     import time
 
     root_dir = directory
@@ -114,35 +99,28 @@ def select(msx_module, directory, title="Select ROM",
         _prev_hdmi = hdmi_suspend()
         _prev_lcd  = lcd_suspend()
         try:
-            return _list_dir_entries(d, exclude_names=exclude_names)
+            return _list_dir_entries(d, exclude_names=exclude_names, ext=ext)
         finally:
             lcd_resume(_prev_lcd)
             hdmi_resume(_prev_hdmi)
 
-    # No keyboard: can't navigate, so search recursively instead of just
-    # the top level.
+    # No keyboard: no way to navigate/cancel interactively, so there's
+    # nothing to wait for — cancel immediately (same "no selection ->
+    # BASIC" outcome as the keyboard-present timeout below). 2026-09-13:
+    # this used to auto-select the first ROM found by a recursive search
+    # (or the only ROM present, via the auto_if_one parameter this
+    # replaced), on the reasoning that a headless setup can't pick
+    # anything anyway — but same objection as the timeout fix below: no
+    # 'cart'/'disk' configured should mean BASIC, not "whichever ROM
+    # happens to sort first" (or "happens to be the only one present").
     if usb_host_mod is None:
-        found = _find_first_rom_recursive(directory, exclude_names=exclude_names)
-        if found:
-            _draw_message(canvas, title, found[len(directory) + 1:],
-                          "No keyboard — auto-selecting", C_YELLOW)
-            time.sleep_ms(1500)
-            return found
-        _draw_message(canvas, title, "No .ROM files found under", directory, C_RED)
-        time.sleep_ms(2000)
         return None
 
     cur_dir = start_dir if start_dir else directory
     entries = _listing(cur_dir)
 
-    if auto_if_one and len(entries) == 1 and not entries[0][1]:
-        name = entries[0][0]
-        _draw_message(canvas, title, f"Auto: {name}", "Loading…", C_GREEN)
-        time.sleep_ms(800)
-        return cur_dir + "/" + name
-
     if not entries and cur_dir == root_dir:
-        _draw_message(canvas, title, "No .ROM files found in", cur_dir, C_RED)
+        _draw_message(canvas, title, f"No {ext.upper()} files found in", cur_dir, C_RED)
         time.sleep_ms(2000)
         return None
 
@@ -155,7 +133,7 @@ def select(msx_module, directory, title="Select ROM",
     scroll   = 0
     MAX_ROWS = (MenuCanvas.H - 26) // 10
 
-    _draw_file_list(canvas, title, _display_items(), selected, scroll)
+    _draw_file_list(canvas, title, _display_items(), selected, scroll, ext=ext)
     _wait_key_release(usb_host_mod)
 
     last_key  = 0
@@ -166,24 +144,22 @@ def select(msx_module, directory, title="Select ROM",
         key = _get_key(usb_host_mod)
         has_updir = (cur_dir != root_dir)
 
-        # Timeout, no key activity: load current item if it's a ROM, else
-        # fall back to a recursive search from the root.
+        # Timeout, no key activity: cancel (same as ESC) rather than
+        # auto-loading whatever happens to be highlighted. 2026-09-13:
+        # this used to auto-load the current/first ROM after timeout_ms of
+        # no input — meant as a headless-boot convenience, but with a
+        # keyboard present (this branch is unreachable without one — see
+        # the no-keyboard recursive-search path above) it meant an
+        # unattended boot with no 'cart'/'disk' configured would silently
+        # load *some* ROM instead of the expected "no selection → BASIC"
+        # outcome, purely because whoever happened to be near the machine
+        # didn't press a key in time. Caller already treats None exactly
+        # like an explicit ESC (main.py: "No cartridge — booting MSX
+        # BASIC" / msx_fdd's "no disk image" message).
         if deadline is not None and key == 0:
             if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
-                idx = selected - (1 if has_updir else 0)
-                if idx >= 0 and idx < len(entries) and not entries[idx][1]:
-                    path = cur_dir + "/" + entries[idx][0]
-                    _draw_message(canvas, title, f"Auto: {entries[idx][0]}",
-                                  "No input — loading…", C_YELLOW)
-                    time.sleep_ms(600)
-                    return path
-                found = _find_first_rom_recursive(root_dir, exclude_names=exclude_names)
-                if found:
-                    _draw_message(canvas, title, found[len(root_dir) + 1:],
-                                  "No input — loading…", C_YELLOW)
-                    time.sleep_ms(600)
-                    return found
-                deadline = None  # nothing loadable anywhere — keep waiting
+                _wait_key_release(usb_host_mod)
+                return None
 
         if key == last_key:
             continue   # still held — ignore repeat for now
@@ -233,4 +209,4 @@ def select(msx_module, directory, title="Select ROM",
             _wait_key_release(usb_host_mod)
             return None
 
-        _draw_file_list(canvas, title, _display_items(), selected, scroll)
+        _draw_file_list(canvas, title, _display_items(), selected, scroll, ext=ext)

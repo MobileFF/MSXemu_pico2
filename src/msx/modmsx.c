@@ -20,6 +20,7 @@
 #include "py/runtime.h"
 #include "py/obj.h"
 #include "py/objstr.h"
+#include "py/objlist.h"
 #include "py/mphal.h"
 #include "py/stream.h"
 
@@ -63,6 +64,14 @@ static uint8_t g_state_hdr_buf[MSX_SAVE_HDR_SZ];
  * and could collect it out from under this module's raw mp_obj_t copy. */
 MP_REGISTER_ROOT_POINTER(mp_obj_t msx_cart_file0);
 MP_REGISTER_ROOT_POINTER(mp_obj_t msx_cart_file1);
+
+/* Virtual FDD (mode=disk, mp/msx_fdd.py) — the mounted .dsk image's open
+ * Python file object, held the same way as msx_cart_file0/1 above (a GC
+ * root pointer, since this module's own copy is otherwise invisible to
+ * the collector) for fdc_sector_io_from_pyfile() (see msx.fdc_mount()
+ * below) to seek/read/write against on each WD179x Read/Write Sector
+ * command. */
+MP_REGISTER_ROOT_POINTER(mp_obj_t msx_fdc_file);
 
 static mp_obj_t *cart_file_slot(uint8_t slot) {
     return (slot == 0) ? &MP_STATE_VM(msx_cart_file0) : &MP_STATE_VM(msx_cart_file1);
@@ -176,6 +185,12 @@ static mp_obj_t msx_py_init(void) {
         }
         *fp = mp_const_none;
     }
+    /* Same close-before-memset for a previous msx.fdc_mount()'s file, if
+     * any (mode=disk re-init-without-reboot case). */
+    if (MP_STATE_VM(msx_fdc_file) != MP_OBJ_NULL && MP_STATE_VM(msx_fdc_file) != mp_const_none) {
+        mp_stream_close(MP_STATE_VM(msx_fdc_file));
+    }
+    MP_STATE_VM(msx_fdc_file) = mp_const_none;
 
     msx_init(&msx_state);
     /* msx_init() zeroes the whole state including cart_fetch_cb and
@@ -359,6 +374,119 @@ static mp_obj_t msx_py_is_cart_paged(mp_obj_t slot_obj) {
     return mp_obj_new_bool(msx_state.cart_paged[slot]);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_is_cart_paged_obj, msx_py_is_cart_paged);
+
+/* -----------------------------------------------------------------------
+ * Virtual FDD (mode=disk, mp/msx_fdd.py) — WD179x-compatible FDC
+ * register emulation (src/msx/wd179x.c/.h). Memory-mapped into cart
+ * slot 1's page (see msx_core.c's msx_mem_read()/msx_mem_write()) —
+ * a real Disk ROM's own low-level driver code talks to these registers
+ * directly (confirmed by disassembling one: a BUSY-bit poll against
+ * static ROM bytes, since this project previously had no FDC hardware
+ * behind that address at all), so DSKIO/DSKCHG/GETDPB-level hooking
+ * (this project's original approach) can't intercept it — only emulating
+ * the actual chip can. See wd179x.h for the full design rationale.
+ *
+ * Same "keep a Python file object as a GC root pointer, do the actual
+ * seek/read/write in C via mp_stream_*" pattern as cart_fetch_from_pyfile
+ * above, just triggered by the FDC's Read/Write Sector commands instead
+ * of a Mega ROM bank-switch.
+ *
+ * 2026-09-14: this fires synchronously from inside msx.run_frame() —
+ * same timing as the CALL-hook-based DSKIO this replaced, and the exact
+ * same SPI1-bus-contention hazard already well-documented elsewhere in
+ * this project for any SD touch that lands right after display activity
+ * (msx_wait_display()'s own comment in msx_core.c; msx_menu.py's
+ * hdmi_suspend()/lcd_suspend()) — confirmed for real here too: a real-
+ * hardware run hit `OSError [Errno 5]` from sdcard.py's readblocks() the
+ * first time a Read Sector command actually reached this function.
+ * msx_wait_display() only drains an in-flight DMA transfer; it does
+ * nothing about the *settling time* a same-peripheral SPI mode switch
+ * needs (HDMI's mode 3 -> SD's mode 0) even after that transfer has
+ * fully finished — msx_wait_display()'s own comment calls the 20ms
+ * Python-side sleep hdmi_suspend() adds for exactly this reason "nowhere
+ * near enough" to skip. Applied unconditionally (not just when HDMI is
+ * active) rather than trying to thread display-mode awareness down into
+ * wd179x.c — matches how hdmi_suspend()/lcd_suspend() already run
+ * unconditionally around every other SD-heavy operation in this project,
+ * and a sector transfer is already far from a 60fps-sensitive path. */
+static bool fdc_sector_io_from_pyfile(void *userdata, uint32_t lba_sector,
+                                        bool is_write, uint8_t *buf) {
+    (void)userdata;
+    mp_obj_t file_obj = MP_STATE_VM(msx_fdc_file);
+    if (file_obj == MP_OBJ_NULL || file_obj == mp_const_none) return false;
+
+    msx_wait_display(&msx_state);
+#if HAVE_PICO_SDK
+    sleep_ms(20);
+#endif
+
+    int errcode = 0;
+    mp_off_t byte_offset = (mp_off_t)lba_sector * (mp_off_t)MSX_FDC_SECTOR_SIZE;
+    mp_off_t pos = mp_stream_seek(file_obj, byte_offset, MP_SEEK_SET, &errcode);
+    if (errcode != 0 || pos < 0) return false;
+
+    if (is_write) {
+        mp_uint_t n = mp_stream_write_exactly(file_obj, buf, MSX_FDC_SECTOR_SIZE, &errcode);
+        return (errcode == 0 && n == MSX_FDC_SECTOR_SIZE);
+    } else {
+        mp_uint_t n = mp_stream_read_exactly(file_obj, buf, MSX_FDC_SECTOR_SIZE, &errcode);
+        return (errcode == 0 && n == MSX_FDC_SECTOR_SIZE);
+    }
+}
+
+/* Unlike msx_set_cart_fetch_cb()/call_hook_relink() elsewhere in this
+ * file, there's no "re-link after msx.init()" step needed here:
+ * msx.init()'s full memset() also clears msx_state.fdc.enabled itself
+ * (there's no separate, outside-msx_state record of "the FDC was
+ * enabled with these params" the way call_hook_addrs[]/call_hook_fns[]
+ * remember hook registrations independently of msx_state) — so after
+ * msx.init(), the FDC is simply disabled again until msx.fdc_mount() is
+ * called, exactly like the first boot. mp/msx_fdd.py's register()+
+ * mount() re-run as part of any normal reboot (main.py's own top-level
+ * flow), including the rare "re-run main.py without a hardware reset"
+ * case call_hook_relink()'s own comment describes, so this needs no
+ * special handling on the C side.
+ *
+ * msx.fdc_mount(file_obj, base_addr: int, sectors_per_track: int, num_sides: int)
+ * Enables the FDC and points it at an already-open, seekable disk-image
+ * file object (e.g. open(path, 'r+b')) — this module keeps its own
+ * reference (rooted against the GC, same as load_cart_paged()'s
+ * file_obj); do not close file_obj yourself, msx.fdc_unmount() does.
+ * base_addr is where register +0 (Status/Command) is memory-mapped
+ * within cart slot 1's page (registers +0..+4 follow); sectors_per_track/
+ * num_sides come from the image's own boot-sector BPB (mp/msx_fdd.py
+ * parses it) — pass 0 for either to fall back to the 9-sectors/2-sides
+ * standard-floppy default.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_fdc_mount(size_t n_args, const mp_obj_t *args) {
+    (void)n_args;
+    mp_obj_t file_obj          = args[0];
+    uint16_t base_addr         = (uint16_t)mp_obj_get_int(args[1]);
+    uint8_t  sectors_per_track = (uint8_t)mp_obj_get_int(args[2]);
+    uint8_t  num_sides         = (uint8_t)mp_obj_get_int(args[3]);
+
+    MP_STATE_VM(msx_fdc_file) = file_obj;
+    msx_fdc_enable(&msx_state.fdc, base_addr, sectors_per_track, num_sides);
+    msx_fdc_set_io_cb(&msx_state.fdc, fdc_sector_io_from_pyfile, NULL);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_fdc_mount_obj, 4, 4, msx_py_fdc_mount);
+
+/* -----------------------------------------------------------------------
+ * msx.fdc_unmount()
+ * Disables the FDC and closes/releases the mounted image file, if any.
+ * Safe to call even if fdc_mount() was never called.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_fdc_unmount(void) {
+    msx_fdc_disable(&msx_state.fdc);
+    mp_obj_t file_obj = MP_STATE_VM(msx_fdc_file);
+    if (file_obj != MP_OBJ_NULL && file_obj != mp_const_none) {
+        mp_stream_close(file_obj);
+    }
+    MP_STATE_VM(msx_fdc_file) = mp_const_none;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_fdc_unmount_obj, msx_py_fdc_unmount);
 
 /* -----------------------------------------------------------------------
  * CALL/RST hook table
@@ -1218,6 +1346,9 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_detect_mapper),          MP_ROM_PTR(&msx_py_detect_mapper_obj) },
     { MP_ROM_QSTR(MP_QSTR_eject_cart),             MP_ROM_PTR(&msx_py_eject_cart_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_cart_paged),          MP_ROM_PTR(&msx_py_is_cart_paged_obj) },
+    /* Virtual FDD (mode=disk) */
+    { MP_ROM_QSTR(MP_QSTR_fdc_mount),              MP_ROM_PTR(&msx_py_fdc_mount_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fdc_unmount),            MP_ROM_PTR(&msx_py_fdc_unmount_obj) },
     /* Emulation */
     { MP_ROM_QSTR(MP_QSTR_run_frame),              MP_ROM_PTR(&msx_py_run_frame_obj) },
     { MP_ROM_QSTR(MP_QSTR_boost_peri_clock),       MP_ROM_PTR(&msx_py_boost_peri_clock_obj) },

@@ -39,14 +39,14 @@ _VOLUME_MAX  = 256
 _FILTER_MAX  = 8
 
 
-def _draw_runtime_menu(canvas, cursor, msg=""):
+def _draw_runtime_menu(canvas, cursor, msg="", items=_RUNTIME_ITEMS):
     _echo_msg(msg)
     canvas.clear(C_BLACK)
     canvas.rect(0, 0, canvas.W, 12, C_YELLOW, fill=True)
     canvas.text("EMULATOR MENU", 2, 2, C_BLACK)
 
     y = 20
-    for i, label in enumerate(_RUNTIME_ITEMS):
+    for i, label in enumerate(items):
         if i == cursor:
             canvas.rect(0, y, canvas.W, 10, C_GREEN, fill=True)
             canvas.text(label, 2, y + 1, C_BLACK)
@@ -149,11 +149,12 @@ def _show_audio_settings_menu(msx_module, usb_host_mod, config_path):
 def show(msx_module, usb_host_mod, rom_dir, exclude_names,
         save_path, config_path=None,
         init_hdmi_output=None, init_lcd_output=None,
-        display_state=None, cart_path=None):
+        display_state=None, cart_path=None,
+        fdd_mode=False, disk_path=None):
     # Pause gameplay and show the runtime emulator menu (GUI+F7).
-    # All actions (cart swap, save/load, reset) are performed directly
-    # here; the caller just needs to resume its main loop once this
-    # returns.
+    # All actions (cart/disk swap, save/load, reset) are performed
+    # directly here; the caller just needs to resume its main loop once
+    # this returns.
     #
     # display_state/init_hdmi_output/init_lcd_output: see
     # msx_display_settings.show(). Pass the caller's current display/
@@ -170,15 +171,32 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
     # here when Swap Cartridge succeeds and returned so the caller can
     # keep it for its own F5/F8 hotkey saves.
     #
-    # Returns (display_state, cart_path), both possibly updated, so the
-    # caller can update its own globals.
+    # fdd_mode/disk_path: mode=disk (see mp/msx_fdd.py) — mutually
+    # exclusive with cart_path (always None in this mode). "Swap
+    # Cartridge" becomes "Swap Disk" (browses .DSK instead of .ROM).
+    # Unlike Swap Cartridge, this does NOT reset the machine — mp/
+    # msx_fdd.py hooks DSKCHG (see its docstring) specifically so
+    # MSX-DOS notices the swap on its own via the normal disk-change
+    # protocol; the earlier unconditional msx.reset() here was removed
+    # 2026-09-15 at the user's explicit request. Not yet verified on
+    # real hardware beyond this — if MSX-DOS's own directory/FAT cache
+    # doesn't pick up the new image correctly after a swap, that's the
+    # first place to look. Save/Load State key off disk_path here
+    # instead of cart_path, same rotating-slot-per-image reasoning.
+    #
+    # Returns (display_state, cart_path, disk_path), all possibly
+    # updated, so the caller can update its own globals.
     import time
+
+    items = list(_RUNTIME_ITEMS)
+    if fdd_mode:
+        items[0] = "Swap Disk"
 
     canvas = MenuCanvas(msx_module)
     cursor = 0
     msg = ""
 
-    _draw_runtime_menu(canvas, cursor, msg)
+    _draw_runtime_menu(canvas, cursor, msg, items=items)
     _wait_key_release(usb_host_mod)
 
     last_key = 0
@@ -200,13 +218,52 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
             msg = ""
         elif key == HID_ESC:
             _wait_key_release(usb_host_mod)
-            return display_state, cart_path
+            return display_state, cart_path, disk_path
         elif key == HID_ENTER:
             _wait_key_release(usb_host_mod)
-            label = _RUNTIME_ITEMS[cursor]
+            label = items[cursor]
 
             if label == "Resume":
-                return display_state, cart_path
+                return display_state, cart_path, disk_path
+
+            elif label == "Swap Disk":
+                # No msx.reset() here (unlike Swap Cartridge below) — see
+                # this function's docstring: mp/msx_fdd.py's DSKCHG hook
+                # is relied on to let MSX-DOS notice the new image on its
+                # own. select_rom()/hdmi_suspend()/lcd_suspend() usage
+                # mirrors Swap Cartridge exactly, just filtered to .DSK
+                # and without touching cart slot 1 (the Disk ROM stays
+                # loaded — only the mounted image changes).
+                listdir_failed = False
+                start_dir = disk_path.rsplit('/', 1)[0] if disk_path else None
+                try:
+                    selected = select_rom(msx_module, rom_dir,
+                                          title="Select Disk Image",
+                                          usb_host_mod=usb_host_mod,
+                                          timeout_ms=0,
+                                          exclude_names=exclude_names,
+                                          start_dir=start_dir, ext='.dsk')
+                except OSError as e:
+                    selected = None
+                    listdir_failed = True
+                    msg = f"Directory listing failed: {e}"
+                if selected:
+                    _prev_hdmi = hdmi_suspend()
+                    _prev_lcd  = lcd_suspend()
+                    try:
+                        _draw_runtime_menu(canvas, cursor, "Loading…", items=items)
+                        try:
+                            import msx_fdd
+                            msx_fdd.mount(selected)
+                            disk_path = selected
+                            msg = f"Mounted {selected.rsplit('/',1)[-1]}"
+                        except Exception as e:
+                            msg = f"Mount failed: {e}"
+                    finally:
+                        lcd_resume(_prev_lcd)
+                        hdmi_resume(_prev_hdmi)
+                elif not listdir_failed:
+                    msg = ""
 
             elif label == "Swap Cartridge":
                 # select_rom() suspends HDMI internally around its own SD
@@ -230,7 +287,6 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                     selected = select_rom(msx_module, rom_dir,
                                           title="Select Cartridge ROM",
                                           usb_host_mod=usb_host_mod,
-                                          auto_if_one=False,
                                           timeout_ms=0,
                                           exclude_names=exclude_names,
                                           start_dir=start_dir)
@@ -256,7 +312,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                         # SD reads of cart-sized files take a visible moment
                         # (shared bus with the LCD) — without this, the screen
                         # just freezes on the file list and looks hung.
-                        _draw_runtime_menu(canvas, cursor, "Loading…")
+                        _draw_runtime_menu(canvas, cursor, "Loading…", items=items)
                         try:
                             import gc
                             # Eject the previous cart FIRST: if it was a paged
@@ -300,9 +356,9 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # too (lcd_suspend()) — see its docstring.
                 _prev_hdmi = hdmi_suspend()
                 _prev_lcd  = lcd_suspend()
-                _draw_runtime_menu(canvas, cursor, "Saving…")
+                _draw_runtime_menu(canvas, cursor, "Saving…", items=items)
                 try:
-                    rotate_and_save_state(msx_module, save_base_for_cart(cart_path, save_path))
+                    rotate_and_save_state(msx_module, save_base_for_cart(disk_path if fdd_mode else cart_path, save_path))
                     msg = "State saved"
                 except Exception as e:
                     msg = f"Save failed: {e}"
@@ -316,7 +372,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # HDMI/LCD internally only around its own SD stat() calls,
                 # same reasoning as select_rom() — the interactive list
                 # itself is redrawn from RAM, no per-keypress SD access.
-                base = save_base_for_cart(cart_path, save_path)
+                base = save_base_for_cart(disk_path if fdd_mode else cart_path, save_path)
                 import gc
                 gc.collect()  # defragment before compiling msx_save_slots.py
                               # — real-hardware finding: this always happens
@@ -330,7 +386,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 if chosen:
                     _prev_hdmi = hdmi_suspend()
                     _prev_lcd  = lcd_suspend()
-                    _draw_runtime_menu(canvas, cursor, "Loading…")
+                    _draw_runtime_menu(canvas, cursor, "Loading…", items=items)
                     try:
                         ok = load_state_from(msx_module, chosen)
                         msg = "State loaded" if ok else "Invalid save file"
@@ -367,4 +423,4 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 msg = "MSX reset"
 
         if redraw:
-            _draw_runtime_menu(canvas, cursor, msg)
+            _draw_runtime_menu(canvas, cursor, msg, items=items)

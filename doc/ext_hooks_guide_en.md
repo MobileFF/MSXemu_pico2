@@ -85,6 +85,12 @@ hdmi_baud=8000000
 | `display` | `lcd` | `lcd` or `hdmi`. **Mutually exclusive** (no simultaneous output) — only the chosen side's hardware is initialized at boot. Also switchable live from the runtime menu's Display Settings (or the GUI+P hotkey) |
 | `hdmi_frame_skip` | `2` | Send the HDMI bridge output every Nth frame (only matters when `display=hdmi`). `1` sends every frame |
 | `hdmi_baud` | `8000000` | SPI baud rate (Hz) for the HDMI bridge output. 5MHz/8MHz confirmed clean on real hardware — 10MHz was found to corrupt the received palette. Restart required |
+| `mode` | (none) | Set to `disk` for virtual FDD (floppy disk drive) mode. Mutually exclusive with `cart` (`cart` is ignored when `mode=disk`) |
+| `diskrom` | (none) | Required when `mode=disk`. Path to the Disk ROM loaded into cart slot 1 (not bundled for copyright reasons — dump your own Disk ROM and place it here) |
+| `disk` | (none) | Path to the `.DSK` image (360KB/720KB) to mount at boot. If omitted, an interactive selector listing the SD card's `.DSK` files is shown |
+| `fdc_base` | `0x7FB8` | Z80 address where the Disk ROM's FDC (WD1793/WD2793-compatible) registers are memory-mapped (decimal or `0x`-prefixed hex). This default works for many Disk ROMs, but another one may map its FDC elsewhere |
+
+Under `mode=disk`, the runtime menu shows "Swap Disk" in place of "Swap Cartridge", for hot-swapping the mounted `.DSK` image (the DSKCHG hook in `mp/msx_fdd.py` lets MSX-DOS/Disk BASIC notice the new disk on its own — no reset needed). Verified on real hardware: Disk BASIC SAVE/LOAD, and a full MSX-DOS boot (MSXDOS.SYS/COMMAND.COM load, both disk sides). Single drive, standard 3.5" DD (360KB/720KB) geometry only.
 
 If `cart` is omitted, or the specified file isn't found, an interactive selector listing the SD card's `.ROM` files (subfolders included) is shown (with no USB keyboard connected, the first file in the list is auto-selected).
 

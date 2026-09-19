@@ -288,6 +288,16 @@ uint8_t msx_mem_read(void *userdata, uint16_t addr) {
         return 0xFF;
 
     case 1: /* Cartridge slot 1 */ {
+        /* Virtual FDD (mode=disk, mp/msx_fdd.py): a Disk ROM's own FDC
+         * registers are memory-mapped into its own cart slot's page,
+         * overlaying what would otherwise be ROM data there (real
+         * hardware — the ROM chip simply doesn't respond in that address
+         * range; the FDC IC does). Checked before cart_page_ptr() so it
+         * takes priority; no-op (falls through to normal ROM/cache reads)
+         * when mode=disk isn't active. */
+        if (msx_fdc_addr_in_range(&msx->fdc, addr)) {
+            return msx_fdc_read(&msx->fdc, addr);
+        }
         const uint8_t *p = cart_page_ptr(msx, 0, addr);
         return p ? *p : 0xFF;
     }
@@ -315,6 +325,11 @@ void msx_mem_write(void *userdata, uint16_t addr, uint8_t data) {
         break;
 
     case 1:
+        /* See msx_mem_read()'s matching comment. */
+        if (msx_fdc_addr_in_range(&msx->fdc, addr)) {
+            msx_fdc_write(&msx->fdc, addr, data);
+            break;
+        }
         cart_mapper_write(msx, 0, addr, data);
         break;
 
@@ -763,6 +778,8 @@ void msx_reset(msx_state_t *msx) {
     msx->joy_state[0] = 0xFF;
     msx->joy_state[1] = 0xFF;
     msx->joy_select   = 0;
+
+    msx_fdc_reset(&msx->fdc);
 }
 
 /* -----------------------------------------------------------------------

@@ -22,6 +22,10 @@
 # msx.ini format (key=value, # = comment):
 #   bios=/sd/msx/MSX.ROM
 #   cart=/sd/msx/CART.ROM
+#   mode=disk
+#   diskrom=/sd/msx/DISK.ROM
+#   disk=/sd/msx/GAME.DSK
+#   fdc_base=0x7FB8
 #   lcd=ILI9341
 #   rotate=180
 #   volume=128
@@ -32,6 +36,24 @@
 #   # omit 'cart' to show the interactive ROM selector at boot (browses from
 #   # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
 #   # a ROM, ESC goes up a level/cancels at the root)
+#   # mode=disk switches to virtual FDD support (see mp/msx_fdd.py):
+#   # cart slot 1 loads 'diskrom' (a Disk ROM binary, same copyright-onus-
+#   # on-user policy as bios=) instead of 'cart', and the runtime menu's
+#   # "Swap Cartridge" becomes "Swap Disk" (browses .DSK files instead of
+#   # .ROM). Mutually exclusive with 'cart' (heap-budget reasons — a Disk
+#   # ROM + a Mega ROM cart loaded together risks exceeding the 64KB C
+#   # heap) — 'cart'/'mode=disk' together in msx.ini is invalid; 'cart' is
+#   # ignored when mode=disk. omit 'disk' to show the interactive .DSK
+#   # selector at boot, same UX as omitting 'cart'. 'fdc_base' (decimal or
+#   # 0x-hex) is the Z80 address of the emulated WD179x FDC's Status/
+#   # Command register within the Disk ROM's own page — omit to use the
+#   # default (0x7FB8, confirmed by disassembly for the Disk ROM this was
+#   # built against); a different Disk ROM may memory-map its FDC
+#   # elsewhere, in which case override this. First-pass scope: a single
+#   # drive (A:), flat/non-paged Disk ROMs only, standard 360KB/720KB
+#   # geometry — see mp/msx_fdd.py's docstring for the full list of
+#   # caveats (no disk-change hardware signal, drive-control latch bit
+#   # layout unconfirmed).
 #   # omit 'lcd' to default to ST7796 (see LCD_SIZES for valid names)
 #   # omit 'rotate' (or 0) for normal orientation; 180 flips the panel. Only
 #   # 0/180 supported (landscape MADCTL flip only, not a true 90/270
@@ -100,8 +122,8 @@ import gc
 gc.collect()  # maximize contiguous free heap before compiling the next
               # (larger) imports below — non-compacting GC, so this is
               # cheap insurance against a marginal MemoryError here.
-from msx_keymap import (apply_hid_report, HID_F7, HID_P, HID_ESC,
-                       MOD_LGUI, MOD_RGUI)
+from msx_keymap import (apply_hid_report, HID_F7, HID_P, HID_ESC, HID_DELETE,
+                       MOD_LGUI, MOD_RGUI, MOD_LCTRL, MOD_RCTRL, MOD_LALT, MOD_RALT)
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
                         load_cart_smart, set_display_state, readinto_chunked,
@@ -217,8 +239,7 @@ JOY_TRIG_A_PIN = 26
 JOY_TRIG_B_PIN = 27
 
 # ROM_DIR is the SD root — select_rom() browses subfolders too (see
-# msx_menu.py's _list_dir_entries()/_find_first_rom_recursive()). BIOS
-# stays under /sd/msx/.
+# msx_rom_browser.py's _list_dir_entries()). BIOS stays under /sd/msx/.
 ROM_DIR      = "/sd"
 CONFIG_PATH  = "/sd/msx.ini"
 DEFAULT_BIOS = "/sd/msx/MSX.ROM"
@@ -356,6 +377,7 @@ _last_keycodes = b'\x00' * 6
 _menu_held = False
 _display_held = False  # GUI+P
 _reinit_held = False   # GUI+ESC
+_exit_requested = False  # Ctrl+Alt+Delete — see poll_keyboard()'s comment
 _bios_name = ""
 _cart_path = None  # currently loaded cart's full path, or None (BASIC
                    # only) — see save_base_for_cart() in msx_menu.py; the
@@ -363,6 +385,14 @@ _cart_path = None  # currently loaded cart's full path, or None (BASIC
                    # cart keeps its own rotating save history. (2026-09-08:
                    # F5/F8 used to double as quick-save/load hotkeys here
                    # too, but were removed — see poll_keyboard()'s comment.)
+_fdd_mode  = False  # True when msx.ini's mode=disk — mutually exclusive
+                    # with cartridge use (see mp/msx_fdd.py); cart slot 1
+                    # holds the Disk ROM instead of a game cartridge in
+                    # this mode, sidestepping the C-heap budget risk of
+                    # loading both at once.
+_disk_path = None  # currently mounted .dsk image's full path (mode=disk
+                   # only), or None — mirrors _cart_path, used by the
+                   # runtime menu's "Swap Disk" item.
 _display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see Display Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
@@ -412,9 +442,9 @@ def _init_lcd_output():
 
 def poll_keyboard():
     global _last_modifier, _last_keycodes, _menu_held
-    global _display_held, _reinit_held
+    global _display_held, _reinit_held, _exit_requested
     global _display_mode, _hdmi_frame_skip
-    global _lcd_model, _rotate_180, _hdmi_baud, _cart_path
+    global _lcd_model, _rotate_180, _hdmi_baud, _cart_path, _disk_path
     if not _usb_ready:
         return
     try:
@@ -426,6 +456,23 @@ def poll_keyboard():
 
     mod = report[0]
     kc  = report[2:8]
+
+    # Ctrl+Alt+Delete: hard-exit main.py back to the REPL. Checked first,
+    # unconditionally (no GUI-key gating, no edge-triggering — exiting is
+    # a one-shot action) so it works regardless of what else is going on
+    # (a menu open, gameplay running, another hotkey held). Added
+    # 2026-09-13 after a real-hardware lockout: main.py's own USB-host
+    # keyboard support (usb_host, a separate PIO-USB peripheral on
+    # GP24/25 — see this file's header) doesn't touch the native USB CDC
+    # serial mpremote connects over, but a plain Ctrl+C sent over that
+    # connection was not observed to interrupt a running main.py — so
+    # this gives an escape hatch that only depends on the USB keyboard,
+    # not on the PC/mpremote side working at all. See run()'s main loop
+    # (`if _exit_requested: break`) and the cleanup right after it.
+    if ((mod & (MOD_LCTRL | MOD_RCTRL)) and (mod & (MOD_LALT | MOD_RALT))
+            and HID_DELETE in kc):
+        _exit_requested = True
+        return
 
     # 2026-09-08: F5/F8 used to be intercepted here as quick-save/load
     # hotkeys (edge-triggered, mirroring GUI+F7 below) — removed, since
@@ -520,7 +567,7 @@ def poll_keyboard():
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
         try:
-            display_state, _cart_path = show_emulator_menu(
+            display_state, _cart_path, _disk_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
                 init_hdmi_output=_init_hdmi_output,
                 init_lcd_output=_init_lcd_output,
@@ -528,7 +575,8 @@ def poll_keyboard():
                                 'frame_skip': _hdmi_frame_skip,
                                 'lcd': _lcd_model, 'rotate': _rotate_180,
                                 'hdmi_baud': _hdmi_baud},
-                cart_path=_cart_path)
+                cart_path=_cart_path,
+                fdd_mode=_fdd_mode, disk_path=_disk_path)
         except Exception as e:
             print(f"Menu crashed: {e!r} — resuming gameplay")
             try:
@@ -798,13 +846,52 @@ def run():
 
     log_mem("after BIOS load")
 
-    # 7 — Load cartridge (config file → interactive selector → none → BASIC)
+    # 7 — Load cartridge, OR (mode=disk) a Disk ROM into the same slot —
+    # mutually exclusive, see msx_fdd.py / the msx.ini comment above.
     # load_cart_smart() picks in-RAM vs SD-backed paged loading (Mega ROM,
     # >32KB) automatically — see msx_menu.py. HDMI is already active at
     # this point (step 5.1 above), so the interactive selector below shows
     # there too, not just on the LCD.
-    global _cart_path
-    if 'cart' in cfg:
+    global _cart_path, _fdd_mode, _disk_path
+    _fdd_mode = cfg.get('mode', '').strip().lower() == 'disk'
+
+    if _fdd_mode:
+        diskrom_path = cfg.get('diskrom')
+        if diskrom_path is None:
+            print("ERROR: mode=disk but no diskrom= in msx.ini")
+            _show_error("diskrom= not set", "required when mode=disk")
+            return
+        if has_sd:
+            try:
+                ok = load_cart_smart(msx, 0, diskrom_path)
+            except OSError:
+                ok = False
+            print(f"Disk ROM (config): {diskrom_path}  {'OK' if ok else 'FAILED'}")
+            if not ok:
+                print(f"ERROR: Disk ROM not found/failed to load: {diskrom_path}")
+                _show_error("Disk ROM not found", diskrom_path)
+                return
+        else:
+            print("ERROR: mode=disk but no SD card")
+            _show_error("No SD card", "mode=disk needs an SD card")
+            return
+
+        if 'disk' in cfg:
+            _disk_path = cfg['disk']
+        elif has_sd:
+            _disk_path = select_rom(
+                msx, ROM_DIR,
+                title="Select Disk Image",
+                usb_host_mod=usb_host if _usb_ready else None,
+                exclude_names={_bios_name},
+                ext='.dsk',
+            )
+        if _disk_path:
+            print(f"Disk image: {_disk_path}")
+        else:
+            print("No disk image — MSX-DOS will report drive A: not ready")
+
+    elif 'cart' in cfg:
         # Explicit path from msx.ini
         if has_sd:
             try:
@@ -818,13 +905,14 @@ def run():
             print(f"WARNING: configured cart not found: {cfg['cart']}")
 
     elif has_sd:
-        # Interactive selector — auto-select if no keyboard or only one file
+        # Interactive selector — no keyboard, or no response within the
+        # timeout, means "no selection" (boots MSX BASIC), not an
+        # auto-pick (2026-09-13; see msx_rom_browser.select()'s comments).
         # (exclude the BIOS file so it isn't offered as a cartridge)
         selected = select_rom(
             msx, ROM_DIR,
             title="Select Cartridge ROM",
             usb_host_mod=usb_host if _usb_ready else None,
-            auto_if_one=not _usb_ready,   # auto-select when no keyboard
             exclude_names={_bios_name},
         )
         if selected:
@@ -849,6 +937,23 @@ def run():
     # plugins — see mp/msx_ext.py and doc/extension_api.md). Runs before
     # reset() so any hooks are already in place when the machine starts.
     load_extensions(msx)
+
+    # 8.6 — Virtual FDD (mode=disk only): WD179x FDC register emulation
+    # (src/msx/wd179x.c), memory-mapped into cart slot 1's page. Mounted
+    # before reset() so msx.reset()'s msx_fdc_reset() (clears transient
+    # FDC registers, preserves the enabled/base_addr/geometry config —
+    # see wd179x.h) has something to preserve.
+    if _fdd_mode:
+        import msx_fdd
+        msx_fdd.register(msx)
+        if _disk_path:
+            try:
+                fdc_base = int(cfg.get('fdc_base', str(msx_fdd.DEFAULT_FDC_BASE)), 0)
+            except ValueError as e:
+                print(f"Bad fdc_base in msx.ini: {e} — using default")
+                fdc_base = msx_fdd.DEFAULT_FDC_BASE
+            msx_fdd.mount(_disk_path, fdc_base)
+        log_mem("after msx_fdd import")
 
     # 9 — Reset and start
     msx.reset()
@@ -914,6 +1019,16 @@ def run():
         poll_keyboard()
         poll_joystick()
 
+        if _exit_requested:
+            # Ctrl+Alt+Delete — see poll_keyboard()'s comment. Drain
+            # whatever DMA transfer render_to_display_1to1() just started
+            # above before we stop touching the display peripheral
+            # entirely (same reasoning as every other mid-loop early-out
+            # in this file, e.g. GUI+F7's wait_display() call below).
+            if use_lcd:
+                msx.wait_display()
+            break
+
         # Block until DMA and SPI shift register finish; deasserts CS.
         # Safe/cheap no-op if render_to_display_1to1() wasn't called above.
         if use_lcd:
@@ -950,6 +1065,22 @@ def run():
             ring    = msx.get_audio_ring_level()
             print(f"FPS: {fps:.1f}  ring: {ring}")
             t0 = time.ticks_ms()
+
+    # Ctrl+Alt+Delete landed here (the only way out of the loop above).
+    # Stop the USB host's background timer so its ISR doesn't keep firing
+    # into a script that's about to finish — best-effort, not required for
+    # mpremote/the REPL to work again (that's the native USB CDC serial, a
+    # separate peripheral from usb_host's PIO-USB pins — see
+    # poll_keyboard()'s comment). Returning from run() here (main.py's only
+    # top-level statement is `if __name__=='__main__': run()`) ends the
+    # script and hands control back to the REPL, exactly like a normal
+    # script finishing on its own.
+    if usb_host is not None and hasattr(usb_host, 'stop_bg_timer'):
+        try:
+            usb_host.stop_bg_timer()
+        except Exception as e:
+            print(f"stop_bg_timer failed (ignoring): {e}")
+    print("Ctrl+Alt+Delete: main.py exiting — REPL/mpremote should be usable now.")
 
 
 if __name__ == '__main__':

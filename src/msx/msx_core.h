@@ -17,6 +17,7 @@
 #include "z80/z80.h"
 #include "tms9918/vrEmuTms9918.h"
 #include "emu2149/emu2149.h"
+#include "wd179x.h"
 
 /* -----------------------------------------------------------------------
  * Timing constants (NTSC)
@@ -172,6 +173,14 @@ typedef struct {
     int32_t   cart_cache_page[2][4];     /* ROM page (8KB units) resident per window, -1=none */
     msx_cart_fetch_fn cart_fetch_cb;     /* set once via msx_set_cart_fetch_cb() */
     void     *cart_fetch_userdata;
+
+    /* WD1793/WD2793-compatible FDC register emulation (see wd179x.h) —
+     * mode=disk virtual FDD support (mp/msx_fdd.py). Always checked
+     * against cart slot 1 (index 0) specifically in msx_mem_read()/
+     * msx_mem_write() below, since that's the only slot a Disk ROM is
+     * ever loaded into (see main.py's mode=disk handling) — not a
+     * per-slot array like cart[]/cart_size[] above. */
+    msx_fdc_t fdc;
 
     /* I/O chip state */
     uint8_t  slot_select;                /* PPI port A: slot select per 16KB page */
@@ -362,6 +371,13 @@ uint8_t msx_detect_mapper(const uint8_t *data, uint32_t size);
 
 /* Eject cartridge. */
 void msx_eject_cart(msx_state_t *msx, uint8_t slot);
+
+/* Virtual FDD (mode=disk, mp/msx_fdd.py): msx->fdc (wd179x.h) is a plain
+ * struct member, not wrapped in msx_core-level functions — callers (i.e.
+ * modmsx.c) use wd179x.h's own msx_fdc_enable()/msx_fdc_disable()/
+ * msx_fdc_set_io_cb()/msx_fdc_reset() directly against &msx->fdc. Call
+ * msx_fdc_set_io_cb() again after every msx_init() (full-state memset,
+ * same requirement as msx_set_cart_fetch_cb() above). */
 
 /* Hard reset (re-runs BIOS boot sequence). */
 void msx_reset(msx_state_t *msx);
