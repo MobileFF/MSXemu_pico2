@@ -51,6 +51,16 @@ static const uint32_t tms_palette_rgb888[16] = {
     0xFFFFFF, /* 15: white */
 };
 
+/* Accessor for src/msx/display/disp_dvi.c (Waveshare RP2350-PiZero only)
+ * — tms_palette_rgb888[] above is file-static; DVI needs the raw RGB888
+ * table to build its own plain (non-byte-swapped) RGB565 palette, since
+ * msx->palette565[] is already byte-swapped for the LCD's SPI convention
+ * (see rgb888_to_565be() below). Cheap enough (16 entries, called once at
+ * DVI init) that a getter beats duplicating the table. */
+const uint32_t *msx_tms_palette_rgb888(void) {
+    return tms_palette_rgb888;
+}
+
 /* Convert RGB888 → RGB565 big-endian (byte-swapped) as ILI9341 expects. */
 static inline uint16_t rgb888_to_565be(uint32_t rgb888) {
     uint8_t r = (rgb888 >> 16) & 0xFF;
@@ -126,27 +136,83 @@ uint8_t msx_detect_mapper(const uint8_t *data, uint32_t size) {
 static volatile uint32_t cart_bankswitch_count = 0;
 static volatile uint32_t cart_fetch_count = 0;
 
-/* Refill one 8KB physical cache window with ROM page `rom_page` (in
- * MSX_CART_PAGE_SIZE units), via the registered fetch callback. No-op if
- * that page is already resident. On fetch failure the stale cache
- * content is left in place (a visible/audible glitch, not a crash) and
- * cart_cache_page is left unchanged so the fetch is retried next time
- * this bank is selected. */
+/* Clears a paged slot's cache bookkeeping (primary + victim pool) back
+ * to "nothing resident" — shared by msx_cart_alloc()'s paged-mode
+ * cleanup, msx_load_cart_paged()'s initial setup, and msx_eject_cart(). */
+static void cart_reset_page_state(msx_state_t *msx, uint8_t slot) {
+    for (int win = 0; win < 4; win++) msx->cart_cache_page[slot][win] = -1;
+    for (int v = 0; v < MSX_CART_VICTIM_SLOTS; v++) msx->cart_victim_page[slot][v] = -1;
+    msx->cart_victim_next[slot] = 0;
+}
+
+/* Swaps two MSX_CART_PAGE_SIZE regions using a small fixed-size stack
+ * scratch buffer (never the full 8KB — this project has hit real
+ * problems from oversized stack buffers before). Only used on a victim-
+ * cache hit (see cart_page_refill()) — bank-switch writes are far rarer
+ * than memory reads, so this cost is negligible next to the SD/flash
+ * fetch it avoids. */
+static void cart_swap_pages(uint8_t *a, uint8_t *b) {
+    uint8_t scratch[256];
+    for (uint32_t off = 0; off < MSX_CART_PAGE_SIZE; off += sizeof(scratch)) {
+        memcpy(scratch, a + off, sizeof(scratch));
+        memcpy(a + off, b + off, sizeof(scratch));
+        memcpy(b + off, scratch, sizeof(scratch));
+    }
+}
+
+/* Selects ROM page `rom_page` (in MSX_CART_PAGE_SIZE units) as visible
+ * for one window, via the registered fetch callback if it isn't already
+ * resident — either in that window's own primary slot, or in the shared
+ * victim pool any window's eviction can land in (see MSX_CART_VICTIM_SLOTS
+ * in msx_core.h). Three cases, cheapest first:
+ *   1. Already this window's resident page — no-op.
+ *   2. Resident in the shared victim pool (this window, or a *different*
+ *      window, evicted it earlier — content is identical either way, it's
+ *      just ROM bytes) — swap it into the window's primary slot; the
+ *      window's previous page becomes the new victim-pool occupant. One
+ *      cart_swap_pages() call, no fetch.
+ *   3. Miss — move the window's current page into the victim pool
+ *      (round-robin across MSX_CART_VICTIM_SLOTS), then fetch the new
+ *      page into the now-free primary slot. On fetch failure the stale
+ *      cache content is left in place (a visible/audible glitch, not a
+ *      crash) and the fetch is retried next time this bank is selected —
+ *      same contract as before the victim pool existed. */
 static void cart_page_refill(msx_state_t *msx, uint8_t slot_idx, uint8_t win,
                               uint32_t rom_page) {
     cart_bankswitch_count++;
-    if (msx->cart_cache_page[slot_idx][win] == (int32_t)rom_page) return;
+    int32_t *page = &msx->cart_cache_page[slot_idx][win];
+    if (*page == (int32_t)rom_page) return;
+
+    int32_t *victims  = msx->cart_victim_page[slot_idx];
+    uint8_t *win_buf  = &msx->cart_cache[slot_idx][(uint32_t)win * MSX_CART_PAGE_SIZE];
+
+    for (uint8_t v = 0; v < MSX_CART_VICTIM_SLOTS; v++) {
+        if (victims[v] == (int32_t)rom_page) {
+            uint8_t *victim_buf = &msx->cart_cache[slot_idx]
+                [(4u + v) * MSX_CART_PAGE_SIZE];
+            cart_swap_pages(win_buf, victim_buf);
+            victims[v] = *page;
+            *page      = (int32_t)rom_page;
+            return;
+        }
+    }
+
     cart_fetch_count++;
+
+    uint8_t v = msx->cart_victim_next[slot_idx];
+    msx->cart_victim_next[slot_idx] = (uint8_t)((v + 1) % MSX_CART_VICTIM_SLOTS);
+    uint8_t *victim_buf = &msx->cart_cache[slot_idx][(4u + v) * MSX_CART_PAGE_SIZE];
+    memcpy(victim_buf, win_buf, MSX_CART_PAGE_SIZE);
+    victims[v] = *page;
 
     uint32_t total_pages = msx->cart_size[slot_idx] / MSX_CART_PAGE_SIZE;
     if (total_pages == 0) total_pages = 1;
     uint32_t safe_page   = rom_page % total_pages;
     uint32_t byte_offset = safe_page * MSX_CART_PAGE_SIZE;
-    uint8_t *dest = &msx->cart_cache[slot_idx][(uint32_t)win * MSX_CART_PAGE_SIZE];
 
     if (msx->cart_fetch_cb &&
-        msx->cart_fetch_cb(msx->cart_fetch_userdata, slot_idx, byte_offset, dest)) {
-        msx->cart_cache_page[slot_idx][win] = (int32_t)rom_page;
+        msx->cart_fetch_cb(msx->cart_fetch_userdata, slot_idx, byte_offset, win_buf)) {
+        *page = (int32_t)rom_page;
     }
 }
 
@@ -159,7 +225,9 @@ static const uint8_t *cart_page_ptr(msx_state_t *msx, uint8_t slot_idx,
     if (msx->cart_paged[slot_idx]) {
         /* Mega ROM mode: cache is always 4 uniform 8KB windows regardless
          * of mapper type (ASCII16's 16KB windows are just two adjacent
-         * 8KB cache slots — see cart_mapper_write()'s paged branch). */
+         * 8KB cache slots — see cart_mapper_write()'s paged branch), at a
+         * fixed position each (unlike the shared victim pool past index
+         * 4 — see cart_page_refill()), so reads need no indirection. */
         if (!msx->cart_cache[slot_idx]) return NULL;
         if (addr < 0x4000 || addr >= 0xC000) return NULL;
         uint8_t win = (uint8_t)((addr - 0x4000) >> 13);  /* 0–3 */
@@ -589,6 +657,12 @@ bool msx_load_cart(msx_state_t *msx, uint8_t slot, const uint8_t *data,
 
     /* Free previous cart if any */
     msx_eject_cart(msx, slot);
+    /* A small in-RAM cart never touches cart_cache[] — free it explicitly
+     * (msx_eject_cart() no longer does, to let a paged-to-paged swap
+     * reuse it instead — see that function's comment) so it doesn't sit
+     * around permanently reserved out of the small-cart C-heap budget. */
+    free(msx->cart_cache[slot]);
+    msx->cart_cache[slot] = NULL;
 
     msx->cart[slot] = (uint8_t *)malloc(size);
     if (!msx->cart[slot]) return false;
@@ -633,15 +707,15 @@ uint8_t *msx_cart_alloc(msx_state_t *msx, uint8_t slot, uint32_t size) {
     /* Deliberately NOT msx_eject_cart(msx, slot) here — that would free()
      * cart[slot], which is exactly the malloc()/free() cycle this
      * function exists to avoid (see cart_alloc_cap[]'s comment in
-     * msx_core.h). Do the same paged-mode cleanup msx_eject_cart() does,
-     * minus touching cart[]/cart_alloc_cap[]; msx_load_cart_paged() still
-     * calls the real msx_eject_cart() when switching a slot *to* paged
-     * mode, which correctly frees this buffer since it's genuinely not
-     * needed in that mode. */
+     * msx_core.h). cart_cache[slot] IS still freed explicitly right here
+     * though (unlike msx_eject_cart(), which now preserves it for
+     * msx_load_cart_paged() to reuse — see that function's comment): a
+     * small in-RAM cart never touches it, so it shouldn't sit around
+     * permanently reserved out of the small-cart C-heap budget. */
     free(msx->cart_cache[slot]);
     msx->cart_cache[slot] = NULL;
     msx->cart_paged[slot] = false;
-    for (int i = 0; i < 4; i++) msx->cart_cache_page[slot][i] = -1;
+    cart_reset_page_state(msx, slot);
 
     if (!(msx->cart[slot] && msx->cart_alloc_cap[slot] >= size)) {
         /* No existing block, or it's too small — round small carts up to
@@ -701,11 +775,17 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
     if (!msx->initialized || slot > 1 || total_size == 0) return false;
     if (mapper == MSX_MAPPER_PLAIN) return false;  /* paging needs banking */
 
-    /* Free previous cart if any (either mode) */
+    /* Free previous cart if any (either mode). msx_eject_cart()
+     * deliberately does NOT free cart_cache[slot] — see its own comment —
+     * so a paged-to-paged swap (e.g. Swap Cartridge from one Mega ROM to
+     * another) reuses the same block below instead of free()ing and
+     * malloc()ing the identical size straight back. */
     msx_eject_cart(msx, slot);
 
-    msx->cart_cache[slot] = (uint8_t *)malloc(4u * MSX_CART_PAGE_SIZE);
-    if (!msx->cart_cache[slot]) return false;
+    if (!msx->cart_cache[slot]) {
+        msx->cart_cache[slot] = (uint8_t *)malloc((4u + MSX_CART_VICTIM_SLOTS) * MSX_CART_PAGE_SIZE);
+        if (!msx->cart_cache[slot]) return false;
+    }
 
     msx->cart_paged[slot] = true;
     msx->cart_size[slot]  = total_size;
@@ -719,8 +799,8 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
     msx->cart_bank[slot][2] = 2;
     msx->cart_bank[slot][3] = 3;
 
+    cart_reset_page_state(msx, slot);
     for (uint8_t win = 0; win < 4; win++) {
-        msx->cart_cache_page[slot][win] = -1;
         cart_page_refill(msx, slot, win, win);
     }
 
@@ -735,19 +815,33 @@ void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     /* Genuinely frees cart[slot] (unlike msx_cart_alloc()'s own internal
      * cleanup, which deliberately keeps reusing this block across swaps —
      * see cart_alloc_cap[]'s comment in msx_core.h). Called here for a
-     * real "nothing loaded" state and by msx_load_cart_paged() when a
-     * slot switches *to* paged mode, where this buffer genuinely isn't
-     * needed any more. */
+     * real "nothing loaded" state and (from Python, e.g.
+     * mp/msx_mode_switch.py's swap_cartridge()) unconditionally before
+     * every cart load, regardless of which mode comes next.
+     *
+     * cart_cache[slot] is deliberately NOT freed here, unlike cart[]
+     * above — real-hardware finding (2026-09-20): this general eject is
+     * called from Python *before* load_cart_smart()/load_cart_paged()
+     * even knows whether the next load will be paged again, so freeing
+     * cart_cache[] unconditionally here defeated msx_load_cart_paged()'s
+     * own "reuse this fixed-size block across paged-to-paged swaps"
+     * fix — every Swap Cartridge between two Mega ROMs still hit the
+     * exact free-then-immediately-need-the-same-size C-heap
+     * fragmentation failure that fix exists to avoid (see
+     * msx_load_cart_paged()'s comment), just one level up the call
+     * chain. Deferred instead to whichever load actually runs next:
+     * msx_load_cart_paged() reuses it if still present; msx_load_cart()
+     * (below) frees it explicitly, since a small in-RAM cart never
+     * touches it and permanently reserving it there would eat into the
+     * small-cart C-heap budget instead. */
     free(msx->cart[slot]);
     msx->cart[slot]         = NULL;
     msx->cart_alloc_cap[slot] = 0;
-    free(msx->cart_cache[slot]);
-    msx->cart_cache[slot] = NULL;
     msx->cart_paged[slot] = false;
     msx->cart_size[slot] = 0;
     msx->cart_type[slot] = MSX_MAPPER_PLAIN;
     memset(msx->cart_bank[slot], 0, sizeof(msx->cart_bank[slot]));
-    for (int i = 0; i < 4; i++) msx->cart_cache_page[slot][i] = -1;
+    cart_reset_page_state(msx, slot);
 }
 
 /* -----------------------------------------------------------------------
@@ -1461,7 +1555,26 @@ void msx_init_hdmi_output(msx_state_t *msx, uint8_t cs_pin, uint32_t baudrate) {
  * never a real need for a full-frame buffer there — see its own
  * comment), so this union is gone too; back to a plain array, its own
  * 24576 bytes. */
+/* 2026-09-27 (Phase 4, PIO-USB bring-up): this buffer (and
+ * hdmi_row_buf_raw332 below) exist only for the "HDMI bridge" companion-
+ * board feature (a second Pico2+PICO-HDMI-PLUS over SPI) — structurally
+ * unusable on the Waveshare RP2350-PiZero, which has its own onboard DVI
+ * output instead (disp_dvi.c) and no HDMI-bridge SPI wiring at all
+ * (board_config.py never sets DISPLAY_TYPE to allow display=hdmi there —
+ * see _init_display()'s board branch in mp/main.py). msx_render_to_hdmi()
+ * itself already no-ops via its `if (!msx->hdmi_ready) return;` guard
+ * (hdmi_ready can never become true on pizero, since msx.init_hdmi_output()
+ * is never called), but the 24576+256 = ~24.25KB of static buffers behind
+ * it were being permanently wasted on pizero's already-tight RAM budget
+ * regardless — real-hardware bring-up of PIO-USB (this Phase) needed that
+ * RAM back for the GC heap (a MemoryError importing main.py itself,
+ * despite passing the build's own link-time GcHeap-size check — that
+ * check only verifies a 64KB floor, not that 64KB is actually enough for
+ * this specific program). Excluded outright for pizero rather than
+ * shrunk, since the feature has no meaning there at all. */
+#ifndef MSX_BOARD_PIZERO
 static uint8_t hdmi_frame_buf_pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
+#endif
 
 /* Reverse-lookup: which of the 16 palette entries does this (byte-swapped)
  * RGB565 pixel match? framebuf only ever contains exact palette565[]
@@ -1469,6 +1582,7 @@ static uint8_t hdmi_frame_buf_pal4[(MSX_SCREEN_W / 2) * MSX_SCREEN_H];
  * color), so this always finds an exact match. Checking the previous
  * pixel's index first is a cheap win for typical content (solid color
  * runs — backgrounds, borders — are extremely common in MSX graphics). */
+#ifndef MSX_BOARD_PIZERO
 static inline uint8_t hdmi_find_palette_index(const msx_state_t *msx, uint16_t raw565be) {
     static uint8_t last_idx = 0;
     if (msx->palette565[last_idx] == raw565be) {
@@ -1482,6 +1596,7 @@ static inline uint8_t hdmi_find_palette_index(const msx_state_t *msx, uint16_t r
     }
     return 0; /* shouldn't happen; falls back to palette entry 0 */
 }
+#endif
 
 /* 2026-09-04: Now asynchronous — builds the whole frame, kicks off ONE
  * DMA-driven SPI transfer, and returns with it left in-flight (mirrors
@@ -1492,6 +1607,12 @@ static inline uint8_t hdmi_find_palette_index(const msx_state_t *msx, uint16_t r
  * now calls _spi_dma_wait() internally first regardless, so correctness
  * doesn't depend on the caller remembering to wait, only performance does
  * (waiting too soon just gets back today's blocking behavior). */
+#ifdef MSX_BOARD_PIZERO
+/* See hdmi_frame_buf_pal4's comment — this feature has no meaning on
+ * pizero (onboard DVI instead), and msx->hdmi_ready can never become
+ * true there, so this is a stable no-op API surface only. */
+void msx_render_to_hdmi(msx_state_t *msx) { (void)msx; }
+#else
 void msx_render_to_hdmi(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
@@ -1544,6 +1665,7 @@ void msx_render_to_hdmi(msx_state_t *msx) {
      * comment above and _spi_dma_wait()'s. */
     dma_active_cs_pin = (int)msx->hdmi_cs_pin;
 }
+#endif /* MSX_BOARD_PIZERO */
 
 /* RAW332 menu/UI frame path. Used for the menu/UI screens (MenuCanvas in
  * msx_menu.py), which draw directly into the same C framebuf as the
@@ -1575,8 +1697,15 @@ void msx_render_to_hdmi(msx_state_t *msx) {
  * spi_write_blocking() calls costing more CPU time than one big call
  * doesn't matter here the way it matters for gameplay; the RAM it saves
  * (49152 -> 256 bytes) does. */
+#ifndef MSX_BOARD_PIZERO
 static uint8_t hdmi_row_buf_raw332[MSX_SCREEN_W];
+#endif
 
+#ifdef MSX_BOARD_PIZERO
+/* See hdmi_frame_buf_pal4's comment — no-op stub, same rationale as
+ * msx_render_to_hdmi() above. */
+void msx_render_to_hdmi_raw332(msx_state_t *msx) { (void)msx; }
+#else
 void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     if (!msx->hdmi_ready) return;
 
@@ -1603,6 +1732,7 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
     }
     gpio_put(msx->hdmi_cs_pin, 1);
 }
+#endif /* MSX_BOARD_PIZERO */
 
 /* Sends the receiver's dedicated PKT_CLEAR_SCREEN command (header-only,
  * 1 dummy payload byte) so the receiver's screen — which just keeps

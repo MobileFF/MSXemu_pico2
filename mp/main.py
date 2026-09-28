@@ -43,17 +43,16 @@
 #   # .ROM). Mutually exclusive with 'cart' (heap-budget reasons — a Disk
 #   # ROM + a Mega ROM cart loaded together risks exceeding the 64KB C
 #   # heap) — 'cart'/'mode=disk' together in msx.ini is invalid; 'cart' is
-#   # ignored when mode=disk. omit 'disk' to show the interactive .DSK
-#   # selector at boot, same UX as omitting 'cart'. 'fdc_base' (decimal or
-#   # 0x-hex) is the Z80 address of the emulated WD179x FDC's Status/
-#   # Command register within the Disk ROM's own page — omit to use the
-#   # default (0x7FB8, confirmed by disassembly for the Disk ROM this was
-#   # built against); a different Disk ROM may memory-map its FDC
-#   # elsewhere, in which case override this. First-pass scope: a single
-#   # drive (A:), flat/non-paged Disk ROMs only, standard 360KB/720KB
-#   # geometry — see mp/msx_fdd.py's docstring for the full list of
-#   # caveats (no disk-change hardware signal, drive-control latch bit
-#   # layout unconfirmed).
+#   # ignored when mode=disk. omit 'disk', or point it at a file that no
+#   # longer exists, to show the interactive .DSK selector at boot, same
+#   # UX as omitting/losing 'cart'. 'fdc_base' (decimal or 0x-hex) is the
+#   # Z80 address of the emulated WD179x FDC's Status/Command register
+#   # within the Disk ROM's own page — omit to use the default (0x7FB8,
+#   # confirmed by disassembly for the Disk ROM this was built against); a
+#   # different Disk ROM may memory-map its FDC elsewhere, in which case
+#   # override this. First-pass scope: a single drive (A:), flat/non-paged
+#   # Disk ROMs only, standard 360KB/720KB geometry — see mp/msx_fdd.py's
+#   # docstring for the full list of caveats.
 #   # omit 'lcd' to default to ST7796 (see LCD_SIZES for valid names)
 #   # omit 'rotate' (or 0) for normal orientation; 180 flips the panel. Only
 #   # 0/180 supported (landscape MADCTL flip only, not a true 90/270
@@ -79,6 +78,18 @@
 #   # clean on real hardware, 10MHz corrupts the received palette on this
 #   # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when
 #   # display=hdmi.
+#   # ext=off skips loading /sd/msx/ext/ and /ext/ extension modules (see
+#   # mp/msx_ext.py, doc/extension_api.md). Default is to load them.
+#   # Real-hardware finding: once ANY extension registers even one
+#   # msx.set_call_hook(), the Z80 core's four hook-trigger points (see
+#   # z80.h's call_hook comment) each pay a small per-instruction/per-CALL/
+#   # JP/JR check for the rest of the session, whether or not that hook's
+#   # address is ever actually reached — a measurable FPS cost for
+#   # cart-mode gameplay that never touches a hook at all. ext=off avoids
+#   # it entirely by never calling msx.set_call_hook() in the first place,
+#   # which is different from mode=disk's own DSKCHG hook (mp/msx_fdd.py)
+#   # — that one is unaffected by ext=off and still registers normally,
+#   # since it's required for FDD disk-swap detection, not an ext/ plugin.
 #   #
 #   # All of the above except bios/cart (ROM selector instead) can be tuned
 #   # live via GUI+F7 — Audio/Display Settings. ENTER writes it back to
@@ -131,112 +142,12 @@ from msx_menu   import (select_rom, load_config, show_emulator_menu,
 log_mem("boot, after main.py/msx_menu.py compiled")
 
 # -----------------------------------------------------------------------
-# Pin / peripheral constants
+# Pin / peripheral constants — per-board, see board_config.py (2026-09-20,
+# phase 1 of the RP2350-PiZero port — 調査用/RP2350-PiZero_HDMI出力適用調査.md
+# §7). Everything below this point stays 100% hardware-agnostic; only
+# board_config.py differs between a Pico 2 and a PiZero build.
 # -----------------------------------------------------------------------
-SPI_ID   = 1
-SPI_MOSI = 11
-SPI_SCK  = 10
-SPI_CS   = 9
-SPI_DC   = 8
-SPI_RST  = 7
-SPI_BL   = 22
-SPI_BAUD = 62_500_000   # 62.5 MHz = clk_peri(250MHz)/4 — the highest clean rate found
-                        # empirically (125MHz = clk_peri/2 visibly corrupts the display;
-                        # there's no achievable rate between them since the SPI clock
-                        # divider only produces even divisors of clk_peri). Verified safe
-                        # on both panels below.
-                        # 2026-08-27: lowering this to 20MHz on the second board did NOT
-                        # fix its SD/LCD instability — ruled out as an SPI signal-
-                        # integrity margin issue. See project notes for the ongoing
-                        # investigation.
-
-# Panel size — selects how msx.init_display_hardware() centers the native
-# 256x192 image (no scaling; see main.py's render_to_display_1to1()
-# comment for why). Override via msx.ini: lcd=ILI9341
-LCD_SIZES = {
-    "ST7796":  (480, 320),   # MSP4021 (default)
-    "ILI9341": (320, 240),   # MSP2402
-}
-DEFAULT_LCD_MODEL = "ST7796"
-
-# HDMI bridge output (hdmi_bridge/README.md) — optional second Pico 2 +
-# PICO-HDMI-PLUS. Shares SPI1 (SCK=GP10/MOSI=GP11) with the LCD/SD; GP28 is
-# a new, dedicated CS added only for this link (no existing pin touched).
-# LCD and HDMI are mutually exclusive outputs — msx.ini: display=lcd
-# (default) or display=hdmi. No separate on/off flag: HDMI hardware is
-# only ever initialized when display=hdmi (at boot, or live from the
-# Display Settings menu — see _init_hdmi_output()/poll_keyboard() below).
-# 2026-09-06: simultaneous LCD+HDMI ('both') used to also be selectable
-# but was found unreliable on real hardware (switching SPI mode every
-# frame between the two eventually corrupts/loses the HDMI signal and
-# glitches the LCD — see msx_core.c's hdmi_apply_spi_settings() comment
-# and doc/hdmi_bridge_phase2_report.md) and was removed rather than kept
-# around as a known-broken option.
-HDMI_CS_PIN = 28
-# 2026-09-05: HDMI receiver hardware-reset line (see
-# hdmi_bridge_receiver's notes/sender_reset_line.md) — a spare GPIO wired
-# directly to the receiver Pico 2's RUN pin, pulsed low briefly before
-# init_hdmi_output() to force a real hardware reset. Fixes a real-hardware
-# issue where the receiver can come up in a bad state if it's powered on
-# (or hot-plugged) while the HDMI cable is already connected (suspected
-# backfeed through the TMDS lines' series resistors). Completely free
-# GPIO, not shared with anything else.
-HDMI_RESET_PIN = 13
-HDMI_RESET_GRACE_MS = 100  # let the receiver finish booting before we start sending
-# Real-hardware finding: 10MHz reliably corrupts the received palette on
-# this wiring (electrical margin, not a transport bug — see
-# doc/hdmi_bridge_phase2_report.md); 5/8MHz both confirmed clean, 8MHz
-# slightly faster. 9-10MHz not narrowed further.
-HDMI_BAUD   = 8_000_000  # default/fallback; see doc/hdmi_bridge_phase2_report.md.
-HDMI_FRAME_SKIP = 2       # send to HDMI every Nth emulator frame — the
-                          # blocking SPI send (~40ms at 10MHz) roughly
-                          # halved FPS when sent every frame on real
-                          # hardware; 2 trades HDMI update rate for LCD/
-                          # emulation speed. Set to 1 to send every frame.
-
-# SD card shares SPI1 with the LCD (same SCK/MOSI pins); MISO=GP12, CS=GP15.
-# restore_baudrate returns SPI1 to SPI_BAUD after each SD operation so the
-# LCD/touch drivers are not affected.
-SD_SPI_ID   = 1
-SD_MOSI_PIN = 11
-SD_SCK_PIN  = 10
-SD_MISO_PIN = 12
-SD_CS_PIN   = 15
-SD_INIT_BAUD = 400_000    # SD spec's mandatory low-speed handshake rate —
-                          # sdcard.py's init_card() already hardcodes this
-                          # itself for that handshake regardless of what's
-                          # passed in here; this constant only seeds the
-                          # initial machine.SPI() constructor call, which
-                          # init_card() immediately overrides anyway.
-# 2026-08-29: SDCard()'s own baudrate= parameter (used for every
-# readblocks()/writeblocks() data transfer, NOT just the handshake — see
-# sdcard.py) used to be given SD_INIT_BAUD too, meaning every SD block
-# read/write ran at 400kHz. Split out as its own constant so the handshake
-# rate and the data rate can be tuned independently.
-#
-# First attempt (20MHz) made SD mounting fail outright ("timeout waiting
-# for response" from readinto(), in uos.mount()'s very first readblocks()
-# call reading the filesystem header) — on real hardware. The 62.5MHz
-# proven stable for the *LCD* on this same bus says nothing about what the
-# *SD card* itself can tolerate: an LCD controller and an SD card in SPI
-# mode have very different input timing margins, so "the bus already runs
-# this fast for something else" is not evidence it's safe for the card.
-# 4MHz is a deliberately conservative starting point (still 10x the
-# previous 400kHz) — raise it later only after confirming reads are
-# reliable at this rate first.
-SD_DATA_BAUD = 4_000_000
-
-AUDIO_PIN    = 14
-
-# Joystick: Atari/MSX 9-pin port wired directly to GPIO (PULL_UP, active-low
-# switches to GND — matches the PB-1000 board's joystick convention). JOY1
-# only; JOY2 (port 1) is left at its neutral 0xFF default (no GPIO wired).
-JOY_UP_PIN     = 18
-JOY_DOWN_PIN   = 19
-JOY_LEFT_PIN   = 20
-JOY_RIGHT_PIN  = 21
-JOY_TRIG_A_PIN = 26
-JOY_TRIG_B_PIN = 27
+from board_config import *
 
 # ROM_DIR is the SD root — select_rom() browses subfolders too (see
 # msx_rom_browser.py's _list_dir_entries()). BIOS stays under /sd/msx/.
@@ -263,9 +174,16 @@ def mount_sd():
                               mosi=machine.Pin(SD_MOSI_PIN),
                               miso=machine.Pin(SD_MISO_PIN))
         sd_cs = machine.Pin(SD_CS_PIN, machine.Pin.OUT, value=1)
+        # restore_baudrate exists so pico2's SD driver can hand the shared
+        # SPI1 bus back to the expected LCD speed after each SD
+        # transaction (SD and LCD are on the same bus there). pizero has
+        # no LCD at all (SPI_BAUD is None — see board_config.py) and SD
+        # has its own independent bus, so there's nothing to "restore" to
+        # — fall back to SD's own data baud (a no-op) instead of passing
+        # None through to machine.SPI.init(), which can't convert it.
         sd = sdcard.SDCard(sd_spi, sd_cs,
                            baudrate=SD_DATA_BAUD,
-                           restore_baudrate=SPI_BAUD)
+                           restore_baudrate=SPI_BAUD if SPI_BAUD is not None else SD_DATA_BAUD)
         uos.mount(sd, '/sd')
         print("SD mounted at /sd")
         return True
@@ -326,30 +244,48 @@ def init_usb():
         print(f"USB host init failed: {e}")
         return
 
-    # usb_host.init() reconfigures clk_sys for USB PHY timing (see
-    # usb_host_core.c: set_sys_clock_khz(240000, ...) — 240MHz is the
-    # highest clean multiple of 12MHz this board runs reliably at with USB
-    # host active; the original 144MHz choice there capped CPU-bound
-    # emulation speed hard, roughly halving FPS) and resets clk_peri to a
-    # fixed 48MHz independently of that — silently capping SPI baud again.
-    # Re-sync clk_peri to the (now 240MHz) clk_sys and refresh the UART's
-    # baud divisor to match, same as the early boost_peri_clock() call in
-    # run(). Must happen BEFORE start_bg_timer(): doing it after was
-    # measured to not stick (likely raced against early port/enumeration
-    # activity resetting clk_peri again).
-    msx.boost_peri_clock()
-    try:
-        _uart = machine.UART(0, baudrate=115200,
-                              tx=machine.Pin(0), rx=machine.Pin(1), txbuf=32)
-        uos.dupterm(_uart)
-    except Exception as e:
-        print(f"UART refresh after usb_host clk change failed: {e}")
+    # 2026-09-27 (Phase 4, PIO-USB): pizero's usb_host.init() does NOT
+    # touch clk_sys/clk_peri at all — see hcd_pio_usb_pizero.c/
+    # usb_host_core.c's usb_host_core_init_pizero() comment — clk_sys
+    # must stay at onboard DVI's required 252MHz. Only the native
+    # RP2350 host controller (pico2) needs the clk_sys/clk_peri dance
+    # below; skip it entirely on pizero.
+    if BOARD != "pizero":
+        # usb_host.init() reconfigures clk_sys for USB PHY timing (see
+        # usb_host_core.c: set_sys_clock_khz(240000, ...) — 240MHz is the
+        # highest clean multiple of 12MHz this board runs reliably at with
+        # USB host active; the original 144MHz choice there capped
+        # CPU-bound emulation speed hard, roughly halving FPS) and resets
+        # clk_peri to a fixed 48MHz independently of that — silently
+        # capping SPI baud again. Re-sync clk_peri to the (now 240MHz)
+        # clk_sys and refresh the UART's baud divisor to match, same as
+        # the early boost_peri_clock() call in run(). Must happen BEFORE
+        # start_bg_timer(): doing it after was measured to not stick
+        # (likely raced against early port/enumeration activity resetting
+        # clk_peri again).
+        msx.boost_peri_clock()
+        try:
+            _uart = machine.UART(0, baudrate=115200,
+                                  tx=machine.Pin(0), rx=machine.Pin(1), txbuf=32)
+            uos.dupterm(_uart)
+        except Exception as e:
+            print(f"UART refresh after usb_host clk change failed: {e}")
 
-    try:
-        if hasattr(usb_host, 'start_bg_timer'):
-            usb_host.start_bg_timer(8)
-    except Exception as e:
-        print(f"USB host bg timer failed: {e}")
+    # 2026-09-28 (Phase 4, PIO-USB): pizero's usb_host_core_init_pizero()
+    # already schedules its own dedicated hardware-alarm-based 1ms tick
+    # that calls both pio_usb_host_frame() and tuh_task() itself (see
+    # usb_host_core.c's pio_usb_sof_alarm_handler() — a deliberate,
+    # hard-won design to avoid pico_time's alarm_pool machinery
+    # entirely, after real-hardware hangs/panics tracing back to its
+    # shared striped-spinlock use). Calling start_bg_timer() here too
+    # would register a SECOND, redundant tuh_task() poller through
+    # exactly the alarm_pool path just avoided — skip it on pizero.
+    if BOARD != "pizero":
+        try:
+            if hasattr(usb_host, 'start_bg_timer'):
+                usb_host.start_bg_timer(8)
+        except Exception as e:
+            print(f"USB host bg timer failed: {e}")
 
 
 def _show_error(msg1, msg2=""):
@@ -393,6 +329,10 @@ _fdd_mode  = False  # True when msx.ini's mode=disk — mutually exclusive
 _disk_path = None  # currently mounted .dsk image's full path (mode=disk
                    # only), or None — mirrors _cart_path, used by the
                    # runtime menu's "Swap Disk" item.
+_diskrom_path = None  # msx.ini's diskrom=, remembered even in cart mode
+                      # (unlike _disk_path/_cart_path, not mode-gated) so
+                      # the runtime menu's "Switch to Disk Mode" can reuse
+                      # it without prompting again once known.
 _display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see Display Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
@@ -445,8 +385,21 @@ def poll_keyboard():
     global _display_held, _reinit_held, _exit_requested
     global _display_mode, _hdmi_frame_skip
     global _lcd_model, _rotate_180, _hdmi_baud, _cart_path, _disk_path
+    global _fdd_mode, _diskrom_path
     if not _usb_ready:
         return
+    if BOARD == "pizero":
+        # pizero's dedicated hardware-alarm 1ms tick (usb_host_core.c's
+        # pio_usb_sof_alarm_handler()) only drives pio_usb_host_frame()
+        # itself — tuh_task() (actual device/HID enumeration + report
+        # dequeuing) is deliberately NOT called from that interrupt
+        # context (real-hardware hang, root cause unconfirmed — see that
+        # function's own comment) and is instead polled here, once per
+        # game frame, from ordinary (non-interrupt) context instead.
+        try:
+            usb_host.task()
+        except Exception:
+            pass
     try:
         report = usb_host.get_hid_report()
     except Exception:
@@ -462,8 +415,9 @@ def poll_keyboard():
     # a one-shot action) so it works regardless of what else is going on
     # (a menu open, gameplay running, another hotkey held). Added
     # 2026-09-13 after a real-hardware lockout: main.py's own USB-host
-    # keyboard support (usb_host, a separate PIO-USB peripheral on
-    # GP24/25 — see this file's header) doesn't touch the native USB CDC
+    # keyboard support (usb_host — pico2's native RP2350 host controller
+    # on GP24/25, see this file's header; pizero uses PIO-USB instead,
+    # see board_config.py) doesn't touch the native USB CDC
     # serial mpremote connects over, but a plain Ctrl+C sent over that
     # connection was not observed to interrupt a running main.py — so
     # this gives an escape hatch that only depends on the USB keyboard,
@@ -567,7 +521,7 @@ def poll_keyboard():
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
         try:
-            display_state, _cart_path, _disk_path = show_emulator_menu(
+            display_state, _cart_path, _disk_path, _fdd_mode, _diskrom_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
                 init_hdmi_output=_init_hdmi_output,
                 init_lcd_output=_init_lcd_output,
@@ -576,7 +530,8 @@ def poll_keyboard():
                                 'lcd': _lcd_model, 'rotate': _rotate_180,
                                 'hdmi_baud': _hdmi_baud},
                 cart_path=_cart_path,
-                fdd_mode=_fdd_mode, disk_path=_disk_path)
+                fdd_mode=_fdd_mode, disk_path=_disk_path,
+                diskrom_path=_diskrom_path)
         except Exception as e:
             print(f"Menu crashed: {e!r} — resuming gameplay")
             try:
@@ -696,15 +651,73 @@ def poll_joystick():
 # -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
-def run():
-    # 1 — Init MSX state (no hardware yet)
+def _init_msx_state():
+    # 2026-09-21: split out of run() during real-hardware bring-up on the
+    # RP2350-PiZero — see run()'s own comment for why.
     msx.init()
 
-    # 1.5 — clk_peri defaults to a fixed 48 MHz on this board regardless of
-    #       machine.freq(), silently capping SPI baud well below what's
-    #       requested (e.g. a 40 MHz request clamps to 24 MHz). Reconfigure
-    #       clk_peri to track clk_sys, then re-create the UART so its baud
-    #       divisor is recalculated against the new clock.
+
+def run():
+    # 2026-09-21: split into small phase functions during real-hardware
+    # bring-up on the RP2350-PiZero — see msx_core.c's msx_init() history
+    # and bldfrm_msx.sh's __micropy_extra_stack__ comment. The original
+    # single ~445-line run() reproducibly corrupted UART output and hard-
+    # panicked immediately after msx.init() on real hardware; splitting it
+    # into small functions (each individually confirmed safe) fixed it.
+    # The exact root cause inside MicroPython/the C call chain was never
+    # fully identified (memory pressure, C stack size, and call depth were
+    # all ruled out individually) — this is a confirmed-working structural
+    # fix, not a fully explained one.
+    _init_msx_state()
+    has_sd, cfg = _mount_sd_and_load_config()
+    _init_display(cfg)
+    _init_hdmi_bridge(cfg)
+    # 2026-09-29 (Phase 4, PIO-USB) real-hardware finding: on pizero,
+    # _boost_clock_and_start_usb() used to run BEFORE _init_display() (the
+    # original pico2-era order — USB kept skipping clk_sys entirely on
+    # pizero until Phase 4, so the order never mattered before). Once USB
+    # actually starts a recurring 1kHz hardware-alarm interrupt
+    # (usb_host_core.c's pio_usb_sof_alarm_handler()), _init_display()'s
+    # own set_sys_clock_khz(252000, ...) call (disp_dvi.c) running WHILE
+    # that interrupt is already active reproducibly left the DVI output
+    # black (BASIC screen never appeared) on real hardware, even though
+    # each piece individually — DVI alone, or USB alone — was confirmed
+    # working many times over. Moved USB init to AFTER display init so
+    # onboard DVI's clock is fully stable (and nothing is yet touching
+    # per-ms interrupts) before USB's alarm starts ticking; not yet
+    # confirmed this specific reordering fixes it on real hardware.
+    _boost_clock_and_start_usb()
+    init_joystick()
+    if not _load_bios(cfg, has_sd):
+        return
+    if not _load_cart_or_disk(cfg, has_sd):
+        return
+    _init_audio_and_ext(cfg)
+    _main_loop()
+
+
+def _boost_clock_and_start_usb():
+    # 2026-09-21/22: msx.boost_peri_clock() (reconfigures clk_peri, which
+    # the UART is clocked from, to track clk_sys) is SKIPPED on pizero
+    # specifically — real-hardware bring-up found calling it corrupts
+    # UART output (garbled bytes, sometimes a subsequent "Hard assert"
+    # panic) extremely reliably, isolated down to that single C call via
+    # extensive bisection. The exact mechanism was never confirmed
+    # (looked consistent with the UART's baud divisor going stale
+    # mid-clock-change, but rebuilding the UART object immediately after
+    # did not reliably resolve it). Safe to skip on pizero: it's a
+    # performance optimization only (raises SPI baud caps for the LCD/SD),
+    # and pizero has no LCD. pico2 needs it (proven, unaffected by this
+    # bug) — do NOT make this unconditional.
+    #
+    # 2026-09-27 (Phase 4, PIO-USB): init_usb() itself is NOT skipped on
+    # pizero anymore — unlike boost_peri_clock(), it no longer touches
+    # clk_sys/clk_peri at all on this board (see init_usb()'s own board
+    # branch below) once PIO-USB keyboard support exists.
+    if BOARD == "pizero":
+        init_usb()
+        return
+
     msx.boost_peri_clock()
     try:
         _uart = machine.UART(0, baudrate=115200,
@@ -716,6 +729,8 @@ def run():
     # 2 — USB host
     init_usb()
 
+
+def _mount_sd_and_load_config():
     # 3 — Mount SD card FIRST so SPI1 is configured by SD init before LCD.
     #     If LCD were initialized before SD, the SD driver would reconfigure
     #     SPI1 at 400 kHz and break subsequent DMA rendering.
@@ -725,28 +740,67 @@ def run():
     #     panel size — LCD_SIZES — and which side of the exclusive
     #     LCD/HDMI display= to bring up — see _display_mode below).
     cfg = load_config(CONFIG_PATH) if has_sd else {}
+    return has_sd, cfg
+
+
+def _init_display(cfg):
     lcd_model = cfg.get('lcd', DEFAULT_LCD_MODEL)
-    lcd_w, lcd_h = LCD_SIZES.get(lcd_model, LCD_SIZES[DEFAULT_LCD_MODEL])
+    # LCD_SIZES is {} / DEFAULT_LCD_MODEL is None on a pizero board (no LCD
+    # hardware at all, see board_config.py) — guard against indexing an
+    # empty dict with a None key; lcd_w/lcd_h are simply unused in that
+    # case (display mode resolves to 'dvi' below, never 'lcd').
+    if LCD_SIZES:
+        lcd_w, lcd_h = LCD_SIZES.get(lcd_model, LCD_SIZES[DEFAULT_LCD_MODEL])
+    else:
+        lcd_w, lcd_h = 0, 0
     rotate_180 = cfg.get('rotate', '0').strip() == '180'
 
     # Parsed early (before LCD init) so it can decide whether that runs.
-    # LCD and HDMI are mutually exclusive outputs (see HDMI_CS_PIN's
-    # comment) — display=lcd or display=hdmi only, no combined 'both'.
+    # LCD/HDMI/DVI are mutually exclusive outputs (see HDMI_CS_PIN's
+    # comment) — display=lcd, display=hdmi, or display=dvi only, no
+    # combined mode. 2026-09-20/22 (phase 3 of the RP2350-PiZero port): a
+    # pizero board has no LCD/HDMI-bridge hardware at all (board_config.py
+    # sets those pin constants to None) — DVI is its only possible output,
+    # so it's forced here UNCONDITIONALLY, ignoring msx.ini's display=
+    # entirely. This is deliberate, not just a default: an msx.ini written
+    # for a pico2 setup (e.g. display=hdmi for the HDMI-bridge feature)
+    # would otherwise be silently accepted and crash trying to touch
+    # nonexistent HDMI-bridge/LCD pins (all None) — real-hardware finding,
+    # 2026-09-22. pico2 keeps the normal msx.ini-driven lcd/hdmi choice.
     global _display_mode
-    _display_mode = cfg.get('display', 'lcd').strip().lower()
-    if _display_mode not in ('lcd', 'hdmi'):
-        _display_mode = 'lcd'
+    if DISPLAY_TYPE == 'DVI':
+        _display_mode = 'dvi'
+    else:
+        _display_mode = cfg.get('display', 'lcd').strip().lower()
+        if _display_mode not in ('lcd', 'hdmi'):
+            _display_mode = 'lcd'
 
     # 5 — Initialize display AFTER SD: SPI1 is now stable at SPI_BAUD.
-    #     Skipped entirely when display=hdmi (msx_core.c's
-    #     hdmi_apply_spi_settings() doesn't depend on this having run) —
+    #     Skipped entirely when display=hdmi/dvi (msx_core.c's
+    #     hdmi_apply_spi_settings() doesn't depend on this having run, and
+    #     a pizero board has no SPI LCD pins to init in the first place) —
     #     _lcd_w/_lcd_h/_rotate_180/_lcd_model are still recorded either
     #     way so a later live switch to 'lcd' from the Display Settings menu
-    #     (_init_lcd_output()) has the right panel parameters on hand.
+    #     (_init_lcd_output()) has the right panel parameters on hand (n/a
+    #     on pizero — that menu path is LCD-only, see poll_keyboard()).
     global _lcd_w, _lcd_h, _rotate_180, _lcd_model
     _lcd_w, _lcd_h, _rotate_180, _lcd_model = lcd_w, lcd_h, rotate_180, lcd_model
     if _display_mode == 'hdmi':
         print("Display: LCD init skipped (display=hdmi, exclusive)")
+    elif _display_mode == 'dvi':
+        # NOT YET REAL-HARDWARE VERIFIED — see src/msx/display/disp_dvi.c's
+        # header comment. getattr() guards against running this file on
+        # older/pico2 firmware that predates init_display_hardware_dvi().
+        print("Initializing onboard DVI…")
+        _init_dvi = getattr(msx, "init_display_hardware_dvi", None)
+        if _init_dvi is not None:
+            if not _init_dvi():
+                print("Display: init_display_hardware_dvi() failed "
+                      "(out of C heap for the ~150KB framebuffer, or "
+                      "PIO/DVI init failed) — no display output.")
+        else:
+            print("Display: msx.init_display_hardware_dvi() not present in "
+                  "this firmware (built for pico2?) — no display output.")
     else:
         print(f"Initializing display… ({lcd_model} {lcd_w}x{lcd_h}"
               f"{', rotated 180' if rotate_180 else ''})")
@@ -758,6 +812,8 @@ def run():
         )
         msx.set_backlight(True)
 
+
+def _init_hdmi_bridge(cfg):
     # 5.1 — Optional HDMI bridge output (hdmi_bridge/README.md). Must come
     #       after init_display_hardware() (reuses its SPI1 instance).
     #       Only initialized when display=hdmi — users without the second
@@ -820,9 +876,8 @@ def run():
     # LCD.
     set_display_state(_display_mode)
 
-    # 5.5 — Joystick GPIO (Atari/MSX 9-pin port, JOY1)
-    init_joystick()
 
+def _load_bios(cfg, has_sd):
     # 6 — Load BIOS
     global _bios_name
     bios_path = cfg.get('bios', DEFAULT_BIOS)
@@ -842,43 +897,57 @@ def run():
     if not bios_ok:
         print(f"ERROR: MSX BIOS not found at {bios_path}")
         _show_error("MSX BIOS not found", DEFAULT_BIOS)
-        return
+        return False
 
     log_mem("after BIOS load")
+    return True
 
+
+def _load_cart_or_disk(cfg, has_sd):
     # 7 — Load cartridge, OR (mode=disk) a Disk ROM into the same slot —
     # mutually exclusive, see msx_fdd.py / the msx.ini comment above.
     # load_cart_smart() picks in-RAM vs SD-backed paged loading (Mega ROM,
     # >32KB) automatically — see msx_menu.py. HDMI is already active at
     # this point (step 5.1 above), so the interactive selector below shows
     # there too, not just on the LCD.
-    global _cart_path, _fdd_mode, _disk_path
+    global _cart_path, _fdd_mode, _disk_path, _diskrom_path
     _fdd_mode = cfg.get('mode', '').strip().lower() == 'disk'
+    # Remembered even in cart mode (not just under mode=disk) so the
+    # runtime menu's "Switch to Disk Mode" can reuse it without asking
+    # again — see msx_runtime_menu.py.
+    _diskrom_path = cfg.get('diskrom')
 
     if _fdd_mode:
-        diskrom_path = cfg.get('diskrom')
-        if diskrom_path is None:
+        if _diskrom_path is None:
             print("ERROR: mode=disk but no diskrom= in msx.ini")
             _show_error("diskrom= not set", "required when mode=disk")
-            return
+            return False
         if has_sd:
             try:
-                ok = load_cart_smart(msx, 0, diskrom_path)
+                ok = load_cart_smart(msx, 0, _diskrom_path)
             except OSError:
                 ok = False
-            print(f"Disk ROM (config): {diskrom_path}  {'OK' if ok else 'FAILED'}")
+            print(f"Disk ROM (config): {_diskrom_path}  {'OK' if ok else 'FAILED'}")
             if not ok:
-                print(f"ERROR: Disk ROM not found/failed to load: {diskrom_path}")
-                _show_error("Disk ROM not found", diskrom_path)
-                return
+                print(f"ERROR: Disk ROM not found/failed to load: {_diskrom_path}")
+                _show_error("Disk ROM not found", _diskrom_path)
+                return False
         else:
             print("ERROR: mode=disk but no SD card")
             _show_error("No SD card", "mode=disk needs an SD card")
-            return
+            return False
 
         if 'disk' in cfg:
-            _disk_path = cfg['disk']
-        elif has_sd:
+            try:
+                uos.stat(cfg['disk'])
+                _disk_path = cfg['disk']
+            except OSError:
+                print(f"WARNING: configured disk= not found: {cfg['disk']}")
+        if _disk_path is None and has_sd:
+            # Falls through here both when 'disk' was omitted and when the
+            # configured path didn't exist (see the OSError case above) —
+            # same "let the user pick instead of crashing" recovery already
+            # used for a missing 'cart' file (see load_cart_smart() above).
             _disk_path = select_rom(
                 msx, ROM_DIR,
                 title="Select Disk Image",
@@ -924,7 +993,10 @@ def run():
             print("No cartridge — booting MSX BASIC")
 
     log_mem("after cart load")
+    return True
 
+
+def _init_audio_and_ext(cfg):
     # 8 — Audio: PWM + 22050 Hz repeating timer (ISR feeds ring buffer)
     msx.setup_audio_pwm(AUDIO_PIN)
     try:
@@ -936,25 +1008,37 @@ def run():
     # 8.5 — Load /sd/msx/ext/ and /ext/ extension modules (CALL/RST hook
     # plugins — see mp/msx_ext.py and doc/extension_api.md). Runs before
     # reset() so any hooks are already in place when the machine starts.
-    load_extensions(msx)
+    # 'ext=off' skips this — see the msx.ini comment above for why that
+    # recovers performance for cart-mode sessions that don't use any
+    # extension at all.
+    if cfg.get('ext', '').strip().lower() == 'off':
+        print("EXT: disabled via msx.ini (ext=off)")
+    else:
+        load_extensions(msx)
 
     # 8.6 — Virtual FDD (mode=disk only): WD179x FDC register emulation
     # (src/msx/wd179x.c), memory-mapped into cart slot 1's page. Mounted
     # before reset() so msx.reset()'s msx_fdc_reset() (clears transient
     # FDC registers, preserves the enabled/base_addr/geometry config —
     # see wd179x.h) has something to preserve.
+    #
+    # Always call mount() here, even with no disk image (_disk_path is
+    # None) — msx_fdd.mount(None, ...) still enables the FDC itself (see
+    # its own comment for why a *disabled* FDC breaks Disk BASIC entirely
+    # rather than just leaving drive A: empty).
     if _fdd_mode:
         import msx_fdd
         msx_fdd.register(msx)
-        if _disk_path:
-            try:
-                fdc_base = int(cfg.get('fdc_base', str(msx_fdd.DEFAULT_FDC_BASE)), 0)
-            except ValueError as e:
-                print(f"Bad fdc_base in msx.ini: {e} — using default")
-                fdc_base = msx_fdd.DEFAULT_FDC_BASE
-            msx_fdd.mount(_disk_path, fdc_base)
+        try:
+            fdc_base = int(cfg.get('fdc_base', str(msx_fdd.DEFAULT_FDC_BASE)), 0)
+        except ValueError as e:
+            print(f"Bad fdc_base in msx.ini: {e} — using default")
+            fdc_base = msx_fdd.DEFAULT_FDC_BASE
+        msx_fdd.mount(_disk_path, fdc_base)
         log_mem("after msx_fdd import")
 
+
+def _main_loop():
     # 9 — Reset and start
     msx.reset()
     print("MSX started")
@@ -1002,6 +1086,7 @@ def run():
         # see _display_mode's comment — so exactly one of these is true.
         use_hdmi = _display_mode == 'hdmi'
         use_lcd  = _display_mode == 'lcd'
+        use_dvi  = _display_mode == 'dvi'
 
         # Start DMA transfer of the just-completed frame (non-blocking).
         # 1:1 native 256x192 (no 1.5x scaling) — scaling nearly doubled
@@ -1010,6 +1095,12 @@ def run():
         # cost for users who only care about the HDMI output.
         if use_lcd:
             msx.render_to_display_1to1()
+        elif use_dvi:
+            # Synchronous, not DMA — core1 reads the DVI framebuffer
+            # continuously on its own; there is nothing to wait for here
+            # (see msx_render_to_display_dvi()'s comment). NOT YET REAL-
+            # HARDWARE VERIFIED.
+            msx.render_to_display_dvi()
 
         # Compute the NEXT frame while the DMA above is still in flight —
         # msx_run_frame() writes into the other framebuf, so this is safe.

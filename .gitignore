@@ -4,6 +4,15 @@
 /roms/
 /references/
 
+# Local investigation/scratch folder — mixes working notes with
+# copyrighted ROM dumps and reference PDFs; always excluded (user
+# instruction, 2026-09-29).
+/調査用/
+
+# Build artifacts (test .uf2 outputs from bare-metal diagnostic harnesses,
+# not part of the shipped firmware).
+/firmware/test/
+
 # Local dev-tool/session state — not part of the project itself.
 .claude/
 **/.claude/

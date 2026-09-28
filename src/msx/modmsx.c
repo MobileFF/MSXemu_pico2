@@ -457,17 +457,34 @@ static bool fdc_sector_io_from_pyfile(void *userdata, uint32_t lba_sector,
  * num_sides come from the image's own boot-sector BPB (mp/msx_fdd.py
  * parses it) — pass 0 for either to fall back to the 9-sectors/2-sides
  * standard-floppy default.
- * ----------------------------------------------------------------------- */
+ *
+ * file_obj may be None — 2026-09-20 real-hardware finding: booting
+ * mode=disk with no disk image selected used to skip this call entirely
+ * (see mp/msx_fdd.py's mount()/main.py), leaving fdc.enabled false. A
+ * real WD179x chip is still physically present and answers register
+ * reads even with no diskette in the drive — only actual sector reads
+ * fail — so a Disk ROM's own drive-presence check (the busy-wait loop
+ * documented at length in wd179x.h) polling a *disabled* FDC instead
+ * falls through to cart_page_ptr()'s static ROM byte at that offset,
+ * reproducing the exact "busy-wait against a statically-dumped-as-0xFF
+ * byte" bug this whole wd179x.c module was written to fix in the first
+ * place — Disk BASIC never comes up. Passing None here still enables the
+ * FDC (so drive-presence detection succeeds) but leaves io_cb NULL, so
+ * any actual Read/Write Sector attempt correctly reports "not found"
+ * (see wd179x.c's exec_command()) instead — the same real-hardware
+ * behavior as a drive with no diskette inserted. */
 static mp_obj_t msx_py_fdc_mount(size_t n_args, const mp_obj_t *args) {
     (void)n_args;
     mp_obj_t file_obj          = args[0];
     uint16_t base_addr         = (uint16_t)mp_obj_get_int(args[1]);
     uint8_t  sectors_per_track = (uint8_t)mp_obj_get_int(args[2]);
     uint8_t  num_sides         = (uint8_t)mp_obj_get_int(args[3]);
+    bool     has_disk          = file_obj != mp_const_none;
 
-    MP_STATE_VM(msx_fdc_file) = file_obj;
+    MP_STATE_VM(msx_fdc_file) = has_disk ? file_obj : mp_const_none;
     msx_fdc_enable(&msx_state.fdc, base_addr, sectors_per_track, num_sides);
-    msx_fdc_set_io_cb(&msx_state.fdc, fdc_sector_io_from_pyfile, NULL);
+    msx_fdc_set_io_cb(&msx_state.fdc,
+                       has_disk ? fdc_sector_io_from_pyfile : NULL, NULL);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_fdc_mount_obj, 4, 4, msx_py_fdc_mount);
@@ -489,23 +506,29 @@ static mp_obj_t msx_py_fdc_unmount(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_fdc_unmount_obj, msx_py_fdc_unmount);
 
 /* -----------------------------------------------------------------------
- * CALL/RST hook table
+ * Subroutine hook table
  *
- * Lets Python register a callback that fires whenever the Z80 executes a
- * CALL/RST targeting a specific address, in place of the real subroutine
- * — e.g. to replace a piece of the MSX BIOS with a native implementation.
- * The actual interception point lives in z80.c's call() (see z80.h's
- * call_hook comment); this table + dispatcher is the Python-facing half,
- * deliberately kept entirely in this MicroPython binding layer (msx_core.c
- * itself has no notion of hooks, same separation as the rest of this
- * file's C-core/Python-binding split).
+ * Lets Python register a callback that fires whenever the Z80 reaches a
+ * specific address — e.g. to replace a piece of the MSX BIOS with a
+ * native implementation, or to observe a routine before it runs. The
+ * actual interception points live in z80.c (see z80.h's call_hook
+ * comment for the four trigger sites: immediate-target CALL/RST, JP,
+ * JR/DJNZ, and a generic per-instruction trap for everything else —
+ * indirect jumps, RET landing there, fall-through, interrupt vectors,
+ * or a CALL to a different real address that jumps there); this table +
+ * dispatcher is the Python-facing half, deliberately kept entirely in
+ * this MicroPython binding layer (msx_core.c itself has no notion of
+ * hooks, same separation as the rest of this file's C-core/Python-
+ * binding split).
  *
- * Same design as the CAL-hook mechanism this project's sibling PB-1000
- * emulator has for its HD61700 CPU core — but the Z80 has real CALL/RST
- * instructions (unlike the HD61700, whose BASIC-level "CALL" is just
- * push+JP with no dedicated opcode), so the hook only needs to run at
- * actual CALL/RST execution rather than being checked before every single
- * instruction fetch.
+ * Same design and return-value contract as the call-hook mechanism this
+ * project's sibling PB-1000 emulator has for its HD61700 CPU core:
+ * the Python callable's return value controls intercept vs. passthrough
+ * — omitting a return (None) or returning any other truthy value
+ * intercepts (the real CALL/JP/JR/instruction is skipped, as if the
+ * hooked "subroutine" already ran and returned); explicitly returning
+ * False passes through (the callable runs first as a pre-check, then
+ * the real code executes normally).
  * ----------------------------------------------------------------------- */
 #define CALL_HOOK_MAX 16
 static uint16_t call_hook_addrs[CALL_HOOK_MAX];
@@ -517,32 +540,45 @@ static bool c_call_hook_dispatcher(void *userdata, uint16_t addr) {
     (void)userdata;
     for (int i = 0; i < call_hook_count; i++) {
         if (call_hook_addrs[i] == addr && call_hook_enabled[i]) {
-            mp_call_function_0(call_hook_fns[i]);
-            return true;
+            mp_obj_t result = mp_call_function_0(call_hook_fns[i]);
+            /* None (bare `return`/no return) or any other truthy value
+             * intercepts; an explicit `return False` passes through —
+             * see this table's comment above. */
+            return result == mp_const_none || mp_obj_is_true(result);
         }
     }
     return false;
 }
 
 /* Re-link msx_state.cpu.call_hook after anything that re-runs z80_init()
- * (msx_init()/msx_reset()) — that zeroes the field along with the other
- * callback pointers, same reason msx_set_cart_fetch_cb() has to be
- * re-called after msx_init() elsewhere in this file. No-op if no hooks
- * are registered. */
+ * (msx_init()/msx_reset()) — that zeroes the field (and hook_bitmap)
+ * along with the other callback pointers, same reason
+ * msx_set_cart_fetch_cb() has to be re-called after msx_init() elsewhere
+ * in this file. No-op if no hooks are registered. */
 static void call_hook_relink(void) {
     if (call_hook_count > 0) {
         msx_state.cpu.call_hook = c_call_hook_dispatcher;
+        for (int i = 0; i < call_hook_count; i++) {
+            z80_hook_bitmap_set(&msx_state.cpu, call_hook_addrs[i], call_hook_enabled[i]);
+        }
     }
 }
 
 /* -----------------------------------------------------------------------
  * msx.set_call_hook(address: int, callable)
  * Registers (or replaces) the hook for `address`. `callable` is invoked
- * with no arguments each time a CALL/RST targeting `address` would
- * execute; the actual CALL/RST is then skipped (see z80.h's call_hook
- * comment) — the callable is responsible for whatever the replaced
- * subroutine should do (e.g. via msx.get_ram_view(), msx.debug_peek(),
- * future register-access API, etc.).
+ * with no arguments the moment execution reaches `address` — whether via
+ * a CALL/RST, a JP, a JR/DJNZ, or any other way (see the table comment
+ * above for the four trigger sites). Returning None or any other truthy
+ * value intercepts: the real CALL/JP/JR/instruction is skipped, and the
+ * callable is responsible for whatever the replaced subroutine should do
+ * (e.g. via msx.get_ram_view(), msx.debug_peek(), msx.debug_set_cpu(),
+ * etc.) — including simulating its return, since interception at the
+ * generic per-instruction trap (point 4) pops a return address off the
+ * stack for you, but interception at a CALL/JP/JR (points 1-3) leaves
+ * the stack untouched (there was nothing to pop — the push/jump itself
+ * never happened). Returning False passes through: the callable runs as
+ * a pre-check, then the real CALL/JP/JR/instruction executes normally.
  * ----------------------------------------------------------------------- */
 static mp_obj_t msx_py_set_call_hook(mp_obj_t addr_obj, mp_obj_t fn_obj) {
     uint16_t addr = (uint16_t)mp_obj_get_int(addr_obj);
@@ -551,6 +587,7 @@ static mp_obj_t msx_py_set_call_hook(mp_obj_t addr_obj, mp_obj_t fn_obj) {
             call_hook_fns[i] = fn_obj;
             call_hook_enabled[i] = true;
             msx_state.cpu.call_hook = c_call_hook_dispatcher;
+            z80_hook_bitmap_set(&msx_state.cpu, addr, true);
             return mp_const_none;
         }
     }
@@ -562,6 +599,7 @@ static mp_obj_t msx_py_set_call_hook(mp_obj_t addr_obj, mp_obj_t fn_obj) {
     call_hook_enabled[call_hook_count] = true;
     call_hook_count++;
     msx_state.cpu.call_hook = c_call_hook_dispatcher;
+    z80_hook_bitmap_set(&msx_state.cpu, addr, true);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(msx_py_set_call_hook_obj, msx_py_set_call_hook);
@@ -579,6 +617,7 @@ static mp_obj_t msx_py_clear_call_hook(mp_obj_t addr_obj) {
             call_hook_fns[i]     = call_hook_fns[call_hook_count];
             call_hook_enabled[i] = call_hook_enabled[call_hook_count];
             call_hook_fns[call_hook_count] = MP_OBJ_NULL; /* release GC ref */
+            z80_hook_bitmap_set(&msx_state.cpu, addr, false);
             break;
         }
     }
@@ -599,6 +638,7 @@ static mp_obj_t msx_py_set_call_hook_enabled(mp_obj_t addr_obj, mp_obj_t enabled
     for (int i = 0; i < call_hook_count; i++) {
         if (call_hook_addrs[i] == addr) {
             call_hook_enabled[i] = enabled;
+            z80_hook_bitmap_set(&msx_state.cpu, addr, enabled);
             break;
         }
     }
@@ -758,6 +798,71 @@ static mp_obj_t msx_py_render_to_display_1to1(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_render_to_display_1to1_obj,
                                    msx_py_render_to_display_1to1);
+
+/* -----------------------------------------------------------------------
+ * msx.get_board_type() -> str  ("pico2" or "pizero")
+ * 2026-09-20, phase 2/3 of the RP2350-PiZero port (調査用/
+ * RP2350-PiZero_HDMI出力適用調査.md §7). Compiled to a fixed return value
+ * (MSX_BOARD_PIZERO is set per-target by micropython_msx.cmake, not
+ * read at runtime) — mp/board_config.py probes for this function's very
+ * existence with getattr(msx, "get_board_type", lambda: "pico2")(), so
+ * older firmware without it still behaves as a plain Pico 2 build.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_get_board_type(void) {
+#ifdef MSX_BOARD_PIZERO
+    return MP_OBJ_NEW_QSTR(MP_QSTR_pizero);
+#else
+    return MP_OBJ_NEW_QSTR(MP_QSTR_pico2);
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_board_type_obj, msx_py_get_board_type);
+
+#ifdef MSX_BOARD_PIZERO
+/* -----------------------------------------------------------------------
+ * msx.init_display_hardware_dvi()
+ * Waveshare RP2350-PiZero only — brings up onboard DVI and launches core1
+ * as a dedicated DVI driver. See src/msx/display/disp_dvi.c. Takes no
+ * arguments (unlike init_display_hardware()): there is no pin choice —
+ * the DVI connector's GPIO32-39 wiring is fixed by the board.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_init_display_hardware_dvi(void) {
+    bool ok = msx_init_display_hardware_dvi(&msx_state);
+    return ok ? mp_const_true : mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_init_display_hardware_dvi_obj,
+                                   msx_py_init_display_hardware_dvi);
+
+/* -----------------------------------------------------------------------
+ * msx.render_to_display_dvi()
+ * Waveshare RP2350-PiZero only — composes the just-completed frame into
+ * the DVI driver's framebuffer. Synchronous (no wait_display() call
+ * needed afterward — see msx_render_to_display_dvi()'s own comment).
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_render_to_display_dvi(void) {
+    msx_render_to_display_dvi(&msx_state);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_render_to_display_dvi_obj,
+                                   msx_py_render_to_display_dvi);
+
+/* -----------------------------------------------------------------------
+ * msx.dvi_debug()
+ * Waveshare RP2350-PiZero only — real-hardware bring-up diagnostic aid,
+ * see disp_dvi.c's msx_dvi_debug_info() comment. Returns
+ * (heartbeat, late_scanline_ctr); call twice with a delay between to see
+ * whether core1's DMA IRQ is still advancing.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_dvi_debug(void) {
+    uint32_t heartbeat, late_ctr;
+    msx_dvi_debug_info(&heartbeat, &late_ctr);
+    mp_obj_t items[2] = {
+        mp_obj_new_int_from_uint(heartbeat),
+        mp_obj_new_int_from_uint(late_ctr),
+    };
+    return mp_obj_new_tuple(2, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_dvi_debug_obj, msx_py_dvi_debug);
+#endif /* MSX_BOARD_PIZERO */
 
 /* -----------------------------------------------------------------------
  * msx.wait_display()
@@ -1361,6 +1466,13 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_render_to_display),      MP_ROM_PTR(&msx_py_render_to_display_obj) },
     { MP_ROM_QSTR(MP_QSTR_render_to_display_1to1), MP_ROM_PTR(&msx_py_render_to_display_1to1_obj) },
     { MP_ROM_QSTR(MP_QSTR_wait_display),           MP_ROM_PTR(&msx_py_wait_display_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_board_type),         MP_ROM_PTR(&msx_py_get_board_type_obj) },
+#ifdef MSX_BOARD_PIZERO
+    /* Display — onboard DVI (Waveshare RP2350-PiZero only) */
+    { MP_ROM_QSTR(MP_QSTR_init_display_hardware_dvi), MP_ROM_PTR(&msx_py_init_display_hardware_dvi_obj) },
+    { MP_ROM_QSTR(MP_QSTR_render_to_display_dvi),      MP_ROM_PTR(&msx_py_render_to_display_dvi_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dvi_debug),                  MP_ROM_PTR(&msx_py_dvi_debug_obj) },
+#endif
     { MP_ROM_QSTR(MP_QSTR_set_backlight),          MP_ROM_PTR(&msx_py_set_backlight_obj) },
     { MP_ROM_QSTR(MP_QSTR_hdmi_reset_init),        MP_ROM_PTR(&msx_py_hdmi_reset_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_hdmi_reset_pulse),       MP_ROM_PTR(&msx_py_hdmi_reset_pulse_obj) },

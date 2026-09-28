@@ -67,7 +67,7 @@ C_RED    = rgb(220, 0,   0)
 # Settings menu changes these values.
 # ---------------------------------------------------------------------------
 
-_display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see set_display_state()
+_display_mode = 'lcd'   # 'lcd' | 'hdmi' | 'dvi' — mutually exclusive, see set_display_state()
 _hdmi_suspended = False
 _lcd_suspended = False
 
@@ -200,9 +200,15 @@ class MenuCanvas:
         # the other side, which may not even be initialized).
         use_hdmi = (_display_mode == 'hdmi') and not _hdmi_suspended
         use_lcd  = (_display_mode == 'lcd') and not _lcd_suspended
+        use_dvi  = (_display_mode == 'dvi')
         if use_lcd:
             self._msx.render_to_display_1to1()
             self._msx.wait_display()
+        if use_dvi:
+            # Synchronous, no wait_display() — see main.py's identical
+            # render_to_display_dvi() comment. NOT YET REAL-HARDWARE
+            # VERIFIED (2026-09-20, phase 3 of the RP2350-PiZero port).
+            self._msx.render_to_display_dvi()
         if use_hdmi:
             # raw332, not render_to_hdmi(): menus draw arbitrary UI colors
             # (borders, highlights) that aren't limited to the MSX's 16
@@ -662,12 +668,18 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                        save_path, config_path=None,
                        init_hdmi_output=None, init_lcd_output=None,
                        display_state=None, cart_path=None,
-                       fdd_mode=False, disk_path=None):
+                       fdd_mode=False, disk_path=None, diskrom_path=None):
     # Thin lazy-import wrapper — see msx_runtime_menu.show() for the
     # actual implementation (kept out of this module's eager compile
     # path; only loaded the first time GUI+F7 is actually pressed).
     # fdd_mode/disk_path: mode=disk (see mp/msx_fdd.py) — "Swap Cartridge"
     # becomes "Swap Disk" and browses .DSK files instead of .ROM.
+    # diskrom_path: the Disk ROM to reuse for "Switch to Disk Mode" (see
+    # msx_runtime_menu.show()'s docstring) — pass main.py's remembered
+    # msx.ini diskrom= even while currently in cart mode. Returns
+    # (display_state, cart_path, disk_path, fdd_mode, diskrom_path) —
+    # fdd_mode/diskrom_path can now change here too (mode-switch menu
+    # items), not just cart_path/disk_path.
     import gc
     gc.collect()  # defragment before compiling msx_runtime_menu.py — this
                   # first GUI+F7 press happens mid-gameplay, where cart/
@@ -684,7 +696,8 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
                                  init_lcd_output=init_lcd_output,
                                  display_state=display_state,
                                  cart_path=cart_path,
-                                 fdd_mode=fdd_mode, disk_path=disk_path)
+                                 fdd_mode=fdd_mode, disk_path=disk_path,
+                                 diskrom_path=diskrom_path)
 
 
 def load_config(config_path):

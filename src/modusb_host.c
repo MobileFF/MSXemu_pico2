@@ -69,6 +69,23 @@ static mp_obj_t mod_usb_host_get_hid_report(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_usb_host_get_hid_report_obj,
                                   mod_usb_host_get_hid_report);
 
+#ifdef MSX_BOARD_PIZERO
+// Python API: usb_host.debug() -> (tick_count, connected, suspended, ints)
+// Real-hardware bring-up diagnostic, Phase 4 (PIO-USB) — see
+// usb_host_core.c's own comment.
+static mp_obj_t mod_usb_host_debug(void) {
+  uint32_t tick_count, connected, suspended, ints;
+  usb_host_core_debug_pizero(&tick_count, &connected, &suspended, &ints);
+  mp_obj_t items[4] = {
+      mp_obj_new_int_from_uint(tick_count),
+      mp_obj_new_int_from_uint(connected),
+      mp_obj_new_int_from_uint(suspended),
+      mp_obj_new_int_from_uint(ints),
+  };
+  return mp_obj_new_tuple(4, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_usb_host_debug_obj, mod_usb_host_debug);
+#endif
 
 static const mp_rom_map_elem_t usb_host_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_usb_host)},
@@ -81,6 +98,9 @@ static const mp_rom_map_elem_t usb_host_module_globals_table[] = {
      MP_ROM_PTR(&mod_usb_host_stop_bg_timer_obj)},
     {MP_ROM_QSTR(MP_QSTR_get_hid_report),
      MP_ROM_PTR(&mod_usb_host_get_hid_report_obj)},
+#ifdef MSX_BOARD_PIZERO
+    {MP_ROM_QSTR(MP_QSTR_debug), MP_ROM_PTR(&mod_usb_host_debug_obj)},
+#endif
 };
 static MP_DEFINE_CONST_DICT(usb_host_module_globals,
                             usb_host_module_globals_table);

@@ -90,13 +90,55 @@
  * msx_load_cart() copies the whole ROM into a heap buffer — fine for
  * small carts, but Mega ROMs (128KB-1MB, ASCII-8/ASCII-16/KONAMI) don't
  * fit in this board's RAM budget. msx_load_cart_paged() instead keeps
- * only the 4 currently bank-switched-in 8KB windows resident (32KB
- * total, regardless of the ROM's real size) and fetches a fresh page
- * on demand — via a caller-registered callback — whenever a mapper
- * write bank-switches a window to a page not already cached. In
- * practice the callback reads from an open file on SD.
+ * only the 4 currently bank-switched-in 8KB windows resident, plus a
+ * small shared victim pool (see MSX_CART_VICTIM_SLOTS), and fetches a
+ * fresh page on demand — via a caller-registered callback — whenever a
+ * mapper write bank-switches a window to a page not already cached. In
+ * practice the callback reads from an open file on SD or (for Mega ROM)
+ * the Pico's onboard flash.
+ *
+ * 2026-09-20: real-hardware finding — the original design (exactly one
+ * page resident per window, no history at all) measured a 0% cache hit
+ * rate on at least one title (see doc/architecture.md), because a window
+ * bank-switching between even just two pages in a tight loop (e.g.
+ * alternating graphics/music data banks) evicted its only slot on
+ * literally every switch. First fix tried: give every window its own
+ * 2nd resident page (doubling cart_cache[] to 64KB/slot) — this worked,
+ * but that +32KB, taken from MICROPY_C_HEAP_SIZE (bldfrm_msx.sh), came
+ * out of the same fixed 512KB SRAM as the GC/Python heap and pushed
+ * *unrelated* lazy-module compiles (the runtime menu, see
+ * mp/msx_mode_switch.py) into real-hardware MemoryErrors. Replaced with
+ * a cheaper design: MSX_CART_VICTIM_SLOTS extra pages *shared* across
+ * all 4 windows (not one dedicated 2nd slot per window) — whichever
+ * window's page gets evicted moves into this shared pool instead of
+ * being discarded, and any window's later cache_page_refill() checks the
+ * pool before fetching. Content is identical regardless of which window
+ * a page was originally selected in (it's just ROM bytes), so this pools
+ * naturally across windows without needing to track which window a
+ * victim page "belongs to". One shared slot (+8KB total, vs. +32KB for
+ * the per-window-2nd-slot version) already fully resolves the documented
+ * 2-page ping-pong case: the evicted page is still there the moment the
+ * window switches back to it. See cart_page_refill() in msx_core.c.
+ *
+ * This does NOT change MSX_CART_PAGE_SIZE (the unit a single fetch
+ * transfers) — see cart_page_refill()'s comment for why enlarging the
+ * fetch unit itself would be counterproductive (bandwidth-bound, no
+ * fetch-target locality guarantee for ASCII8/KONAMI).
  * ----------------------------------------------------------------------- */
-#define MSX_CART_PAGE_SIZE  0x2000u   /* 8KB cache granularity (4 windows/slot) */
+#define MSX_CART_PAGE_SIZE     0x2000u  /* 8KB cache granularity (4 windows/slot) */
+#define MSX_CART_VICTIM_SLOTS  2        /* shared "recently evicted page" pool,
+                                          * across all 4 windows — see
+                                          * cart_page_refill(). Bumped 1->2
+                                          * (2026-09-20, real-hardware "still
+                                          * a bit slower than before" report)
+                                          * so two windows thrashing at once
+                                          * don't contend for the same single
+                                          * victim slot; costs +8KB more (see
+                                          * MICROPY_C_HEAP_SIZE in
+                                          * bldfrm_msx.sh) — raise further only
+                                          * if profiling shows 2 still isn't
+                                          * enough, each +1 here is another
+                                          * +8KB/paged-slot. */
 
 /* byte_offset/dest are always MSX_CART_PAGE_SIZE-aligned/sized. Return
  * true on success (dest fully filled); false leaves dest untouched
@@ -169,8 +211,25 @@ typedef struct {
      * above. cart_size[]/cart_type[]/cart_bank[] above are shared with
      * the full-ROM path; these are additional. */
     bool      cart_paged[2];             /* true = paged mode (cart[]/malloc unused) */
-    uint8_t  *cart_cache[2];             /* 4 * MSX_CART_PAGE_SIZE, malloc'd when paged */
+    uint8_t  *cart_cache[2];             /* (4 + MSX_CART_VICTIM_SLOTS) * MSX_CART_PAGE_SIZE,
+                                          * malloc'd when paged — the first 4 pages are the
+                                          * windows themselves (fixed position, same layout
+                                          * as before victim slots existed), the rest are the
+                                          * shared victim pool. Fixed size regardless of the
+                                          * loaded ROM, so msx_load_cart_paged() keeps this
+                                          * block allocated and reuses it across same-mode
+                                          * (paged-to-paged) swaps rather than free()ing and
+                                          * malloc()ing the identical size back every time —
+                                          * see its comment for the real-hardware C-heap-
+                                          * fragmentation failure this avoids (same lesson as
+                                          * cart_alloc_cap[] below, just for this field). Only
+                                          * msx_eject_cart()/msx_load_cart() (leaving paged
+                                          * mode entirely) actually free it. */
     int32_t   cart_cache_page[2][4];     /* ROM page (8KB units) resident per window, -1=none */
+    int32_t   cart_victim_page[2][MSX_CART_VICTIM_SLOTS]; /* ROM page resident in each shared
+                                          * victim slot, -1=none — see cart_page_refill() */
+    uint8_t   cart_victim_next[2];       /* round-robin index: which victim slot the next
+                                          * eviction writes into */
     msx_cart_fetch_fn cart_fetch_cb;     /* set once via msx_set_cart_fetch_cb() */
     void     *cart_fetch_userdata;
 
@@ -452,6 +511,51 @@ void msx_render_to_display_1to1(msx_state_t *msx);
 
 /* Wait for the DMA display transfer to complete (blocking). */
 void msx_wait_display(msx_state_t *msx);
+
+/* -----------------------------------------------------------------------
+ * Onboard DVI output (Waveshare RP2350-PiZero only) — see
+ * src/msx/display/disp_dvi.c and 調査用/RP2350-PiZero_HDMI出力適用調査.md.
+ * These are only declared (and disp_dvi.c only built) when the board's
+ * micropython_msx.cmake branch defines MSX_BOARD_PIZERO — a Pico 2 build
+ * never sees or links this API, so main.py/modmsx.c must probe for it
+ * with getattr(msx, "init_display_hardware_dvi", None) the same way
+ * board_config.py already probes for msx.get_board_type(). NOT YET REAL-
+ * HARDWARE VERIFIED (2026-09-20, phase 3 first draft) — this is new,
+ * unexercised code; see disp_dvi.c's header comment for the open
+ * questions real hardware bring-up needs to resolve.
+ * ----------------------------------------------------------------------- */
+#ifdef MSX_BOARD_PIZERO
+/* Brings up onboard DVI (PIO-driven TMDS on GPIO32-39, 640x480p60,
+ * DVI_VERTICAL_REPEAT=2 scanned out from a 320x240 source buffer) and
+ * launches core1 as a dedicated, self-contained DVI driver (both the
+ * scanline producer, via dvi_inst's scanline_callback hook, and the
+ * dvi_scanbuf_main_16bpp() TMDS encoder run there) — core0 is left free
+ * for Z80/VDP/PSG emulation + the MicroPython VM, never touches DVI
+ * again after this call. Allocates a single (not double-buffered —
+ * ~150KB is already a large fraction of the RP2350's 520KB SRAM; see
+ * disp_dvi.c) persistent 320x240 RGB565 framebuffer from the C heap. */
+/* Returns false (no C-heap for the ~150KB framebuffer, or PIO/DVI init
+ * failed) or true (DVI signal actually started). 2026-09-22: this used
+ * to return void and silently do nothing on failure — real-hardware
+ * bring-up found MICROPY_C_HEAP_SIZE too small to ever satisfy this
+ * allocation, and the failure was invisible (no print, no exception)
+ * until traced down separately. modmsx.c's binding surfaces this. */
+bool msx_init_display_hardware_dvi(msx_state_t *msx);
+
+/* Composes the just-completed framebuf[framebuf_ready_idx] (native
+ * 256x192) into the DVI driver's persistent 320x240 buffer, centered
+ * (32px left/right, 24px top/bottom border, filled black once at init
+ * and never touched again). Call once per completed MSX frame, analogous
+ * to msx_render_to_display_1to1() — but unlike that function this is
+ * synchronous/blocking (a few hundred us; no DMA handoff — core1 reads
+ * the buffer directly and continuously, there is nothing to wait for). */
+void msx_render_to_display_dvi(msx_state_t *msx);
+
+/* 2026-09-26 real-hardware bring-up diagnostic aid — see disp_dvi.c's own
+ * comment above msx_dvi_debug_info(). modmsx.c exposes this as
+ * msx.dvi_debug() -> (heartbeat, late_scanline_ctr). */
+void msx_dvi_debug_info(uint32_t *heartbeat, uint32_t *late_ctr);
+#endif
 
 /* 2026-09-05: LCD backlight on/off (spi_bl_pin GPIO only, no bus access).
  * No-op if the LCD was never initialized (msx->display_ready false —
