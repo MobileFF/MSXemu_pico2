@@ -12,7 +12,10 @@ Controls: **Up/Down** to move between items, **ENTER** to select, **ESC** to clo
 
 | Menu item | Behavior |
 | :--- | :--- |
-| **Swap Cartridge** | Pick a `.ROM` file from the SD card to replace the current cartridge with (opens in the current cartridge's own folder; subfolders browsable). Automatically calls `msx.reset()`. ROMs over 32KB are automatically loaded in Mega ROM (paged) mode |
+| **Swap Cartridge** | (`cart` mode) Pick a `.ROM` file from the SD card to replace the current cartridge with (opens in the current cartridge's own folder; subfolders browsable). Automatically calls `msx.reset()`. ROMs over 32KB are automatically loaded in Mega ROM (paged) mode |
+| **Swap Disk** | (`mode=disk`) Pick a `.DSK` file from the SD card to replace the mounted disk image with. The DSKCHG hook (`mp/msx_fdd.py`) lets MSX-DOS/Disk BASIC notice on its own, so this does **not** reset |
+| **Switch to Disk Mode** | (shown only in `cart` mode) Pick a Disk ROM (reuses `diskrom=` from `msx.ini` if already set, otherwise shows a `.ROM` picker) → confirmation screen (ENTER to proceed, ESC to cancel) → writes `mode=disk` and `diskrom=` to `msx.ini`, then **reboots the MCU itself**. Doesn't mount a disk image itself — pick one after boot via "Swap Disk" or `msx.ini`'s `disk=` |
+| **Switch to Cart Mode** | (shown only in `mode=disk`) Pick a cartridge ROM → confirmation screen → writes `cart=` (and clears `mode=`) to `msx.ini`, then **reboots the MCU itself** |
 | **Save State** | Saves the current CPU/VDP/RAM/VRAM state to the SD card (takes ~2 seconds, shows a "Saving…" message). Rotates per-cartridge, next to the ROM itself, keeping up to 10 generations (e.g. `ANTADV.ROM` → `ANTADV.0.sav`, `ANTADV.1.sav`, ...) |
 | **Load State** | Pick a generation from the saved list and restore it |
 | **Audio Settings** | Opens a sub-screen for live-adjusting volume and the audio filter (see below) |
@@ -87,8 +90,9 @@ hdmi_baud=8000000
 | `hdmi_baud` | `8000000` | SPI baud rate (Hz) for the HDMI bridge output. 5MHz/8MHz confirmed clean on real hardware — 10MHz was found to corrupt the received palette. Restart required |
 | `mode` | (none) | Set to `disk` for virtual FDD (floppy disk drive) mode. Mutually exclusive with `cart` (`cart` is ignored when `mode=disk`) |
 | `diskrom` | (none) | Required when `mode=disk`. Path to the Disk ROM loaded into cart slot 1 (not bundled for copyright reasons — dump your own Disk ROM and place it here) |
-| `disk` | (none) | Path to the `.DSK` image (360KB/720KB) to mount at boot. If omitted, an interactive selector listing the SD card's `.DSK` files is shown |
+| `disk` | (none) | Path to the `.DSK` image (360KB/720KB) to mount at boot. If omitted, or if the file isn't found, an interactive selector listing the SD card's `.DSK` files is shown |
 | `fdc_base` | `0x7FB8` | Z80 address where the Disk ROM's FDC (WD1793/WD2793-compatible) registers are memory-mapped (decimal or `0x`-prefixed hex). This default works for many Disk ROMs, but another one may map its FDC elsewhere |
+| `ext` | (none) | Set to `off` to skip loading `/sd/msx/ext/` and `/ext/` extension modules. Use this to fully avoid the subroutine hook mechanism's small overhead (see below) for a `cart`-mode session that doesn't use any extension. `mode=disk`'s own DSKCHG hook (required for FDD disk-swap detection) is unaffected by this setting |
 
 Under `mode=disk`, the runtime menu shows "Swap Disk" in place of "Swap Cartridge", for hot-swapping the mounted `.DSK` image (the DSKCHG hook in `mp/msx_fdd.py` lets MSX-DOS/Disk BASIC notice the new disk on its own — no reset needed). Verified on real hardware: Disk BASIC SAVE/LOAD, and a full MSX-DOS boot (MSXDOS.SYS/COMMAND.COM load, both disk sides). Single drive, standard 3.5" DD (360KB/720KB) geometry only.
 

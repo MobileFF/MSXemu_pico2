@@ -1,4 +1,5 @@
 #include "z80.h"
+#include <string.h>
 
 // MARK: timings
 static const uint8_t cyc_00[256] = {4, 10, 7, 6, 4, 4, 7, 4, 4, 11, 7, 6, 4, 4,
@@ -163,32 +164,61 @@ static void exec_opcode_dcb(
 static void exec_opcode_ed(z80* const z, uint8_t opcode);
 static void exec_opcode_ddfd(z80* const z, uint8_t opcode, uint16_t* const iz);
 
+// Cheap pre-filter for the four call_hook trigger points — see
+// hook_bitmap's comment in z80.h. Callers still do `if (z->call_hook)`
+// themselves first (that guards hook_bitmap being meaningful at all).
+static inline bool hook_registered(const z80* const z, uint16_t addr) {
+  return (z->hook_bitmap[addr >> 3] >> (addr & 7)) & 1;
+}
+
+void z80_hook_bitmap_set(z80* const z, uint16_t addr, bool set) {
+  uint8_t mask = (uint8_t)(1u << (addr & 7));
+  if (set) z->hook_bitmap[addr >> 3] |= mask;
+  else     z->hook_bitmap[addr >> 3] &= (uint8_t)~mask;
+}
+
 // MARK: opcodes
-// jumps to an address
+// jumps to an address — no hook check (used for indirect jumps, e.g.
+// JP (HL)/(IX)/(IY), whose target isn't known until it's already been
+// computed; see z80.h's call_hook comment, point 4, for how those are
+// still covered by the generic per-step trap instead).
 static inline void jump(z80* const z, uint16_t addr) {
   z->pc = addr;
   z->mem_ptr = addr;
+}
+
+// jumps to an immediate address — checked variant for JP nn/JP cc,nn
+// (see z80.h's call_hook comment, point 2).
+static inline void jump_checked(z80* const z, uint16_t addr) {
+  if (z->call_hook && hook_registered(z, addr)) {
+    if (z->call_hook(z->userdata, addr)) return; // intercept: cancel the jump
+    z->hook_suppress_active = true; // passthrough: see call_hook's comment
+  }
+  jump(z, addr);
 }
 
 // jumps to next word in memory if condition is true
 static inline void cond_jump(z80* const z, bool condition) {
   const uint16_t addr = nextw(z);
   if (condition) {
-    jump(z, addr);
+    jump_checked(z, addr);
   }
   z->mem_ptr = addr;
 }
 
 // calls to next word in memory
 static inline void call(z80* const z, uint16_t addr) {
-  if (z->call_hook && z->call_hook(z->userdata, addr)) {
-    // Intercepted: skip the push+jump entirely. The instruction's own
-    // opcode/operand bytes were already consumed (by nextw()/the RST
-    // dispatch) before call() was reached, so z->pc is already sitting on
-    // the instruction right after the CALL/RST — execution just falls
-    // through to it, as if the hooked "subroutine" ran and returned
-    // instantly.
-    return;
+  if (z->call_hook && hook_registered(z, addr)) {
+    if (z->call_hook(z->userdata, addr)) {
+      // Intercepted: skip the push+jump entirely. The instruction's own
+      // opcode/operand bytes were already consumed (by nextw()/the RST
+      // dispatch) before call() was reached, so z->pc is already sitting
+      // on the instruction right after the CALL/RST — execution just
+      // falls through to it, as if the hooked "subroutine" ran and
+      // returned instantly.
+      return;
+    }
+    z->hook_suppress_active = true; // passthrough: see call_hook's comment
   }
   pushw(z, z->pc);
   z->pc = addr;
@@ -219,9 +249,16 @@ static inline void cond_ret(z80* const z, bool condition) {
   }
 }
 
+// jumps by a relative displacement — checked variant for JR e/JR cc,e/
+// DJNZ e (see z80.h's call_hook comment, point 3).
 static inline void jr(z80* const z, int8_t displacement) {
-  z->pc += displacement;
-  z->mem_ptr = z->pc;
+  const uint16_t addr = (uint16_t)(z->pc + displacement);
+  if (z->call_hook && hook_registered(z, addr)) {
+    if (z->call_hook(z->userdata, addr)) return; // intercept: cancel the jump
+    z->hook_suppress_active = true; // passthrough: see call_hook's comment
+  }
+  z->pc = addr;
+  z->mem_ptr = addr;
 }
 
 static inline void cond_jr(z80* const z, bool condition) {
@@ -718,6 +755,8 @@ void z80_init(z80* const z) {
   z->port_out = NULL;
   z->call_hook = NULL;
   z->userdata = NULL;
+  z->hook_suppress_active = false;
+  memset(z->hook_bitmap, 0, sizeof(z->hook_bitmap));
 
   z->cyc = 0;
 
@@ -770,6 +809,24 @@ void z80_init(z80* const z) {
 
 // executes the next instruction in memory + handles interrupts
 void z80_step(z80* const z) {
+  if (z->call_hook) {
+    // Generic per-step trap — see z80.h's call_hook comment, point 4.
+    // Skipped exactly once right after a checked CALL/JP/JR passed
+    // through without intercepting, so landing on that same address
+    // doesn't fire the hook a second time for the one event.
+    if (z->hook_suppress_active) {
+      z->hook_suppress_active = false;
+    } else if (hook_registered(z, z->pc) && z->call_hook(z->userdata, z->pc)) {
+      // Intercepted: simulate an instant RET rather than fetching the
+      // real instruction at z->pc — requires a real call already pushed
+      // a return address to land here (see the header comment).
+      z->pc = popw(z);
+      z->mem_ptr = z->pc;
+      process_interrupts(z);
+      return;
+    }
+  }
+
   if (z->halted) {
     exec_opcode(z, 0x00);
   } else {
@@ -1142,7 +1199,7 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0xBE: cp(z, rb(z, get_hl(z))); break; // cp (hl)
   case 0xFE: cp(z, nextb(z)); break; // cp *
 
-  case 0xC3: jump(z, nextw(z)); break; // jm **
+  case 0xC3: jump_checked(z, nextw(z)); break; // jm **
   case 0xC2: cond_jump(z, z->zf == 0); break; // jp nz, **
   case 0xCA: cond_jump(z, z->zf == 1); break; // jp z, **
   case 0xD2: cond_jump(z, z->cf == 0); break; // jp nc, **
@@ -1153,7 +1210,7 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0xFA: cond_jump(z, z->sf == 1); break; // jp m, **
 
   case 0x10: cond_jr(z, --z->b != 0); break; // djnz *
-  case 0x18: z->pc += (int8_t) nextb(z); break; // jr *
+  case 0x18: jr(z, (int8_t) nextb(z)); break; // jr *
   case 0x20: cond_jr(z, z->zf == 0); break; // jr nz, *
   case 0x28: cond_jr(z, z->zf == 1); break; // jr z, *
   case 0x30: cond_jr(z, z->cf == 0); break; // jr nc, *
