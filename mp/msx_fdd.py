@@ -114,12 +114,28 @@ def mount(path, fdc_base=None):
     Opened 'r+b' (not 'rb') since Write Sector needs write access.
     fdc_base defaults to whatever was last used (see _fdc_base's comment)
     — the same Disk ROM stays loaded across a disk swap, only the image
-    changes, so its real register address doesn't change either."""
+    changes, so its real register address doesn't change either.
+
+    path=None (no disk image chosen/available) still enables the FDC,
+    with no backing file — real-hardware finding (2026-09-20): booting
+    mode=disk with no image used to skip msx.fdc_mount() entirely,
+    leaving the FDC disabled. A real WD179x chip is still physically
+    present and answers register reads with no diskette inserted — only
+    actual sector reads fail — so a disabled FDC makes the Disk ROM's own
+    drive-presence check (see wd179x.h) busy-wait against Disk ROM's
+    static byte content instead of a live register, hanging forever
+    rather than falling through to Disk BASIC. See msx.fdc_mount()'s own
+    comment in modmsx.c for the C-side half of this."""
     global _disk_path, _fdc_base, _disk_changed
     if fdc_base is None:
         fdc_base = _fdc_base
     else:
         _fdc_base = fdc_base
+    if path is None:
+        _msx.fdc_mount(None, fdc_base, 0, 0)
+        _disk_path = None
+        _disk_changed = True
+        return
     sectors_per_track, num_sides = _read_geometry(path)
     f = _msx_open_rw(path)
     _msx.fdc_mount(f, fdc_base, sectors_per_track, num_sides)
