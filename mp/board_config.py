@@ -63,6 +63,7 @@ if BOARD == "pizero":
     HDMI_RESET_GRACE_MS = None
     HDMI_BAUD = None
     HDMI_FRAME_SKIP = None
+    HDMI_SCALE = None
 
     # Onboard TF (microSD) card slot — independent SPI-capable pins, not
     # shared with anything else (see report §2.2/§3①). 2026-09-20: these
@@ -78,6 +79,14 @@ if BOARD == "pizero":
     SD_CS_PIN    = 43
     SD_CARD_DETECT_PIN = 22
     SD_INIT_BAUD = 400_000
+    # 2026-09-30 EIO investigation: reproducible OSError([Errno 5] EIO)
+    # loading the SECOND SD file read in a boot session (any file, not a
+    # specific one) was root-caused to sdcard.py's CMD12 (stop
+    # transmission) not waiting for the card's busy signal to clear before
+    # releasing CS — see sdcard.py's _readblocks_once() comment. Not a
+    # baud/timing-margin issue after all (confirmed: neither the PIO-USB
+    # interrupt (_DIAG_ENABLE_USB=False) nor dropping this to 1MHz changed
+    # the failure rate). Restored to the original 4MHz.
     SD_DATA_BAUD = 4_000_000
 
     # 2026-09-20 IMPORTANT CAVEAT found during phase 3 research (not
@@ -177,6 +186,9 @@ else:
                               # halved FPS when sent every frame on real
                               # hardware; 2 trades HDMI update rate for LCD/
                               # emulation speed. Set to 1 to send every frame.
+    HDMI_SCALE = 1            # receiver-side upscale of the 256x192 frame
+                              # (msx.ini: hdmi_scale=); 2 = 512x384, the
+                              # largest that fits the receiver's 640x480.
 
     # SD card shares SPI1 with the LCD (same SCK/MOSI pins); MISO=GP12, CS=GP15.
     # restore_baudrate returns SPI1 to SPI_BAUD after each SD operation so the

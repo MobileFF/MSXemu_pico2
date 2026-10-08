@@ -11,7 +11,6 @@
 add_compile_options(-Wno-error)
 add_compile_definitions(CFG_TUH_HID_EP_BUFSIZE=64)
 add_definitions(-DPICO_MALLOC_PANIC=0)
-add_compile_definitions(MICROPY_HW_USB_CDC=0)
 add_compile_definitions(MICROPY_HW_USB_MSC=0)
 
 # ============================================================
@@ -43,6 +42,25 @@ if(MICROPY_BOARD STREQUAL "WAVESHARE_RP2350_PIZERO")
     # fails to pick up new MP_QSTR_* names guarded by them (real build
     # failure, 2026-09-22). bldfrm_msx.sh passes both via CFLAGS_EXTRA
     # instead, which reaches every compilation unit including that pass.
+endif()
+
+# 2026-10-02: native USB CDC REPL — pico2-only restriction, now scoped
+# per board instead of the previous unconditional MICROPY_HW_USB_CDC=0.
+# pico2's native RP2350 USB controller is dedicated to keyboard host mode
+# (usb_host_core.c's usb_host_core_init() -> tuh_init(0) — the chip has
+# only one native USB controller, and it can't be host and CDC device at
+# the same time), so CDC must stay off there. pizero's keyboard instead
+# goes through PIO-USB on a separate virtual port (tuh_init(1), bit-banged
+# on GPIO28/29 — see usb_host_core_init_pizero()), leaving pizero's native
+# USB controller (the same Type-C port used for BOOTSEL/programming)
+# completely unused — safe to enable CDC there. Requested explicitly: the
+# keyboard being on a physically separate port makes native-USB REPL more
+# convenient than the UART REPL (GP0/1,
+# bldfrm_msx.sh's MICROPY_HW_ENABLE_UART_REPL) pizero has used until now.
+if(MSX_IS_PIZERO)
+    add_compile_definitions(MICROPY_HW_USB_CDC=1)
+else()
+    add_compile_definitions(MICROPY_HW_USB_CDC=0)
 endif()
 
 # ============================================================

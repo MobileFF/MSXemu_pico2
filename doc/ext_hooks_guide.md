@@ -88,6 +88,7 @@ hdmi_baud=8000000
 | `display` | `lcd` | `lcd` または `hdmi`。**排他**（同時出力不可） — 起動時は指定した側のハードウェアのみ初期化される。実行時メニューの Display Settings（またはGUI+Pホットキー）からライブ切替も可能 |
 | `hdmi_frame_skip` | `2` | HDMIブリッジ出力を何フレームごとに送るか（`display=hdmi`の時のみ意味を持つ）。`1`で毎フレーム送信 |
 | `hdmi_baud` | `8000000` | HDMIブリッジ出力のSPIボーレート（Hz）。実機検証済みなのは5MHz/8MHz — 10MHzは受信パレットが化けることが判明している。再起動が必要 |
+| `hdmi_scale` | `1` | HDMI受信側でのアップスケール倍率（`display=hdmi`の時のみ意味を持つ）。`2`で512×384（受信側640×480に収まる最大値）。実行時メニューのDisplay Settingsからライブ調整可能 |
 | `mode` | （なし） | `disk` を指定すると仮想FDD（フロッピーディスクドライブ）モードになる。`cart` とは併用不可（`mode=disk` の時は `cart` は無視される） |
 | `diskrom` | （なし） | `mode=disk` の時に必須。カートリッジスロット1にロードするDisk ROMのパス（著作権の都合上、同梱不可 — お手持ちのDisk ROMを吸い出して配置する） |
 | `disk` | （なし） | 起動時にマウントする `.DSK` イメージ（360KB/720KB）のパス。省略時、またはファイルが見つからない場合はSDカード上の `.DSK` ファイル一覧から選ぶ対話式メニューが表示される |
@@ -98,7 +99,7 @@ hdmi_baud=8000000
 
 `cart` を省略、あるいは指定したファイルが見つからない場合は SD カード上の `.ROM` ファイル一覧（サブフォルダ含む）から選ぶ対話式メニューが表示されます（USBキーボード未接続時は自動的に最初の1件が選択されます）。
 
-`volume`/`audio_filter`/`display`/`hdmi_frame_skip` は実行時メニューで調整して ENTER を押すと、該当キーが自動的に更新されます（他のキー・コメント行は保持されます）。`lcd`/`rotate`/`hdmi_baud`は再起動が必要なため、実行時メニューのDisplay Settingsで変更してENTERを押しても、その場では反映されず`msx.ini`に書き込まれるだけです。
+`volume`/`audio_filter`/`display`/`hdmi_frame_skip`/`hdmi_scale` は実行時メニューで調整して ENTER を押すと、該当キーが自動的に更新されます（他のキー・コメント行は保持されます）。`lcd`/`rotate`/`hdmi_baud`は再起動が必要なため、実行時メニューのDisplay Settingsで変更してENTERを押しても、その場では反映されず`msx.ini`に書き込まれるだけです。
 
 かつて存在した `hdmi`（HDMI On/Off個別設定）・`boot_exclusive` の各キー、および `display=both`（同時出力）は、LCD/HDMIを完全排他にした際に廃止されました。既存の `msx.ini` にこれらの記述が残っていても無視されるだけで害はありませんが、`display=both` は `lcd` にフォールバックされます。
 

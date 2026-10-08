@@ -88,6 +88,7 @@ hdmi_baud=8000000
 | `display` | `lcd` | `lcd` or `hdmi`. **Mutually exclusive** (no simultaneous output) — only the chosen side's hardware is initialized at boot. Also switchable live from the runtime menu's Display Settings (or the GUI+P hotkey) |
 | `hdmi_frame_skip` | `2` | Send the HDMI bridge output every Nth frame (only matters when `display=hdmi`). `1` sends every frame |
 | `hdmi_baud` | `8000000` | SPI baud rate (Hz) for the HDMI bridge output. 5MHz/8MHz confirmed clean on real hardware — 10MHz was found to corrupt the received palette. Restart required |
+| `hdmi_scale` | `1` | Receiver-side upscale factor for the HDMI output (only matters when `display=hdmi`). `2` gives 512×384 (the largest that fits the receiver's 640×480). Live-adjustable from the runtime menu's Display Settings |
 | `mode` | (none) | Set to `disk` for virtual FDD (floppy disk drive) mode. Mutually exclusive with `cart` (`cart` is ignored when `mode=disk`) |
 | `diskrom` | (none) | Required when `mode=disk`. Path to the Disk ROM loaded into cart slot 1 (not bundled for copyright reasons — dump your own Disk ROM and place it here) |
 | `disk` | (none) | Path to the `.DSK` image (360KB/720KB) to mount at boot. If omitted, or if the file isn't found, an interactive selector listing the SD card's `.DSK` files is shown |
@@ -98,7 +99,7 @@ Under `mode=disk`, the runtime menu shows "Swap Disk" in place of "Swap Cartridg
 
 If `cart` is omitted, or the specified file isn't found, an interactive selector listing the SD card's `.ROM` files (subfolders included) is shown (with no USB keyboard connected, the first file in the list is auto-selected).
 
-Adjusting `volume`/`audio_filter`/`display`/`hdmi_frame_skip` in the runtime menu and pressing ENTER automatically updates the corresponding key (other keys and comment lines are preserved). `lcd`/`rotate`/`hdmi_baud` are restart-only — pressing ENTER on Display Settings still writes them to `msx.ini`, but they only take effect on the next boot.
+Adjusting `volume`/`audio_filter`/`display`/`hdmi_frame_skip`/`hdmi_scale` in the runtime menu and pressing ENTER automatically updates the corresponding key (other keys and comment lines are preserved). `lcd`/`rotate`/`hdmi_baud` are restart-only — pressing ENTER on Display Settings still writes them to `msx.ini`, but they only take effect on the next boot.
 
 The formerly-existing `hdmi` (separate HDMI on/off) and `boot_exclusive` keys, and the `display=both` (simultaneous output) value, were removed when LCD/HDMI became strictly mutually exclusive. Leftover mentions of these in an existing `msx.ini` are harmlessly ignored, except `display=both`, which now falls back to `lcd`.
 

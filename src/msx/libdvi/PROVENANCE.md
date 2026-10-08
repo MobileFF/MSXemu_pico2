@@ -14,10 +14,28 @@ Vendored 2026-09-20 (phase 3 of the RP2350-PiZero port, see
   `dvi_serialiser.c`) that this board's DVI pins (GPIO32-39) need and that
   upstream had not yet merged as of this snapshot.
 
-Files copied verbatim (unmodified) from `software/libdvi/`: `dvi.c/h`,
+Files copied verbatim (unmodified) from `software/libdvi/`: `dvi.h`,
 `dvi_config_defs.h`, `dvi_serialiser.c/h/.pio`, `dvi_timing.c/h`,
 `tmds_encode.c/h/.S`, `tmds_table.h`, `tmds_table_fullres.h`,
 `util_queue_u32_inline.h`.
+
+`dvi.c` was verbatim until **2026-10-05**, when it got this project's
+first actual deviation from upstream: `dvi_dma_irq_handler()`'s
+`late_scanline_ctr` backlog counter could never recover once it went
+positive (confirmed permanent real-hardware "No Signal" from something
+as small as a single `gc.collect()` call on the MicroPython side — see
+mp/msx_mode_switch.py's history). Root cause: this project's single-
+core-producer design (disp_dvi.c's `scanline_callback`) can only ever
+supply one fresh TMDS buffer per IRQ, so the drain loop's one "stale"
+buffer removal and the very next serve-check's "nothing available" miss
+drew from — and refilled — the exact same quota every single IRQ, net
+zero, forever. Patched with a `was_backlogged` guard (only count a miss
+as a NEW backlog event when the counter was 0 entering that IRQ) so the
+counter can actually reach 0 again. See the inline comment at that call
+site for the full writeup; not reported upstream (BSD-3-Clause allows
+local modification freely, and this project's producer design — one
+buffer per IRQ, no faster — is likely specific enough to this port that
+upstream's own typical usage pattern may not hit it the same way).
 
 Not copied: the fork's own `common_dvi_pin_configs.h` (this project
 defines its own `waveshare_rp2350_pizero_dvi_cfg` directly in

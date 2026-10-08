@@ -25,13 +25,16 @@
 #include "py/stream.h"
 
 #include "msx_core.h"
+#include <stdlib.h>
 
 #ifdef __arm__
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
+#include "hardware/timer.h"
 #include "pico/time.h"
+#include <malloc.h>
 #define HAVE_PICO_SDK 1
 #else
 #define HAVE_PICO_SDK 0
@@ -134,6 +137,25 @@ static volatile uint32_t audio_ring_write = 0; /* written by main loop only */
 static volatile uint32_t audio_ring_read  = 0; /* written by ISR only */
 
 #if HAVE_PICO_SDK
+/* 2026-09-30 REVERTED: briefly switched this to a raw hardware_alarm_*
+ * self-rearming alarm (mirroring usb_host_core.c's
+ * pio_usb_sof_alarm_handler()), on the theory that add_repeating_timer_us()/
+ * alarm_pool shared the same self-deadlock-prone spinlock pool already
+ * root-caused for USB's SOF handler. That theory was WRONG — checked
+ * pico-sdk source directly: alarm_pool's own IRQ handler (pico_time/
+ * time.c's alarm_pool_irq_handler(), see its own comment) uses ONLY its
+ * own per-pool spin_lock for internal bookkeeping and never calls
+ * hardware_alarm_set_target() from its hot path, so it was NEVER
+ * contending with USB's alarm. The raw hardware_alarm_* API this was
+ * changed to, however, DOES take a single shared PICO_SPINLOCK_ID_TIMER
+ * spinlock on every hardware_alarm_set_target() call (timer.c:216-264) —
+ * calling that every 45us (audio) alongside USB's own 1kHz use of the
+ * exact same lock introduced NEW, real contention that didn't exist
+ * before, and reproduced as real hardware becoming totally unresponsive
+ * to the keyboard (worse than the original Win+F7-only freeze this was
+ * meant to fix). Reverted to add_repeating_timer_us()/alarm_pool — the
+ * Win+F7 hang's real cause is still open; see MenuCanvas.flush()'s
+ * framebuf[ready_idx] race with disp_dvi.c's scanline_callback instead. */
 static repeating_timer_t audio_rep_timer;
 static bool audio_timer_running = false;
 
@@ -227,6 +249,31 @@ static mp_obj_t msx_py_get_bios_view(void) {
     return mp_obj_new_bytearray_by_ref(MSX_BIOS_SIZE, msx_get_bios_ptr(&msx_state));
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_bios_view_obj, msx_py_get_bios_view);
+
+/* -----------------------------------------------------------------------
+ * msx.get_scratch_view() -> bytearray
+ * Zero-copy view of a 4KB scratch buffer malloc()ed once from the C heap
+ * on first call and kept for the rest of the session — backs
+ * msx_menu.get_rom_load_buf() (Mega ROM mapper-detection prefix read and
+ * flash-cache copy chunks). Real hardware, 2026-10-04: allocating that
+ * buffer as a Python bytearray failed ("allocating 4096 bytes") at boot
+ * and again at Mega ROM load, with 24-27KB nominally free on a
+ * fragmented GC heap, while the C heap still had ~65KB free
+ * (msx.c_heap_info()). Raises MemoryError if the C heap is exhausted.
+ * ----------------------------------------------------------------------- */
+#define MSX_SCRATCH_SIZE 4096
+static uint8_t *msx_scratch_buf = NULL;
+
+static mp_obj_t msx_py_get_scratch_view(void) {
+    if (msx_scratch_buf == NULL) {
+        msx_scratch_buf = malloc(MSX_SCRATCH_SIZE);
+        if (msx_scratch_buf == NULL) {
+            mp_raise_type(&mp_type_MemoryError);
+        }
+    }
+    return mp_obj_new_bytearray_by_ref(MSX_SCRATCH_SIZE, msx_scratch_buf);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_scratch_view_obj, msx_py_get_scratch_view);
 
 /* -----------------------------------------------------------------------
  * msx.mark_bios_loaded(size: int) -> bool
@@ -865,6 +912,98 @@ static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_dvi_debug_obj, msx_py_dvi_debug);
 #endif /* MSX_BOARD_PIZERO */
 
 /* -----------------------------------------------------------------------
+ * msx.c_heap_info() -> (uordblks, fordblks, arena, ceiling)
+ * 2026-10-04 real-hardware diagnostic: MICROPY_C_HEAP_SIZE (bldfrm_msx.sh)
+ * is a fixed-size linker-reserved region (memmap_mp_rp2350.ld:
+ * __StackLimit = __bss_end__ + __micropy_c_heap_size__) that malloc()/
+ * free() (msx_core.c's cart_cache, VDP/PSG buffers, etc.) draw from —
+ * there is no existing runtime introspection for it (unlike the GC heap's
+ * gc.mem_free()/gc.mem_alloc()). mallinfo() (newlib) reports the
+ * allocator's own live bookkeeping for exactly this heap:
+ *   uordblks — bytes currently allocated (in use)
+ *   fordblks — bytes free WITHIN THE ARENA newlib has already sbrk()'d
+ *              (i.e. actually available to satisfy the next malloc()
+ *              without growing the arena further — the number that
+ *              actually predicts "will the next malloc() fail", unlike
+ *              a derived "ceiling - uordblks", which assumes the arena
+ *              can always still grow all the way to the ceiling and
+ *              turned out to overstate real availability on real
+ *              hardware — see this comment's earlier revision, kept
+ *              below via (c) for context)
+ *   arena    — total bytes newlib has obtained from the system so far
+ *              (may be less than the full ceiling if it hasn't needed
+ *              to grow that far, OR if something prevented it from
+ *              growing further — e.g. fragmentation elsewhere in RAM)
+ *   ceiling  — the full configured C heap size (__StackLimit -
+ *              __bss_end__, see below for why this isn't a C macro)
+ *
+ * The ceiling is NOT a C preprocessor macro — MICROPY_C_HEAP_SIZE is only
+ * ever passed to the LINKER (`-Wl,--defsym=__micropy_c_heap_size__=...`,
+ * ports/rp2/CMakeLists.txt), never as a `target_compile_definitions()`
+ * reaching this file. An earlier version of this function assumed
+ * otherwise (#ifndef MICROPY_C_HEAP_SIZE / #define ... 0 silently always
+ * won), making every "free" reading 0 — real-hardware finding, caught
+ * because 0 was suspiciously exact rather than just small. Reading
+ * __StackLimit/__bss_end__ (both already defined by the same linker
+ * script) directly instead gives the true configured size regardless of
+ * how the build happened to pass the number in.
+ * ----------------------------------------------------------------------- */
+#if HAVE_PICO_SDK
+extern char __bss_end__;
+extern char __StackLimit;
+#endif
+static mp_obj_t msx_py_c_heap_info(void) {
+    struct mallinfo mi = mallinfo();
+#if HAVE_PICO_SDK
+    uint32_t ceiling = (uint32_t)(&__StackLimit - &__bss_end__);
+#else
+    uint32_t ceiling = 0;
+#endif
+    mp_obj_t items[4] = {
+        mp_obj_new_int_from_uint((uint32_t)mi.uordblks),
+        mp_obj_new_int_from_uint((uint32_t)mi.fordblks),
+        mp_obj_new_int_from_uint((uint32_t)mi.arena),
+        mp_obj_new_int_from_uint(ceiling),
+    };
+    return mp_obj_new_tuple(4, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_c_heap_info_obj, msx_py_c_heap_info);
+
+/* -----------------------------------------------------------------------
+ * msx.test_malloc(n: int) -> bool
+ * 2026-10-04 DIAGNOSTIC ONLY: attempts a single malloc(n)/free(n) against
+ * the exact same C heap msx_core.c's cart_cache uses, under whatever
+ * fragmentation state exists right now — bypasses msx_load_cart_paged()
+ * entirely (no eject_cart()/cart state touched) to test malloc() itself
+ * in isolation, since c_heap_info()'s fordblks/arena/ceiling numbers
+ * looked like they should permit a 49152-byte allocation (arena has
+ * ~12.7KB of room left to grow via sbrk() before the ceiling) yet the
+ * real load_cart_paged() call still failed. Remove once root-caused.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_test_malloc(mp_obj_t n_obj) {
+    size_t n = (size_t)mp_obj_get_int(n_obj);
+    void *p = malloc(n);
+    bool ok = (p != NULL);
+    free(p);
+    return mp_obj_new_bool(ok);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_test_malloc_obj, msx_py_test_malloc);
+
+/* -----------------------------------------------------------------------
+ * msx.build_info() -> str
+ * 2026-09-30: __DATE__/__TIME__ expand to the actual compiler invocation
+ * time of THIS translation unit, not any file's mtime — printed by
+ * main.py at boot so a real-hardware log unambiguously shows whether the
+ * .uf2 actually on the device is the one just rebuilt (this project has
+ * been bitten more than once by testing against a stale firmware/mp file
+ * without realizing it — see log/rp2350-pizero-bringup-2026-09-29.md §4).
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_build_info(void) {
+    return mp_obj_new_str(__DATE__ " " __TIME__, sizeof(__DATE__ " " __TIME__) - 1);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_build_info_obj, msx_py_build_info);
+
+/* -----------------------------------------------------------------------
  * msx.wait_display()
  * Wait for the DMA display transfer to finish (blocking).
  * Must be called before SD card access or next render.
@@ -949,6 +1088,23 @@ static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_render_to_hdmi_obj,
                                    msx_py_render_to_hdmi);
 
 /* -----------------------------------------------------------------------
+ * msx.set_hdmi_scale(n)
+ * Receiver-side integer upscale factor for HDMI bridge frames (game and
+ * menu). Clamped to 1..4; the receiver steps it down to fit 640x480, so
+ * 2 (512x384) is the effective maximum for MSX's 256x192. See
+ * msx_set_hdmi_scale() in msx_core.h.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_set_hdmi_scale(mp_obj_t scale_obj) {
+    mp_int_t scale = mp_obj_get_int(scale_obj);
+    if (scale < 1) scale = 1;
+    if (scale > HDMI_SCALE_MAX) scale = HDMI_SCALE_MAX;
+    msx_set_hdmi_scale(&msx_state, (uint8_t)scale);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_set_hdmi_scale_obj,
+                                   msx_py_set_hdmi_scale);
+
+/* -----------------------------------------------------------------------
  * msx.render_to_hdmi_raw332()
  * Same as msx.render_to_hdmi(), but sends full RGB332 (no palette lookup).
  * Use for menu/UI screens, which use colors outside the MSX's 16-color
@@ -985,6 +1141,42 @@ static mp_obj_t msx_py_get_framebuf(void) {
         msx_state.framebuf[msx_state.framebuf_ready_idx]);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_framebuf_obj, msx_py_get_framebuf);
+
+/* -----------------------------------------------------------------------
+ * msx.get_framebuf_back() -> bytearray (by ref)
+ * 2026-09-30: the NOT-currently-ready half of the double buffer — i.e.
+ * the same side msx_run_frame() itself writes into (msx_core.c:903,
+ * `framebuf[1 - framebuf_ready_idx]`) while the other half is being
+ * displayed. get_framebuf() always returns the READY half, which is fine
+ * for LCD/HDMI (menus there draw-then-immediately-push over SPI, with
+ * gameplay paused — nothing else touches that buffer meanwhile). On
+ * pizero/DVI there is no push: disp_dvi.c's scanline_callback (core1, IRQ-
+ * driven) reads framebuf[framebuf_ready_idx] continuously in the
+ * background regardless of what Python is doing, so a menu drawing
+ * straight into get_framebuf()'s buffer races that live reader — root-
+ * caused as the real-hardware Win+F7 freeze (this project's own past
+ * DVI-plus-shared-resource self-deadlocks are exactly this class of bug).
+ * Pair with msx.publish_framebuf() once a frame drawn here is complete —
+ * see MenuCanvas.flush()/clear() in msx_menu.py.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_get_framebuf_back(void) {
+    return mp_obj_new_bytearray_by_ref(
+        MSX_SCREEN_W * MSX_SCREEN_H * sizeof(uint16_t),
+        msx_state.framebuf[1 - msx_state.framebuf_ready_idx]);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_framebuf_back_obj, msx_py_get_framebuf_back);
+
+/* -----------------------------------------------------------------------
+ * msx.publish_framebuf()
+ * Flips framebuf_ready_idx, the same "publish this frame" step
+ * msx_run_frame() does for itself (msx_core.c:930) — makes the buffer
+ * just drawn into via get_framebuf_back() the new ready/displayed side.
+ * ----------------------------------------------------------------------- */
+static mp_obj_t msx_py_publish_framebuf(void) {
+    msx_state.framebuf_ready_idx = 1 - msx_state.framebuf_ready_idx;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_publish_framebuf_obj, msx_py_publish_framebuf);
 
 /* -----------------------------------------------------------------------
  * msx.get_audio_buf(n: int) -> memoryview
@@ -1436,6 +1628,7 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init),                   MP_ROM_PTR(&msx_py_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_reset),                  MP_ROM_PTR(&msx_py_reset_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_ready),               MP_ROM_PTR(&msx_py_is_ready_obj) },
+    { MP_ROM_QSTR(MP_QSTR_build_info),             MP_ROM_PTR(&msx_py_build_info_obj) },
     /* CALL/RST hooks */
     { MP_ROM_QSTR(MP_QSTR_set_call_hook),          MP_ROM_PTR(&msx_py_set_call_hook_obj) },
     { MP_ROM_QSTR(MP_QSTR_clear_call_hook),        MP_ROM_PTR(&msx_py_clear_call_hook_obj) },
@@ -1473,15 +1666,21 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_render_to_display_dvi),      MP_ROM_PTR(&msx_py_render_to_display_dvi_obj) },
     { MP_ROM_QSTR(MP_QSTR_dvi_debug),                  MP_ROM_PTR(&msx_py_dvi_debug_obj) },
 #endif
+    { MP_ROM_QSTR(MP_QSTR_c_heap_info),            MP_ROM_PTR(&msx_py_c_heap_info_obj) },
+    { MP_ROM_QSTR(MP_QSTR_test_malloc),            MP_ROM_PTR(&msx_py_test_malloc_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_backlight),          MP_ROM_PTR(&msx_py_set_backlight_obj) },
     { MP_ROM_QSTR(MP_QSTR_hdmi_reset_init),        MP_ROM_PTR(&msx_py_hdmi_reset_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_hdmi_reset_pulse),       MP_ROM_PTR(&msx_py_hdmi_reset_pulse_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_framebuf),           MP_ROM_PTR(&msx_py_get_framebuf_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_framebuf_back),      MP_ROM_PTR(&msx_py_get_framebuf_back_obj) },
+    { MP_ROM_QSTR(MP_QSTR_publish_framebuf),       MP_ROM_PTR(&msx_py_publish_framebuf_obj) },
     /* Display — HDMI bridge (hdmi_bridge/README.md), opt-in via config.txt */
     { MP_ROM_QSTR(MP_QSTR_init_hdmi_output),       MP_ROM_PTR(&msx_py_init_hdmi_output_obj) },
     { MP_ROM_QSTR(MP_QSTR_send_hdmi_palette),      MP_ROM_PTR(&msx_py_send_hdmi_palette_obj) },
     { MP_ROM_QSTR(MP_QSTR_render_to_hdmi),         MP_ROM_PTR(&msx_py_render_to_hdmi_obj) },
     { MP_ROM_QSTR(MP_QSTR_render_to_hdmi_raw332),  MP_ROM_PTR(&msx_py_render_to_hdmi_raw332_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_hdmi_scale),         MP_ROM_PTR(&msx_py_set_hdmi_scale_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_scratch_view),       MP_ROM_PTR(&msx_py_get_scratch_view_obj) },
     { MP_ROM_QSTR(MP_QSTR_clear_hdmi),             MP_ROM_PTR(&msx_py_clear_hdmi_obj) },
     /* Keyboard */
     { MP_ROM_QSTR(MP_QSTR_set_key_matrix),         MP_ROM_PTR(&msx_py_set_key_matrix_obj) },

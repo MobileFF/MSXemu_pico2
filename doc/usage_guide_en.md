@@ -102,6 +102,8 @@ The first time you select one, it takes a few seconds to copy to the Pico 2's on
 
 > Supported mappers are ASCII-8 / ASCII-16 / KONAMI (no SCC). KONAMI SCC cartridges (with the extra sound chip) are not currently supported on the audio side.
 
+> **Known limitation (Waveshare RP2350-PiZero build only)**: on PiZero (onboard DVI output), Mega ROM (bank-switched cartridge) loading is currently **disabled**. Attempting to load one is rejected with a "Load failed" error; regular (non-bank-switched) ROMs are unaffected. The cause is a real-hardware issue where core1 (which drives DVI output) crashes intermittently during Mega ROM loading/swapping; after extensive investigation (ruling out mapper type, cache-reuse-vs-fresh-allocation, and other hypotheses) the root cause could not be isolated, so the feature was disabled outright rather than ship something unpredictable. The regular Pico 2 (SPI LCD) build has no DVI/core1 and is unaffected.
+
 ---
 
 ## 7. Save State

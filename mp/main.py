@@ -33,6 +33,7 @@
 #   display=hdmi
 #   hdmi_frame_skip=2
 #   hdmi_baud=8000000
+#   hdmi_scale=2
 #   # omit 'cart' to show the interactive ROM selector at boot (browses from
 #   # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
 #   # a ROM, ESC goes up a level/cancels at the root)
@@ -78,6 +79,11 @@
 #   # clean on real hardware, 10MHz corrupts the received palette on this
 #   # wiring; see doc/hdmi_bridge_phase2_report.md). Only matters when
 #   # display=hdmi.
+#   # omit 'hdmi_scale' to default to 1 (native 256x192 centered on the
+#   # receiver's 640x480 output); 2 = 512x384. Values above 2 behave as 2
+#   # (the receiver steps the factor down until the frame fits). Applies to
+#   # game and menu frames alike, costs no extra SPI traffic (the receiver
+#   # does the upscaling). Only matters when display=hdmi.
 #   # ext=off skips loading /sd/msx/ext/ and /ext/ extension modules (see
 #   # mp/msx_ext.py, doc/extension_api.md). Default is to load them.
 #   # Real-hardware finding: once ANY extension registers even one
@@ -93,7 +99,7 @@
 #   #
 #   # All of the above except bios/cart (ROM selector instead) can be tuned
 #   # live via GUI+F7 — Audio/Display Settings. ENTER writes it back to
-#   # msx.ini; audio/display/frame_skip take effect live, while
+#   # msx.ini; audio/display/frame_skip/hdmi_scale take effect live, while
 #   # lcd/rotate/hdmi_baud need a restart (read once at boot; the same menu
 #   # also offers a "Reinit ... now" action for the active side, no restart
 #   # needed — see msx_display_settings.py).
@@ -122,6 +128,14 @@ except ImportError:
     print("ERROR: 'msx' C module not found — rebuild with micropython_msx.cmake")
     sys.exit(1)
 
+# 2026-09-30: __DATE__/__TIME__, baked into the C module at actual compile
+# time (msx.build_info(), modmsx.c) — printed first thing so a real-
+# hardware log unambiguously shows which firmware.uf2 is actually running,
+# not just which mp/*.py happened to be run. This project has repeatedly
+# lost debugging time to testing against a stale build without noticing
+# (see log/rp2350-pizero-bringup-2026-09-29.md §4).
+print(f"msx module build: {msx.build_info()}")
+
 try:
     import usb_host
     _usb_ready = False
@@ -138,7 +152,7 @@ from msx_keymap import (apply_hid_report, HID_F7, HID_P, HID_ESC, HID_DELETE,
 from msx_ext    import load_extensions
 from msx_menu   import (select_rom, load_config, show_emulator_menu,
                         load_cart_smart, set_display_state, readinto_chunked,
-                        log_mem)
+                        log_mem, get_rom_load_buf)
 log_mem("boot, after main.py/msx_menu.py compiled")
 
 # -----------------------------------------------------------------------
@@ -164,6 +178,13 @@ SAVE_BASE    = "/sd/msx/save"
 
 # -----------------------------------------------------------------------
 # Helpers
+# 2026-09-30 A/B test (EIO investigation): confirmed the 1kHz
+# pio_usb_sof_alarm_handler() interrupt is NOT the cause — real-hardware
+# testing with _DIAG_ENABLE_USB=False still reproduced OSError([Errno 5]
+# EIO) on cart load at the same rate (5/5 reboots). Reverted to True.
+# Kept as a toggle in case it's useful again later; not currently used for
+# active investigation (see SD_DATA_BAUD in board_config.py instead).
+_DIAG_ENABLE_USB = True
 # -----------------------------------------------------------------------
 def mount_sd():
     try:
@@ -336,6 +357,7 @@ _diskrom_path = None  # msx.ini's diskrom=, remembered even in cart mode
 _display_mode = 'lcd'   # 'lcd' | 'hdmi' — mutually exclusive, see Display Settings menu
 _hdmi_frame_skip = 1
 _hdmi_baud = HDMI_BAUD    # override via msx.ini: hdmi_baud=9000000
+_hdmi_scale = HDMI_SCALE  # override via msx.ini: hdmi_scale=2
 
 # Set once in run() right after display init, from the same values passed to
 # msx.init_display_hardware() — kept around so poll_keyboard()'s menu-crash
@@ -383,7 +405,7 @@ def _init_lcd_output():
 def poll_keyboard():
     global _last_modifier, _last_keycodes, _menu_held
     global _display_held, _reinit_held, _exit_requested
-    global _display_mode, _hdmi_frame_skip
+    global _display_mode, _hdmi_frame_skip, _hdmi_scale
     global _lcd_model, _rotate_180, _hdmi_baud, _cart_path, _disk_path
     global _fdd_mode, _diskrom_path
     if not _usb_ready:
@@ -528,7 +550,8 @@ def poll_keyboard():
                 display_state={'display': _display_mode,
                                 'frame_skip': _hdmi_frame_skip,
                                 'lcd': _lcd_model, 'rotate': _rotate_180,
-                                'hdmi_baud': _hdmi_baud},
+                                'hdmi_baud': _hdmi_baud,
+                                'hdmi_scale': _hdmi_scale},
                 cart_path=_cart_path,
                 fdd_mode=_fdd_mode, disk_path=_disk_path,
                 diskrom_path=_diskrom_path)
@@ -568,9 +591,11 @@ def poll_keyboard():
             display_state = {'display': _display_mode,
                              'frame_skip': _hdmi_frame_skip,
                              'lcd': _lcd_model, 'rotate': _rotate_180,
-                             'hdmi_baud': _hdmi_baud}
+                             'hdmi_baud': _hdmi_baud,
+                             'hdmi_scale': _hdmi_scale}
         _display_mode    = display_state['display']
         _hdmi_frame_skip = display_state['frame_skip']
+        _hdmi_scale      = display_state['hdmi_scale']  # already applied live by the menu
         # lcd/rotate/hdmi_baud have no live effect — kept only so Display
         # Settings shows the last-picked values if reopened this session.
         _lcd_model      = display_state['lcd']
@@ -669,6 +694,29 @@ def run():
     # all ruled out individually) — this is a confirmed-working structural
     # fix, not a fully explained one.
     _init_msx_state()
+    # 2026-10-03 real-hardware finding: msx_menu.py's shared 4KB Mega ROM
+    # scratch buffer (get_rom_load_buf()) used to allocate lazily, on
+    # first actual use — which in practice means well into a session
+    # (Swap Cartridge, after the ROM browser/menu have already run and
+    # fragmented the GC heap), where even a single contiguous 4KB block
+    # can fail to allocate despite tens of KB nominally free (non-
+    # compacting GC — see get_rom_load_buf()'s own comment). Warming it up
+    # here, as early as possible (right after msx.init(), before SD mount/
+    # config/display/cart load have allocated and freed anything), means
+    # this one-time 4KB allocation happens while the heap is as fresh/
+    # unfragmented as it will ever be this session, instead of at the
+    # least convenient possible moment. Cheap to hold for the rest of the
+    # session even if no Mega ROM is ever loaded.
+    # Best-effort only: right after main.py's own compile the heap can
+    # already be too fragmented for one contiguous 4KB block (real
+    # hardware, 2026-10-04: MemoryError here with ~24KB nominally free,
+    # aborting boot). get_rom_load_buf() simply retries on first real use
+    # and its callers already tolerate it failing, so never let the
+    # warm-up itself be fatal.
+    try:
+        get_rom_load_buf()
+    except MemoryError:
+        print("get_rom_load_buf() warm-up failed (heap fragmented) — will retry on first use")
     has_sd, cfg = _mount_sd_and_load_config()
     _init_display(cfg)
     _init_hdmi_bridge(cfg)
@@ -715,7 +763,10 @@ def _boost_clock_and_start_usb():
     # clk_sys/clk_peri at all on this board (see init_usb()'s own board
     # branch below) once PIO-USB keyboard support exists.
     if BOARD == "pizero":
-        init_usb()
+        if _DIAG_ENABLE_USB:
+            init_usb()
+        else:
+            print("USB host init SKIPPED (_DIAG_ENABLE_USB=False, EIO A/B test)")
         return
 
     msx.boost_peri_clock()
@@ -842,7 +893,7 @@ def _init_hdmi_bridge(cfg):
     #       what else touched the bus beforehand, so HDMI can safely be
     #       initialized this early again.
     # display already parsed above (step 4).
-    global _hdmi_frame_skip, _hdmi_baud
+    global _hdmi_frame_skip, _hdmi_baud, _hdmi_scale
 
     try:
         _hdmi_frame_skip = max(1, int(cfg.get('hdmi_frame_skip', HDMI_FRAME_SKIP)))
@@ -854,9 +905,19 @@ def _init_hdmi_bridge(cfg):
     except (ValueError, TypeError):
         _hdmi_baud = HDMI_BAUD
 
+    try:
+        _hdmi_scale = max(1, min(4, int(cfg.get('hdmi_scale', HDMI_SCALE))))
+    except (ValueError, TypeError):
+        _hdmi_scale = HDMI_SCALE
+    # Applied regardless of display mode (no SPI traffic — just the header
+    # value), so a later live switch to 'hdmi' already uses it.
+    if _hdmi_scale is not None:
+        msx.set_hdmi_scale(_hdmi_scale)
+
     if _display_mode == 'hdmi':
         print(f"HDMI bridge output enabled (CS=GP{HDMI_CS_PIN}, "
-              f"{_hdmi_baud/1e6:.1f}MHz, frame_skip={_hdmi_frame_skip})")
+              f"{_hdmi_baud/1e6:.1f}MHz, frame_skip={_hdmi_frame_skip}, "
+              f"scale={_hdmi_scale})")
         # Hardware-reset the receiver before sending anything — see
         # HDMI_RESET_PIN's comment above. Must come before
         # init_hdmi_output() (which starts sending immediately).
@@ -925,8 +986,19 @@ def _load_cart_or_disk(cfg, has_sd):
         if has_sd:
             try:
                 ok = load_cart_smart(msx, 0, _diskrom_path)
-            except OSError:
+            except Exception as e:
+                # 2026-09-30: was a bare `except OSError: ok = False` — the
+                # actual error (e.g. an intermittent SD read failure) was
+                # silently discarded, unlike load_bios_file()'s equivalent
+                # path. Surface it so a real-hardware "FAILED" is
+                # diagnosable instead of a dead end. 2026-10-05: widened
+                # from OSError to Exception — load_cart_smart() can also
+                # raise plain RuntimeError (cart_alloc()/short-read
+                # failures, and now the pizero Mega ROM refusal below),
+                # none of which are OSError subclasses; those were an
+                # existing uncaught-crash gap here even before today.
                 ok = False
+                print(f"Disk ROM load error: {e}")
             print(f"Disk ROM (config): {_diskrom_path}  {'OK' if ok else 'FAILED'}")
             if not ok:
                 print(f"ERROR: Disk ROM not found/failed to load: {_diskrom_path}")
@@ -965,8 +1037,15 @@ def _load_cart_or_disk(cfg, has_sd):
         if has_sd:
             try:
                 ok = load_cart_smart(msx, 0, cfg['cart'])
-            except OSError:
+            except Exception as e:
+                # 2026-09-30: see the Disk ROM branch above's identical
+                # comment — this swallowed the real OSError the same way.
+                # 2026-10-05: widened to Exception — see that branch's
+                # updated comment (RuntimeError, incl. the pizero Mega ROM
+                # refusal, is not an OSError and was falling through
+                # uncaught here).
                 ok = False
+                print(f"Cart load error: {e}")
             if ok:
                 _cart_path = cfg['cart']  # own rotating save history — see save_base_for_cart()
             print(f"Cart (config): {cfg['cart']}  {'OK' if ok else 'FAILED'}")
@@ -985,7 +1064,16 @@ def _load_cart_or_disk(cfg, has_sd):
             exclude_names={_bios_name},
         )
         if selected:
-            ok = load_cart_smart(msx, 0, selected)
+            # 2026-10-05: previously no try/except at all here — any
+            # load_cart_smart() exception (short read, cart_alloc()
+            # failure, or now the pizero Mega ROM refusal) crashed the
+            # whole boot uncaught. Matches the msx.ini 'cart=' branch
+            # above.
+            try:
+                ok = load_cart_smart(msx, 0, selected)
+            except Exception as e:
+                ok = False
+                print(f"Cart load error: {e}")
             if ok:
                 _cart_path = selected
             print(f"Cart (menu): {selected}  {'OK' if ok else 'FAILED'}")
@@ -993,6 +1081,15 @@ def _load_cart_or_disk(cfg, has_sd):
             print("No cartridge — booting MSX BASIC")
 
     log_mem("after cart load")
+    # 2026-10-04 DIAGNOSTIC: baseline C heap (used, free) right after the
+    # first cart load — compare against msx_mode_switch.py's identical
+    # print right before a later Swap Cartridge attempt, to see how much
+    # the C heap moves (or doesn't) between the two.
+    if BOARD == "pizero":
+        try:
+            print(f"C HEAP: {msx.c_heap_info()}")
+        except Exception:
+            pass
     return True
 
 
@@ -1155,6 +1252,16 @@ def _main_loop():
             fps     = 300_000 / elapsed if elapsed > 0 else 0.0
             ring    = msx.get_audio_ring_level()
             print(f"FPS: {fps:.1f}  ring: {ring}")
+            # 2026-10-05 DIAGNOSTIC (re-added): (heartbeat, late_scanline_ctr)
+            # — see disp_dvi.c's msx_dvi_debug_info()/msx.dvi_debug() and
+            # the dvi.c was_backlogged fix. Checking whether the fix
+            # actually lets late_scanline_ctr recover, or whether "No
+            # Signal" persists via some other mechanism entirely.
+            if BOARD == "pizero":
+                try:
+                    print(f"DVI DIAG: {msx.dvi_debug()}")
+                except Exception:
+                    pass
             t0 = time.ticks_ms()
 
     # Ctrl+Alt+Delete landed here (the only way out of the loop above).

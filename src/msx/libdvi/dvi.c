@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdbool.h>  /* 2026-10-05 LOCAL PATCH (not upstream) — bool/was_backlogged below */
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 
@@ -190,6 +191,29 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 	}
 
 	uint32_t *tmdsbuf;
+	// 2026-10-05 LOCAL PATCH (not upstream — see PROVENANCE.md): this
+	// project's single-core-producer design (disp_dvi.c's
+	// scanline_callback, called below) can supply AT MOST one fresh
+	// buffer per IRQ, no faster. With the original code, once
+	// late_scanline_ctr went positive it could never return to 0: this
+	// drain loop below consumes that one fresh buffer (decrementing the
+	// counter), which leaves q_tmds_valid EMPTY for the serve-check that
+	// immediately follows in the same call — so that check always takes
+	// the "miss" branch and increments the counter right back up by
+	// exactly as much as the drain loop just subtracted. Net change per
+	// IRQ: zero, forever — confirmed on real hardware as a permanent "No
+	// Signal" the moment ANY sufficiently long stall elsewhere in the
+	// firmware (e.g. a single gc.collect() call on the MicroPython side —
+	// see mp/msx_mode_switch.py) let late_scanline_ctr go positive even
+	// once. was_backlogged breaks the cycle: a miss is only counted as a
+	// NEW backlog event when we entered this IRQ already caught up
+	// (counter was 0) — if we were already draining a backlog, a miss
+	// this same cycle is the expected one-frame gap while the producer
+	// catches up, not a new failure to pile onto the count. This lets the
+	// counter actually reach 0 (typically within one or two IRQs of
+	// whatever stall caused it) instead of oscillating in lock-step with
+	// the drain loop forever.
+	bool was_backlogged = inst->late_scanline_ctr > 0;
 	while (inst->late_scanline_ctr > 0 && queue_try_remove_u32(&inst->q_tmds_valid, &tmdsbuf)) {
 		// If we displayed this buffer then it would be in the wrong vertical
 		// position on-screen. Just pass it back.
@@ -210,7 +234,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 	else {
 		// No valid scanline was ready (generates solid red scanline)
 		tmdsbuf = NULL;
-		if (inst->timing_state.v_ctr % DVI_VERTICAL_REPEAT == DVI_VERTICAL_REPEAT - 1)
+		if (!was_backlogged && inst->timing_state.v_ctr % DVI_VERTICAL_REPEAT == DVI_VERTICAL_REPEAT - 1)
 			++inst->late_scanline_ctr;
 	}
 

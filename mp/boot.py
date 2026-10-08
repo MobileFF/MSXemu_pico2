@@ -29,10 +29,18 @@ if _board == "pico2":
     # ここでは触らない。
     machine.Pin(28, machine.Pin.IN, machine.Pin.PULL_UP)
 
-# UART0を起動し、REPLをUARTに複製する設定
-# Baudrateを115200に設定（標準設定）— GP0/GP1はpico2/pizero共通
-uart = machine.UART(0, baudrate=115200, tx=machine.Pin(0), rx=machine.Pin(1), txbuf=32)
-os.dupterm(uart)
+# 2026-10-02: pizeroはキーボードが別のUSBポート(PIO-USB)に繋がっているため、
+# ネイティブUSBコントローラが完全に空いている(pico2はキーボードのホスト
+# モードでネイティブUSBを使うため同時にCDCデバイスにはできない — 詳細は
+# src/msx/micropython_msx.cmakeのMICROPY_HW_USB_CDC分岐コメント参照)。
+# pizeroではビルド時にMICROPY_HW_USB_CDC=1が有効になっており、ネイティブ
+# USB CDC REPLがC側で自動的に立ち上がるため、GP0/1のUART REPLは不要かつ
+# ユーザー指示により無効化。pico2は従来通りUART REPLを複製する。
+if _board == "pico2":
+    # UART0を起動し、REPLをUARTに複製する設定
+    # Baudrateを115200に設定（標準設定）
+    uart = machine.UART(0, baudrate=115200, tx=machine.Pin(0), rx=machine.Pin(1), txbuf=256, rxbuf=512)
+    os.dupterm(uart)
 # # Boot script for PB-1000 Emulator
 # # This runs automatically on power-up
 # 

@@ -27,3 +27,24 @@ set(PICO_BOARD "waveshare_rp2350_pizero")
 if(NOT DEFINED MICROPY_HW_FLASH_STORAGE_BYTES)
     set(MICROPY_HW_FLASH_STORAGE_BYTES 14680064)  # 14 * 1024 * 1024 (16MB flash, same split as WAVESHARE_RP2350B_CORE)
 endif()
+
+# 2026-09-30 TRIED AND REVERTED: froze the lazily-imported menu modules
+# (manifest.py, same directory, now removed) to fix a real-hardware DVI
+# "No Signal" lockup caused by the compile-time stall of a module's first
+# `import` (see disp_dvi.c's buffer-margin comment). This board's RAM/
+# flash layout is hand-tuned extremely tightly already (see bldfrm_msx.sh's
+# SCRATCH_X/Y, stack-size, and __StackBottom patches, each the product of
+# its own real-hardware debugging session) — adding frozen bytecode
+# content shifted something in that layout enough to cause a NEW, real-
+# hardware-confirmed problem: intermittent mpremote/UART connection
+# failures ("No such device"), reproduced consistently with frozen
+# modules enabled and absent with them disabled, confirmed with two
+# different USB-serial adapters (ruling out a cable/adapter fault) and a
+# full power cycle (ruling out a transient soft-reset residue). Reverted
+# rather than chase the exact mechanism — the DVI "No Signal" issue this
+# was meant to fix remains open; see msx_menu.py's MenuCanvas DVI-
+# back-buffer comment for the next angle to try instead (e.g. keeping DVI
+# quiet during a menu's first-ever draw, rather than avoiding the import
+# cost). pico2 was never affected either way (never includes this board's
+# mpconfigboard.cmake at all — see bldfrm_msx.sh's BOARD_DIR_ARG, only
+# set for pizero).

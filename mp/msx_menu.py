@@ -163,6 +163,24 @@ class MenuCanvas:
 
     def __init__(self, msx_module):
         self._msx = msx_module
+        # 2026-09-30/10-01: DVI briefly drew into the BACK buffer
+        # (get_framebuf_back()) instead of the ready one, on the theory
+        # that disp_dvi.c's scanline_callback (core1, reading
+        # framebuf[ready_idx] continuously in the background) races a
+        # menu drawing into that same live buffer — plausible in theory,
+        # and the Win+F7 freeze this was meant to fix was real, but that
+        # freeze's actual cause turned out to be msx_wait_display()
+        # dereferencing a NULL spi_inst on DVI (see msx_core.c), unrelated
+        # to this buffer choice. The back-buffer "fix" itself, once
+        # isolated by reverting just this one line, was confirmed on real
+        # hardware to be what caused a NEW, worse regression ("No Signal",
+        # permanent, both buffers apparently ending up invalid rather than
+        # the theoretical race merely glitching a frame). Reverted to the
+        # plain front/ready buffer, same as LCD/HDMI — confirmed working
+        # correctly on real hardware. The theoretical race is left
+        # unaddressed (no corruption from it has been observed), rather
+        # than re-attempt a fix whose exact failure mode was never fully
+        # explained.
         self._buf = msx_module.get_framebuf()   # bytearray view of C memory
         self._fb  = framebuf.FrameBuffer(self._buf, self.W, self.H,
                                           framebuf.RGB565)
@@ -205,9 +223,12 @@ class MenuCanvas:
             self._msx.render_to_display_1to1()
             self._msx.wait_display()
         if use_dvi:
-            # Synchronous, no wait_display() — see main.py's identical
-            # render_to_display_dvi() comment. NOT YET REAL-HARDWARE
-            # VERIFIED (2026-09-20, phase 3 of the RP2350-PiZero port).
+            # No-op (disp_dvi.c has no per-frame "compose" step; its
+            # scanline_callback reads framebuf[framebuf_ready_idx] directly
+            # from its own background core1 callback) — kept only as a
+            # stable call site. See __init__()'s comment for the back-
+            # buffer approach this used to take instead, and why it was
+            # reverted.
             self._msx.render_to_display_dvi()
         if use_hdmi:
             # raw332, not render_to_hdmi(): menus draw arbitrary UI colors
@@ -230,14 +251,38 @@ def _echo_msg(msg):
     # Print `msg` to the REPL/serial console the first time it's seen (not
     # on every redraw of the same screen, since these draw functions get
     # called repeatedly while a message stays on screen). The LCD's small
-    # font truncates messages (canvas.text(msg[:31], ...) in
-    # msx_runtime_menu.py's/msx_display_settings.py's _draw() functions),
-    # so a long error (e.g. a full OSError's text) is otherwise only ever
-    # partially readable on-screen.
+    # font is small (31 chars per line), so the on-screen text is drawn
+    # via _wrap_msg() (two lines max) in the menu _draw() functions.
     global _last_printed_msg
     if msg and msg != _last_printed_msg:
         print(f"MENU: {msg}")
     _last_printed_msg = msg
+
+
+def _wrap_msg(msg, width=31, max_lines=2):
+    # Word-wrap a status message into at most `max_lines` lines of `width`
+    # characters (the menu font is 8 px wide on a 256 px canvas, so 31
+    # chars fit). Words longer than `width` are hard-split. Anything past
+    # `max_lines` is dropped — keep messages short enough to fit.
+    lines = []
+    cur = ""
+    for word in msg.split(" "):
+        while len(word) > width:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:width])
+            word = word[width:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= width:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines[:max_lines]
 
 
 def _draw_message(canvas, title, line1, line2="", color=C_WHITE):
@@ -267,6 +312,23 @@ def _get_key(usb_host_mod):
     """Poll USB HID and return a single keycode (or 0 if none / no host)."""
     if usb_host_mod is None:
         return 0
+    # 2026-09-30: on pizero, usb_host.get_hid_report() only reflects
+    # whatever usb_host.task() (tuh_task()) last dequeued — main.py's
+    # poll_keyboard() calls it every frame outside any menu (see its own
+    # comment: pizero's 1ms hardware-alarm tick deliberately does NOT
+    # drive tuh_task() itself). Once inside a menu, poll_keyboard()'s main
+    # loop isn't running — this was the ONLY other place reading HID
+    # reports, and it never called task() itself, so the report buffer
+    # went stale the instant a menu opened. Real-hardware finding: this
+    # made _wait_key_release() (below) spin forever on pizero — the GUI+F7
+    # combo that opened the menu could never be observed as "released"
+    # (the report just stayed frozen at "still held"), a 100%-reproducible
+    # hang on every menu open. Harmless/no-op on pico2 (native USB host
+    # doesn't need explicit task() polling — see usb_host_core_task()).
+    try:
+        usb_host_mod.task()
+    except Exception:
+        pass
     try:
         report = usb_host_mod.get_hid_report()
     except Exception:
@@ -439,6 +501,23 @@ _PREFIX_BUF_SIZE = 4096
 _prefix_buf = None
 
 
+# 2026-10-07: was briefly flipped to False as a real-hardware experiment
+# (hypothesis: msx.get_scratch_view()'s permanent 4KB C-heap malloc() was
+# shifting where the 48KB cart_cache malloc() lands, breaking pico2 Mega
+# ROM loads). Disproving result: pico2's cart_cache malloc() failure
+# ("load_cart() failed") reproduced identically on the 8b57de1 baseline
+# firmware, which predates get_scratch_view() entirely — so that's a
+# separate, pre-existing C-heap fragmentation issue (small in-RAM cart's
+# cart[] freed right before the 48KB cart_cache request), not caused by
+# this flag. Meanwhile, going back to the GC-heap bytearray(4096)
+# fallback (False) reproduced the ORIGINAL problem this flag exists to
+# avoid: "Load failed: memory allocation failed, allocating 4097 bytes"
+# on Swap Cartridge, from msx_runtime_menu/msx_rom_browser's lazy imports
+# fragmenting the GC heap. Restored to True — see get_rom_load_buf()'s
+# own comment for why the C-heap-backed view is strictly safer here.
+_USE_C_SCRATCH = True
+
+
 def get_rom_load_buf():
     """Return the shared Mega-ROM-mapper-detection scratch buffer
     (_PREFIX_BUF_SIZE bytes), allocating it on first call. See the
@@ -448,9 +527,17 @@ def get_rom_load_buf():
     gc.collect() below and the 8KB->4KB shrink."""
     global _prefix_buf
     if _prefix_buf is None:
-        import gc
-        gc.collect()
-        _prefix_buf = bytearray(_PREFIX_BUF_SIZE)
+        # 2026-10-04: prefer the C-heap-backed view (msx.get_scratch_view(),
+        # modmsx.c) — no contiguous GC-heap block needed at all, which is
+        # what kept failing on real hardware (boot warm-up AND Mega ROM
+        # load) despite tens of KB nominally free. bytearray fallback only
+        # for firmware builds that predate it.
+        if _USE_C_SCRATCH and _msx is not None and hasattr(_msx, 'get_scratch_view'):
+            _prefix_buf = _msx.get_scratch_view()
+        else:
+            import gc
+            gc.collect()
+            _prefix_buf = bytearray(_PREFIX_BUF_SIZE)
     return _prefix_buf
 
 
@@ -503,7 +590,8 @@ def write_chunked(f, buf):
 # gameplay reads never touch SD again.
 _FLASH_CACHE_PATH = '/megarom_cache.rom'
 _FLASH_CACHE_META = '/megarom_cache_src.txt'
-_FLASH_COPY_CHUNK = 4096
+_FLASH_COPY_CHUNK = 4096  # must stay <= _PREFIX_BUF_SIZE below — see
+                          # _copy_to_flash_cache()'s reuse of get_rom_load_buf()
 
 
 def _flash_cache_valid(src_path, src_size):
@@ -524,7 +612,21 @@ def _flash_cache_valid(src_path, src_size):
 
 def _copy_to_flash_cache(src_path, size):
     """Stream src_path (on SD) into _FLASH_CACHE_PATH (onboard flash) in
-    small chunks — never holds more than one chunk in RAM at a time."""
+    small chunks — never holds more than one chunk in RAM at a time.
+
+    2026-10-03 real-hardware finding: this used to do
+    `buf = src.read(min(_FLASH_COPY_CHUNK, remaining))`, which allocates a
+    FRESH ~4KB bytes object every single chunk — for a several-hundred-KB
+    Mega ROM that's hundreds of allocations, each one a fresh chance to
+    hit a MemoryError on this board's non-compacting GC heap if it's
+    fragmented enough (e.g. mid-session, after the ROM browser/menu have
+    already run) even with plenty of *nominal* free bytes — reproduced as
+    "Load failed: memory allocation failed, allocating 4097 bytes" via
+    Swap Cartridge. Reuses the shared scratch buffer (get_rom_load_buf(),
+    same 4096-byte size as _FLASH_COPY_CHUNK) via readinto() instead —
+    same single-allocation-then-reuse pattern already used elsewhere in
+    this file (readinto_chunked()) — so only the first-ever call anywhere
+    in the session risks a MemoryError, not every chunk of every copy."""
     # Invalidate the meta file BEFORE writing any data: if the copy below
     # is interrupted (power loss, reset), the stale/incomplete .rom file
     # must not appear valid on the next boot's _flash_cache_valid() check
@@ -535,14 +637,17 @@ def _copy_to_flash_cache(src_path, size):
     except OSError:
         pass
 
+    buf = get_rom_load_buf()
+    mv = memoryview(buf)
     with open(src_path, 'rb') as src, open(_FLASH_CACHE_PATH, 'wb') as dst:
         remaining = size
         while remaining > 0:
-            buf = src.read(min(_FLASH_COPY_CHUNK, remaining))
-            if not buf:
+            chunk = min(_FLASH_COPY_CHUNK, remaining)
+            n = src.readinto(mv[:chunk])
+            if not n:
                 break
-            dst.write(buf)
-            remaining -= len(buf)
+            dst.write(mv[:n])
+            remaining -= n
     with open(_FLASH_CACHE_META, 'w') as f:
         f.write(f"{src_path}\n{size}\n")
 
@@ -558,6 +663,28 @@ def load_cart_smart(msx_module, slot, path):
     Returns True on success.
     """
     size = uos.stat(path)[6]
+
+    if size > _CART_INRAM_MAX and _msx is not None and _msx.get_board_type() == "pizero":
+        # 2026-10-05: Mega ROM (paged) loading disabled on pizero —
+        # real-hardware finding: loading/swapping a paged cart reliably
+        # triggers a core1 (onboard DVI) crash sooner or later (confirmed
+        # via msx.dvi_debug(): heartbeat freezes permanently,
+        # late_scanline_ctr stays 0 — a genuine core1 halt, not the DVI
+        # TMDS buffer-starvation recovery issue already fixed in
+        # src/msx/libdvi/dvi.c). Root cause not isolated after extensive
+        # real-hardware investigation (ruled out: mapper type, cart_cache
+        # reuse vs fresh allocation, the backlog-counter mechanism —
+        # looks probabilistic/timing-dependent, not tied to any one of
+        # those). Refusing up front (small in-RAM carts — regular, non-
+        # bank-switched ROMs — are completely unaffected and keep working
+        # normally) beats an unpredictable crash mid-game. See
+        # doc/usage_guide.md §6 for the user-facing note. pico2 has no
+        # DVI/core1 at all and is unaffected — this check never triggers
+        # there.
+        # Short on purpose: the screen shows at most two 31-char lines,
+        # and msx_mode_switch adds a "Load failed: " prefix (13 chars).
+        raise RuntimeError(
+            f"Mega ROM {size // 1024}KB not supported on PiZero")
 
     if size <= _CART_INRAM_MAX:
         # Zero-copy: msx.cart_alloc() mallocs msx->cart[slot] (C heap) and
@@ -621,6 +748,21 @@ def load_cart_smart(msx_module, slot, path):
             # switches banks still runs fine paged.
         except MemoryError:
             pass  # keep the KONAMI fallback above
+        # 2026-10-05 DIAGNOSTIC: which mapper got used for this load — see
+        # real-hardware report of core1 (DVI) freezing permanently (heart-
+        # beat frozen, late_scanline_ctr stayed 0) specifically on some
+        # Mega ROMs (SHALOM.ROM) but not others (NEMESIS.ROM) that are
+        # otherwise handled by the exact same code path. Checking whether
+        # this correlates with mapper type (ASCII16 calls
+        # cart_page_refill() twice per bank-switch write, unlike ASCII8/
+        # KONAMI's once — see cart_mapper_write()'s comment in msx_core.c).
+        _mapper_names = {
+            msx_module.MAPPER_PLAIN:   "PLAIN",
+            msx_module.MAPPER_ASCII8:  "ASCII8",
+            msx_module.MAPPER_ASCII16: "ASCII16",
+            msx_module.MAPPER_KONAMI:  "KONAMI",
+        }
+        print(f"MAPPER DIAG: {path} -> {_mapper_names.get(mapper, mapper)}")
         ok = msx_module.load_cart_paged(slot, f, size, mapper)
     except Exception:
         f.close()
@@ -641,12 +783,16 @@ def select_rom(msx_module, directory, title="Select ROM",
     actual implementation (kept out of this module's eager compile path;
     only loaded the first time a ROM actually needs picking). `ext`
     selects which file extension is browsable ('.rom' cartridges by
-    default, '.dsk' for the virtual FDD's disk-image browser)."""
-    import gc
-    gc.collect()  # defragment before compiling msx_rom_browser.py — real-
-                  # hardware finding: this can be imported mid-gameplay
-                  # (Swap Cartridge), where cart/emulation state has
-                  # already fragmented the heap more than at a fresh boot.
+    default, '.dsk' for the virtual FDD's disk-image browser).
+
+    2026-10-01: only collects garbage if actually about to compile this
+    module — see show_emulator_menu()'s identical fix/comment below
+    (gc.collect() alone can starve pizero's DVI output; main.py's
+    _prewarm_menu_modules() may already have imported this at boot)."""
+    import sys
+    if 'msx_rom_browser' not in sys.modules:
+        import gc
+        gc.collect()
     import msx_rom_browser
     log_mem("after msx_rom_browser import")
     return msx_rom_browser.select(msx_module, directory, title=title,
@@ -680,13 +826,25 @@ def show_emulator_menu(msx_module, usb_host_mod, rom_dir, exclude_names,
     # (display_state, cart_path, disk_path, fdd_mode, diskrom_path) —
     # fdd_mode/diskrom_path can now change here too (mode-switch menu
     # items), not just cart_path/disk_path.
-    import gc
-    gc.collect()  # defragment before compiling msx_runtime_menu.py — this
-                  # first GUI+F7 press happens mid-gameplay, where cart/
-                  # emulation state has already fragmented the heap more
-                  # than at a fresh boot (real-hardware finding — see the
-                  # same reasoning for msx_display_settings.py's own lazy
-                  # import inside msx_runtime_menu.py).
+    # 2026-10-01 real-hardware finding: gc.collect() here used to run
+    # unconditionally on every single GUI+F7 press, even once main.py's
+    # _prewarm_menu_modules() (pizero only) had already imported
+    # msx_runtime_menu at boot, making the collect's own stated purpose
+    # ("defragment before compiling") a no-op — there is no compile left
+    # to defragment for. Worse: disp_dvi.c's own comment documents
+    # gc.collect() ALONE as sufficient to starve the DVI TMDS buffer queue
+    # ("late_scanline_ctr... never recovers once positive"), and this
+    # project chased exactly that ("No Signal" a few Win+F7 presses in,
+    # not necessarily the first) down two dead ends (freezing the lazy
+    # modules into the firmware, then pre-warming them at boot) before
+    # noticing THIS call was still unconditionally running every time
+    # regardless of either fix. Only collect when actually about to
+    # compile something (i.e. the module isn't cached yet — pico2, or a
+    # pizero build without the pre-warm step).
+    import sys
+    if 'msx_runtime_menu' not in sys.modules:
+        import gc
+        gc.collect()
     import msx_runtime_menu
     log_mem("after msx_runtime_menu import")
     return msx_runtime_menu.show(msx_module, usb_host_mod, rom_dir,

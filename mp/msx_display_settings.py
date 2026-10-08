@@ -1,6 +1,6 @@
 # msx_display_settings.py — unified "Display Settings" runtime menu
-# screen (display routing / frame skip / LCD panel / rotation / HDMI
-# baud / manual reinit), split out of msx_menu.py and imported lazily
+# screen (display routing / frame skip / HDMI scale / LCD panel /
+# rotation / HDMI baud / manual reinit), split out of msx_menu.py and imported lazily
 # (only when the user actually opens this menu item) so its compile
 # cost isn't paid at every boot — see show_emulator_menu()'s "Display
 # Settings" branch in msx_menu.py.
@@ -17,7 +17,7 @@
 # a retained string constant, a comment costs nothing at runtime.)
 
 from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
-                      C_CYAN, C_GRAY, _echo_msg, _wait_key_release, _get_key,
+                      C_CYAN, C_GRAY, _echo_msg, _wrap_msg, _wait_key_release, _get_key,
                       HID_UP, HID_DOWN, HID_LEFT, HID_RIGHT, HID_ENTER, HID_ESC,
                       save_config, set_display_state)
 
@@ -25,9 +25,10 @@ _LCD_MODELS = ["ST7796", "ILI9341"]
 _HDMI_BAUD_OPTIONS = [5_000_000, 8_000_000, 10_000_000]
 _DISPLAY_MODES = ["lcd", "hdmi"]  # mutually exclusive — see set_display_state()
 _FRAME_SKIP_MAX = 8
+_HDMI_SCALE_MAX = 2  # 256x192 * 2 = 512x384; 3+ wouldn't fit the receiver's 640x480
 
-_N_ROWS = 6
-_ROW_REINIT = 5  # last row is an action, not a value — see show()'s ENTER handling
+_N_ROWS = 7
+_ROW_REINIT = 6  # last row is an action, not a value — see show()'s ENTER handling
 
 
 def _draw(canvas, cursor, state, msg=""):
@@ -39,6 +40,7 @@ def _draw(canvas, cursor, state, msg=""):
     rows = [
         f"Display: {state['display'].upper()}",
         f"Frame Skip: {state['frame_skip']}",
+        f"HDMI Scale: x{state['hdmi_scale']}" if state.get('hdmi_scale') else "HDMI Scale: N/A",
         f"LCD Panel: {state['lcd']}",
         f"Rotate: {'180' if state['rotate'] else '0'}",
         f"HDMI Baud: {state['hdmi_baud'] // 1_000_000}MHz",
@@ -54,8 +56,8 @@ def _draw(canvas, cursor, state, msg=""):
         y += 12
 
     canvas.text("Panel/Rotate/Baud: restart needed", 2, y + 2, C_GRAY)
-    if msg:
-        canvas.text(msg[:31], 2, y + 13, C_CYAN)
+    for k, line in enumerate(_wrap_msg(msg) if msg else ()):
+        canvas.text(line, 2, y + 13 + 10 * k, C_CYAN)
 
     canvas.hline(0, canvas.H - 21, canvas.W, C_GRAY)
     canvas.text("LEFT/RIGHT:adjust  UP/DOWN:field", 2, canvas.H - 20, C_GRAY)
@@ -68,12 +70,14 @@ def show(msx_module, usb_host_mod, config_path, display_state,
     # Unified Display/Frame Skip/LCD Panel/Rotate/HDMI Baud/Reinit editor.
     #
     # display_state: dict with 'display' ('lcd'/'hdmi', mutually
-    # exclusive — see set_display_state()), 'frame_skip' (int), 'lcd'
+    # exclusive — see set_display_state()), 'frame_skip' (int),
+    # 'hdmi_scale' (int 1.._HDMI_SCALE_MAX, or None on boards with no
+    # HDMI bridge), 'lcd'
     # (str, one of _LCD_MODELS), 'rotate' (bool), 'hdmi_baud' (int, Hz).
     # Returned (possibly modified) so the caller can update its own
     # globals and this menu shows the last-picked values if reopened.
     #
-    # 'Display' and 'Frame Skip' take effect immediately (same
+    # 'Display', 'Frame Skip' and 'HDMI Scale' take effect immediately (same
     # philosophy as _show_audio_settings_menu() in msx_runtime_menu.py)
     # and are only persisted to msx.ini when ENTER is pressed; 'LCD
     # Panel'/'Rotate'/'HDMI Baud' are restart-only (read once at boot).
@@ -134,12 +138,22 @@ def show(msx_module, usb_host_mod, config_path, display_state,
                 state['frame_skip'] = max(1, min(_FRAME_SKIP_MAX,
                                                   state['frame_skip'] + sign))
             elif cursor == 2:
+                if state.get('hdmi_scale'):
+                    state['hdmi_scale'] = max(1, min(_HDMI_SCALE_MAX,
+                                                      state['hdmi_scale'] + sign))
+                    msx_module.set_hdmi_scale(state['hdmi_scale'])
+                    # Resets the receiver's per-layer centering windows,
+                    # which otherwise keep the old (larger) frame size
+                    # after shrinking — see PKT_CLEAR_SCREEN in msx_core.c.
+                    if state['display'] == 'hdmi':
+                        msx_module.clear_hdmi()
+            elif cursor == 3:
                 idx = _LCD_MODELS.index(state['lcd']) if state['lcd'] in _LCD_MODELS else 0
                 idx = (idx + sign) % len(_LCD_MODELS)
                 state['lcd'] = _LCD_MODELS[idx]
-            elif cursor == 3:
-                state['rotate'] = not state['rotate']
             elif cursor == 4:
+                state['rotate'] = not state['rotate']
+            elif cursor == 5:
                 idx = (_HDMI_BAUD_OPTIONS.index(state['hdmi_baud'])
                        if state['hdmi_baud'] in _HDMI_BAUD_OPTIONS else 0)
                 idx = (idx + sign) % len(_HDMI_BAUD_OPTIONS)
@@ -164,13 +178,16 @@ def show(msx_module, usb_host_mod, config_path, display_state,
                     msg = "No config path — not saved"
                 else:
                     try:
-                        save_config(config_path, {
+                        cfg = {
                             'display': state['display'],
                             'hdmi_frame_skip': str(state['frame_skip']),
                             'lcd': state['lcd'],
                             'rotate': '180' if state['rotate'] else '0',
                             'hdmi_baud': str(state['hdmi_baud']),
-                        })
+                        }
+                        if state.get('hdmi_scale'):
+                            cfg['hdmi_scale'] = str(state['hdmi_scale'])
+                        save_config(config_path, cfg)
                         msg = "Saved to msx.ini"
                     except Exception as e:
                         msg = f"Save failed: {e}"

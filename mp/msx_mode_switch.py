@@ -57,8 +57,27 @@ def _load_rom_with_feedback(msx_module, canvas, cursor, items, rom_dir,
         try:
             import gc
             msx_module.eject_cart(0)
+            # 2026-10-05 TRIED AND REVERTED: briefly removed this
+            # gc.collect() on the theory that get_rom_load_buf() being
+            # pre-warmed + _copy_to_flash_cache()'s rewrite had made the
+            # large allocation it was defragmenting for obsolete. Real-
+            # hardware result: free memory collapsed to as little as 400
+            # bytes across repeated ROM-browser/Swap Cartridge round trips
+            # in one session (vs. tens of KB free with this call kept),
+            # and "No Signal" still happened anyway — removing the
+            # explicit, controlled collection didn't remove the risk, it
+            # just moved it to whatever uncontrolled moment MicroPython's
+            # allocator eventually triggers an implicit GC pass on its own
+            # once allocations stop fitting, now with more garbage
+            # accumulated for that pass to sweep through. Restored.
             gc.collect()  # defragment before the cart-sized read
             log_mem(f"before {title} load_cart_smart()")
+            # 2026-10-07 EXPERIMENT: the 2026-10-04 C HEAP / TEST MALLOC
+            # diagnostic calls that used to sit here were removed. They
+            # malloc()+free() a 32KB block right before the paged-cart
+            # cache malloc(), which can reshape the C heap (e.g. sbrk
+            # growth) and is absent from the last known-good commit
+            # (8b57de1). Restore them only as a last resort.
             if load_cart_smart(msx_module, 0, path):
                 return path, None
             return None, "load_cart() failed"

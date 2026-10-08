@@ -20,7 +20,7 @@
 # docstring is a retained string constant, a comment costs nothing.)
 
 from msx_menu import (MenuCanvas, C_BLACK, C_YELLOW, C_GREEN, C_WHITE,
-                      C_CYAN, C_GRAY, _echo_msg, _get_key, _wait_key_release,
+                      C_CYAN, C_GRAY, _echo_msg, _wrap_msg, _get_key, _wait_key_release,
                       HID_UP, HID_DOWN, HID_LEFT, HID_RIGHT, HID_ENTER, HID_ESC,
                       hdmi_suspend, hdmi_resume, lcd_suspend, lcd_resume,
                       select_rom, load_state_from,
@@ -54,12 +54,17 @@ def _draw_runtime_menu(canvas, cursor, msg="", items=_RUNTIME_ITEMS):
             canvas.text(label, 2, y + 1, C_WHITE)
         y += 12
 
-    if msg:
-        canvas.text(msg[:31], 2, y + 6, C_CYAN)
+    for k, line in enumerate(_wrap_msg(msg) if msg else ()):
+        canvas.text(line, 2, y + 6 + 10 * k, C_CYAN)
 
     canvas.hline(0, canvas.H - 11, canvas.W, C_GRAY)
     canvas.text("UP/DOWN  ENTER:select  ESC:resume", 2, canvas.H - 10, C_GRAY)
     canvas.flush()
+    # 2026-10-05 DIAGNOSTIC (re-added) — see main.py's identical print.
+    try:
+        print(f"DVI DIAG: {canvas._msx.dvi_debug()}")
+    except Exception:
+        pass
 
 
 def _draw_audio_settings(canvas, cursor, volume, filt, msg=""):
@@ -78,8 +83,8 @@ def _draw_audio_settings(canvas, cursor, volume, filt, msg=""):
             canvas.text(label, 2, y + 1, C_WHITE)
         y += 12
 
-    if msg:
-        canvas.text(msg[:31], 2, y + 6, C_CYAN)
+    for k, line in enumerate(_wrap_msg(msg) if msg else ()):
+        canvas.text(line, 2, y + 6 + 10 * k, C_CYAN)
 
     canvas.hline(0, canvas.H - 21, canvas.W, C_GRAY)
     canvas.text("LEFT/RIGHT:adjust  UP/DOWN:field", 2, canvas.H - 20, C_GRAY)
@@ -210,6 +215,7 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
     # diskrom_path), all possibly updated, so the caller can update its
     # own globals.
     import time
+    import sys
 
     items = list(_RUNTIME_ITEMS)
     if fdd_mode:
@@ -342,12 +348,14 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 # same reasoning as select_rom() — the interactive list
                 # itself is redrawn from RAM, no per-keypress SD access.
                 base = save_base_for_cart(disk_path if fdd_mode else cart_path, save_path)
-                import gc
-                gc.collect()  # defragment before compiling msx_save_slots.py
-                              # — real-hardware finding: this always happens
-                              # mid-gameplay, where cart/emulation state has
-                              # already fragmented the heap more than at a
-                              # fresh boot.
+                # 2026-10-01: only collect if actually about to compile —
+                # see show_emulator_menu()'s identical fix/comment in
+                # msx_menu.py (gc.collect() alone can starve pizero's DVI
+                # output; main.py's _prewarm_menu_modules() already
+                # imported this at boot there).
+                if 'msx_save_slots' not in sys.modules:
+                    import gc
+                    gc.collect()
                 import msx_save_slots
                 log_mem("after msx_save_slots import")
                 chosen = msx_save_slots.select(msx_module, base,
@@ -372,13 +380,12 @@ def show(msx_module, usb_host_mod, rom_dir, exclude_names,
                 msg = ""
 
             elif label == "Display Settings":
-                import gc
-                gc.collect()  # defragment before compiling
-                              # msx_display_settings.py — real-hardware
-                              # finding (MemoryError here): this always
-                              # happens mid-gameplay, where cart/emulation
-                              # state has already fragmented the heap more
-                              # than at a fresh boot.
+                # 2026-10-01: only collect if actually about to compile —
+                # see show_emulator_menu()'s identical fix/comment in
+                # msx_menu.py.
+                if 'msx_display_settings' not in sys.modules:
+                    import gc
+                    gc.collect()
                 import msx_display_settings  # lazy — see its own docstring
                 log_mem("after msx_display_settings import")
                 display_state = msx_display_settings.show(

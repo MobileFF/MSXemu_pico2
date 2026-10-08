@@ -78,25 +78,28 @@ if [ "${TARGET}" = "pizero" ]; then
     BOARD_DIR_ARG="BOARD_DIR=${DST_DIR}/src/msx/boards/${MP_BOARD}"
 fi
 
-# 2026-09-21: real-hardware bring-up found that this project's builds have
-# ALWAYS relied entirely on mp/boot.py's os.dupterm(uart) call to get any
-# UART REPL output at all (USB CDC and USB MSC are both compile-time
-# disabled — see USER_C_MODULES's own MICROPY_HW_USB_CDC/MSC=0 above).
-# That is a real footgun: if boot.py hangs or crashes before reaching its
-# dupterm() call for ANY reason, there is no way to see why — no output
-# at all, and (with USB CDC/MSC both off) no way to even reach the
-# filesystem to fix boot.py, since mpremote itself needs a working REPL
-# connection first. This cost a long, hard-to-diagnose bring-up session on
-# the pizero board (a hardcoded machine.freq(250_000_000) in the pico2-era
-# boot.py, run unconditionally before any board check existed — see
-# mp/boot.py's own history/comments). Forcing UART REPL on at the C level
-# for pizero removes that single point of failure: UART now always
-# responds from the moment the firmware boots, regardless of what
-# mp/boot.py does or doesn't do. pico2 is left as-is (unchanged, proven
-# workflow) since it was never the board that hit this.
-if [ "${TARGET}" = "pizero" ]; then
-    export CFLAGS_EXTRA="${CFLAGS_EXTRA:-} -DMICROPY_HW_ENABLE_UART_REPL=1"
-fi
+# 2026-09-21 TRIED AND REVERTED 2026-10-02: real-hardware bring-up found
+# this project's builds relied entirely on mp/boot.py's os.dupterm(uart)
+# call to get any UART REPL output at all (USB CDC and USB MSC were both
+# compile-time disabled at the time — see USER_C_MODULES's own
+# MICROPY_HW_USB_CDC/MSC=0). Forcing UART REPL on at the C level for
+# pizero removed that single point of failure (UART always responding
+# from boot, regardless of what mp/boot.py does or doesn't do) while that
+# was pizero's only usable REPL channel at all.
+#
+# 2026-10-02: no longer needed, and removed at the user's explicit
+# request — pizero's keyboard lives on a physically separate USB port
+# (PIO-USB) from the board's native USB controller (BOOTSEL/programming
+# port), which is now used for a native USB CDC REPL instead (see
+# micropython_msx.cmake's MICROPY_HW_USB_CDC=1 for pizero, and
+# mp/boot.py, which no longer sets up the UART dupterm for pizero either).
+# USB CDC REPL is brought up at the same C/runtime level UART REPL was
+# (before any Python boot.py code runs), so the original crash-safety
+# property this flag existed for is preserved, just through the standard
+# MicroPython mechanism instead of this board-specific one. GP0/1 are now
+# free or whatever other purpose on pizero. pico2 was never affected
+# either way (it already used UART REPL via boot.py's normal path, and
+# still does).
 
 # 2026-09-22: MSX_BOARD_PIZERO/PICO_PIO_USE_GPIO_BASE are ALSO set via
 # add_compile_definitions() inside micropython_msx.cmake's MSX_IS_PIZERO
@@ -328,6 +331,13 @@ rm -rf "${DST_DIR}/src"
 cp -r "${SRC_ORIG}" "${DST_DIR}/src"
 echo "[copy] Done."
 echo ""
+
+# 2026-09-30 TRIED AND REVERTED: this block used to populate frozen_mp/
+# for src/msx/boards/WAVESHARE_RP2350_PIZERO/manifest.py to freeze the
+# lazily-imported menu modules (fixing a real-hardware DVI "No Signal"
+# lockup) — reverted after it caused a separate, real-hardware-confirmed
+# regression (intermittent mpremote/UART connection failures). See that
+# board's mpconfigboard.cmake for the full writeup.
 
 # ── Clean previous build (forces cmake re-configure with current modules) ─────
 echo "[clean] Removing ${BUILD_DIR} …"

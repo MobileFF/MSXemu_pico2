@@ -145,12 +145,15 @@ static void cart_reset_page_state(msx_state_t *msx, uint8_t slot) {
     msx->cart_victim_next[slot] = 0;
 }
 
+#if MSX_CART_VICTIM_SLOTS > 0
 /* Swaps two MSX_CART_PAGE_SIZE regions using a small fixed-size stack
  * scratch buffer (never the full 8KB — this project has hit real
  * problems from oversized stack buffers before). Only used on a victim-
  * cache hit (see cart_page_refill()) — bank-switch writes are far rarer
  * than memory reads, so this cost is negligible next to the SD/flash
- * fetch it avoids. */
+ * fetch it avoids. Unused (and left undefined, see cart_page_refill()'s
+ * own #if) when MSX_CART_VICTIM_SLOTS==0 — there is no victim pool to
+ * swap into. */
 static void cart_swap_pages(uint8_t *a, uint8_t *b) {
     uint8_t scratch[256];
     for (uint32_t off = 0; off < MSX_CART_PAGE_SIZE; off += sizeof(scratch)) {
@@ -159,6 +162,7 @@ static void cart_swap_pages(uint8_t *a, uint8_t *b) {
         memcpy(b + off, scratch, sizeof(scratch));
     }
 }
+#endif
 
 /* Selects ROM page `rom_page` (in MSX_CART_PAGE_SIZE units) as visible
  * for one window, via the registered fetch callback if it isn't already
@@ -183,8 +187,10 @@ static void cart_page_refill(msx_state_t *msx, uint8_t slot_idx, uint8_t win,
     int32_t *page = &msx->cart_cache_page[slot_idx][win];
     if (*page == (int32_t)rom_page) return;
 
-    int32_t *victims  = msx->cart_victim_page[slot_idx];
     uint8_t *win_buf  = &msx->cart_cache[slot_idx][(uint32_t)win * MSX_CART_PAGE_SIZE];
+
+#if MSX_CART_VICTIM_SLOTS > 0
+    int32_t *victims  = msx->cart_victim_page[slot_idx];
 
     for (uint8_t v = 0; v < MSX_CART_VICTIM_SLOTS; v++) {
         if (victims[v] == (int32_t)rom_page) {
@@ -204,6 +210,21 @@ static void cart_page_refill(msx_state_t *msx, uint8_t slot_idx, uint8_t win,
     uint8_t *victim_buf = &msx->cart_cache[slot_idx][(4u + v) * MSX_CART_PAGE_SIZE];
     memcpy(victim_buf, win_buf, MSX_CART_PAGE_SIZE);
     victims[v] = *page;
+#else
+    /* 2026-10-04: no shared victim pool at all (MSX_CART_VICTIM_SLOTS==0
+     * — pizero only, see msx_core.h's comment: this board's C heap is
+     * fragmented enough in practice that even the 1-slot/40KB cache
+     * malloc() still failed on real hardware, only the exact 4-page/32KB
+     * size — no victim pages at all — fit). Every bank-switch miss just
+     * directly refetches into the window's own primary slot; there is no
+     * "this page was evicted a moment ago, maybe it's still sitting in
+     * the shared pool" fast path to check. Strictly more cart_fetch_cb()
+     * calls on bank-switch-heavy Mega ROMs than with a victim pool (see
+     * the >0 branch's own history for why that pool was added at all),
+     * but correctness-neutral: a cache miss was always handled correctly
+     * before the victim pool existed too, just slower. */
+    cart_fetch_count++;
+#endif
 
     uint32_t total_pages = msx->cart_size[slot_idx] / MSX_CART_PAGE_SIZE;
     if (total_pages == 0) total_pages = 1;
@@ -842,6 +863,17 @@ void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     msx->cart_type[slot] = MSX_MAPPER_PLAIN;
     memset(msx->cart_bank[slot], 0, sizeof(msx->cart_bank[slot]));
     cart_reset_page_state(msx, slot);
+    // 2026-10-05 TRIED AND REVERTED: briefly force-freed cart_cache[slot]
+    // here too, to test whether a real-hardware core1 (DVI) crash on
+    // paged Mega ROM loads was specific to the reuse path (vs. a fresh
+    // malloc() of the same size). Result: forcing a fresh allocation
+    // every time did NOT prevent the crash — it then hit on the FIRST
+    // paged load too (previously 100% reliable), across 3 separate fresh
+    // boots. This disproves "reuse vs fresh" as the deciding factor; the
+    // crash looks probabilistic/timing-dependent rather than tied to
+    // which code path allocates the buffer. Reverted — the reuse
+    // optimization is genuinely needed (see this function's own comment)
+    // and wasn't the cause.
 }
 
 /* -----------------------------------------------------------------------
@@ -1153,6 +1185,21 @@ static inline void _spi_dma_wait(spi_inst_t *spi) {
  * sets it unconditionally — see its own comment), so this is safe.
  * ----------------------------------------------------------------------- */
 void msx_wait_display(msx_state_t *msx) {
+    // 2026-09-30 real-hardware finding: disp_dvi.c also sets
+    // display_ready=true ("reused as the generic 'a display backend is
+    // up' flag" — see its own comment), which broke the invariant this
+    // function's 2026-09-06 comment above documents as making it safe
+    // ("msx->spi_inst is guaranteed non-NULL whenever [this guard passes]").
+    // DVI never sets spi_inst (it doesn't use SPI at all — PIO/DMA only),
+    // so with display_ready=true from DVI, this fell through to
+    // _spi_dma_wait(NULL) -> spi_is_busy(NULL) -> a NULL-pointer hardware-
+    // register dereference: a silent hard fault (no Python exception, no
+    // further output) — reproduced as a 100%-repeatable freeze the moment
+    // GUI+F7 called this for the first time in a DVI session (every
+    // earlier call site in the boot path happened to never reach this
+    // function on DVI before). Check spi_inst directly rather than trust
+    // the ready flags alone — it's the actual resource being accessed.
+    if (msx->spi_inst == NULL) return;
     if (!msx->display_ready && !msx->hdmi_ready) return;
     _spi_dma_wait((spi_inst_t *)msx->spi_inst);
 }
@@ -1364,7 +1411,9 @@ void msx_render_to_display_1to1(msx_state_t *msx) {
  * own comment on PKT_CLEAR_SCREEN explains why this was split out as its
  * own packet type instead of reusing PKT_FRAME/PKT_TEXT_CMDS). */
 #define HDMI_PKT_CLEAR_SCREEN 0x04u
-#define HDMI_SCALE       1u /* receiver upscale factor: MSX's 256x192 already fills most of a 640x480 screen unscaled */
+static inline uint8_t hdmi_scale_of(const msx_state_t *msx) {
+    return msx->hdmi_scale ? msx->hdmi_scale : (uint8_t)HDMI_SCALE_DEFAULT;
+}
 
 static inline void hdmi_apply_spi_settings(msx_state_t *msx, spi_inst_t *spi) {
     /* Same bus as the LCD/SD (shared MOSI/SCK), switching between this
@@ -1626,7 +1675,7 @@ void msx_render_to_hdmi(msx_state_t *msx) {
         (uint8_t)HDMI_PKT_FRAME, 4 /* bpp */,
         (uint8_t)(MSX_SCREEN_W >> 8), (uint8_t)(MSX_SCREEN_W & 0xFF),
         (uint8_t)(MSX_SCREEN_H >> 8), (uint8_t)(MSX_SCREEN_H & 0xFF),
-        (uint8_t)HDMI_SCALE, 0 /* reserved */
+        hdmi_scale_of(msx), 0 /* reserved */
     };
 
     /* Build the whole frame first (fast, no bus access) ... */
@@ -1719,7 +1768,7 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) {
         (uint8_t)HDMI_PKT_FRAME, 8 /* bpp */,
         (uint8_t)(MSX_SCREEN_W >> 8), (uint8_t)(MSX_SCREEN_W & 0xFF),
         (uint8_t)(MSX_SCREEN_H >> 8), (uint8_t)(MSX_SCREEN_H & 0xFF),
-        (uint8_t)HDMI_SCALE, 0 /* reserved */
+        hdmi_scale_of(msx), 0 /* reserved */
     };
     gpio_put(msx->hdmi_cs_pin, 0);
     spi_write_blocking(spi, header, sizeof(header));
@@ -1798,6 +1847,12 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx) { (void)msx; }
 void msx_clear_hdmi(msx_state_t *msx) { (void)msx; }
 
 #endif /* HAVE_PICO_SDK */
+
+void msx_set_hdmi_scale(msx_state_t *msx, uint8_t scale) {
+    if (scale < 1) scale = 1;
+    if (scale > HDMI_SCALE_MAX) scale = HDMI_SCALE_MAX;
+    msx->hdmi_scale = scale;
+}
 
 /* -----------------------------------------------------------------------
  * Debug helpers

@@ -283,17 +283,25 @@ class SDCard:
             assert nblocks and not len(buf) % 512, "Buffer length is invalid"
             if nblocks == 1:
                 # CMD17: set read address for single block
-                if self.cmd(17, block_num * self.cdv, 0, release=False) != 0:
+                r = self.cmd(17, block_num * self.cdv, 0, release=False)
+                if r != 0:
                     # release the card
                     self.cs(1)
+                    # 2026-09-30 DIAGNOSTIC: print exactly which command/
+                    # response caused the EIO — see sdcard.py's readblocks()
+                    # comment; a plain "raise OSError(5)" here gives no way
+                    # to tell CMD17 vs CMD18 vs CMD12 apart from the caller.
+                    print(f"SD DIAG: CMD17 failed, block={block_num} r1={hex(r)}")
                     raise OSError(5)  # EIO
                 # receive the data and release card
                 self.readinto(buf)
             else:
                 # CMD18: set read address for multiple blocks
-                if self.cmd(18, block_num * self.cdv, 0, release=False) != 0:
+                r = self.cmd(18, block_num * self.cdv, 0, release=False)
+                if r != 0:
                     # release the card
                     self.cs(1)
+                    print(f"SD DIAG: CMD18 failed, block={block_num} r1={hex(r)}")
                     raise OSError(5)  # EIO
                 offset = 0
                 mv = memoryview(buf)
@@ -302,8 +310,25 @@ class SDCard:
                     self.readinto(mv[offset : offset + 512])
                     offset += 512
                     nblocks -= 1
-                if self.cmd(12, 0, 0xFF, skip1=True) != 0:
+                r = self.cmd(12, 0, 0xFF, release=False, skip1=True)
+                if r != 0:
+                    self.cs(1)
+                    print(f"SD DIAG: CMD12 failed, block={block_num} r1={hex(r)}")
                     raise OSError(5)  # EIO
+                # 2026-09-30 real-hardware finding: unlike write()/
+                # write_token() above (which already wait for the card's
+                # busy signal to clear after CMD24/25), this CMD12 stop-
+                # transmission path used to release CS immediately after
+                # getting the R1 response, with no wait for the card to
+                # finish its internal post-stop cleanup. Reproduced as a
+                # 100%-repeatable OSError([Errno 5] EIO) on the very next
+                # SD command (a different file's CMD17/18) — the retry
+                # loop in readblocks() never helped, because this isn't a
+                # transient bus glitch, it's the card still being busy.
+                while self.spi.read(1, 0xFF)[0] == 0x00:
+                    pass
+                self.cs(1)
+                self.spi.write(b"\xff")
         finally:
             self.spi.init(baudrate=self.restore_baudrate, polarity=0, phase=0)
 

@@ -126,19 +126,41 @@
  * fetch-target locality guarantee for ASCII8/KONAMI).
  * ----------------------------------------------------------------------- */
 #define MSX_CART_PAGE_SIZE     0x2000u  /* 8KB cache granularity (4 windows/slot) */
-#define MSX_CART_VICTIM_SLOTS  2        /* shared "recently evicted page" pool,
-                                          * across all 4 windows — see
-                                          * cart_page_refill(). Bumped 1->2
-                                          * (2026-09-20, real-hardware "still
-                                          * a bit slower than before" report)
-                                          * so two windows thrashing at once
-                                          * don't contend for the same single
-                                          * victim slot; costs +8KB more (see
-                                          * MICROPY_C_HEAP_SIZE in
-                                          * bldfrm_msx.sh) — raise further only
-                                          * if profiling shows 2 still isn't
-                                          * enough, each +1 here is another
-                                          * +8KB/paged-slot. */
+/* 2026-10-04 real-hardware finding (pizero): with VICTIM_SLOTS=2,
+ * cart_cache[]'s malloc() is (4+2)*8KB = 48KB — reproducibly failed on
+ * real pizero hardware (msx.test_malloc() on the exact requested size
+ * returns False) when switching from a small in-RAM cart to a Mega ROM
+ * via Swap Cartridge, specifically because msx_eject_cart() had just
+ * free()'d the previous cart's 32KB cart[] buffer (MSX_CART_INRAM_MAX) a
+ * moment earlier — classic external fragmentation (same underlying class
+ * of problem as the GC heap's non-compacting allocator, just in the C
+ * heap this time): a single 32KB free chunk plus ~8KB scattered
+ * elsewhere (c_heap_info() showed fordblks=40712, arena=69224/69228,
+ * ceiling=81920) is not one contiguous 48KB block. Tried 1 slot (40KB)
+ * next on the theory that *some* reduction would fit — still failed
+ * (msx.test_malloc(40960) also False), confirming the single largest
+ * contiguous free chunk really is that ~32KB hole and nothing bigger:
+ * 40KB doesn't fit a 32KB hole any more than 48KB did. 0 — no victim
+ * pool at all, cache is exactly 4 pages/32KB, matching that hole's size
+ * — needed cart_page_refill() in msx_core.c restructured first (the
+ * victim-eviction code assumed >=1 slot and divides by
+ * MSX_CART_VICTIM_SLOTS; see that function's #if MSX_CART_VICTIM_SLOTS >
+ * 0 / #else split). Trades Mega ROM bank-switch cache-hit rate entirely
+ * away for this (every miss re-fetches, no "recently evicted" fast path).
+ *
+ * 2026-10-08 real-hardware finding (pico2): the exact same failure mode
+ * reproduces on pico2 too — originally assumed pizero-only ("no DVI/
+ * PIO-USB static RAM pressure" on pico2), but that reasoning was wrong:
+ * the trigger isn't DVI/PIO-USB RAM pressure, it's simply "a small
+ * in-RAM cart's 32KB cart[] was free()'d immediately before the 48KB
+ * cart_cache request" — msx_eject_cart() does that on every board. A
+ * fresh boot straight into a Mega ROM (cart= pointing at it directly,
+ * no prior small cart) works fine on pico2 even with VICTIM_SLOTS=2,
+ * since there's no 32KB hole yet to fragment things — it's specifically
+ * Swap Cartridge from a small ROM to a Mega ROM that fails. Since that's
+ * a normal, expected use of Swap Cartridge, both boards now use the same
+ * value. */
+#define MSX_CART_VICTIM_SLOTS  0
 
 /* byte_offset/dest are always MSX_CART_PAGE_SIZE-aligned/sized. Return
  * true on success (dest fully filled); false leaves dest untouched
@@ -313,6 +335,10 @@ typedef struct {
     uint8_t  hdmi_cs_pin;
     uint32_t hdmi_baudrate;
     bool     hdmi_ready;
+    /* Receiver upscale factor sent in every PKT_FRAME header (set by
+     * msx_set_hdmi_scale(); msx.ini: hdmi_scale=). 0 (msx_init()'s
+     * memset) is treated as 1. */
+    uint8_t  hdmi_scale;
 
     /* Joystick (PSG I/O Port A/B, register 14/15): joy_state[0]=JOY1,
      * [1]=JOY2, active-low bitmask (bit0 Up,1 Down,2 Left,3 Right,
@@ -628,6 +654,16 @@ void msx_render_to_hdmi_raw332(msx_state_t *msx);
  * before this emulator's own first real frame is sent. No-op if
  * msx_init_hdmi_output() was never called. */
 void msx_clear_hdmi(msx_state_t *msx);
+
+/* Sets the receiver-side integer upscale factor carried in each PKT_FRAME
+ * header (game and menu frames alike). Clamped to 1..HDMI_SCALE_MAX (the
+ * receiver's own MAX_SCALE); the receiver further steps it down until the
+ * scaled frame fits its 640x480 output, so for MSX's 256x192 anything
+ * above 2 behaves as 2. No SPI traffic — takes effect from the next frame
+ * sent. Safe to call before msx_init_hdmi_output(). */
+#define HDMI_SCALE_DEFAULT 1u /* receiver upscale factor when msx.ini has no hdmi_scale= */
+#define HDMI_SCALE_MAX     4u /* matches the receiver's MAX_SCALE */
+void msx_set_hdmi_scale(msx_state_t *msx, uint8_t scale);
 
 /* Set a keyboard matrix row value (active-low: 0 = key pressed).
  * row: 0–10, col_mask: bit per column (bit 0 = col 0). */
