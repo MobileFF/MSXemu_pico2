@@ -83,11 +83,11 @@ All notable changes to this project are documented in this file. Japanese versio
 
 ### Removed (2026-09-08)
 
-- **The standalone F5 (quick save) / F8 (quick load) hotkeys**: pressing them also forwarded an ordinary F5/F8 keypress to the running MSX software afterward (`apply_hid_report()` has no way to know the key had already been "consumed" for save/load), which could interfere with any MSX software that itself uses F5/F8 for something. Save/Load State remain available from the runtime menu (GUI+F7) — GUI+F7 itself is never forwarded to the MSX matrix, so it doesn't have this problem. `HID_F5`/`HID_F8` removed from `msx_keymap.py`'s special-handling exports (F5/F8 still work as ordinary MSX keys via `HID_TO_MSX`, unaffected); `main.py`'s `save_state()`/`load_state()` functions removed along with their call sites, having no other callers. Documented in `doc/usage_guide.md`/`_en.md` and `doc/ext_hooks_guide.md`/`_en.md`, updated accordingly (the latter two also gained the GUI+P/GUI+ESC rows they'd been missing).
+- **The standalone F5 (quick save) / F8 (quick load) hotkeys**: pressing them also forwarded an ordinary F5/F8 keypress to the running MSX software afterward (`apply_hid_report()` has no way to know the key had already been "consumed" for save/load), which could interfere with any MSX software that itself uses F5/F8 for something. Save/Load State remain available from the runtime menu (GUI+F7) — GUI+F7 itself is never forwarded to the MSX matrix, so it doesn't have this problem. `HID_F5`/`HID_F8` removed from `msx_keymap.py`'s special-handling exports (F5/F8 still work as ordinary MSX keys via `HID_TO_MSX`, unaffected); `main.py`'s `save_state()`/`load_state()` functions removed along with their call sites, having no other callers. Documented in `doc/usage_guide.md`/`_en.md` and `doc/config_and_menu_guide.md`/`_en.md`, updated accordingly (the latter two also gained the GUI+P/GUI+ESC rows they'd been missing).
 
 ### Documentation (2026-09-08)
 
-- **User-facing docs brought back in sync with the config/menu changes from this whole week**: `README.md`/`_en.md`, `doc/usage_guide.md`/`_en.md`, `doc/ext_hooks_guide.md`/`_en.md`, and `doc/dev_guide.md`/`_en.md` still referred to `config.txt` (renamed `msx.ini`, moved to the SD root, days ago), a single `save.bin` (superseded by per-cartridge rotating save slots), and were both missing the "Display Settings" menu item and its full `msx.ini` key reference (`display`/`hdmi_frame_skip`/`hdmi_baud`) entirely. `ext_hooks_guide.md`/`_en.md`'s "Complete Reference" section — the single authoritative config-key listing — got the most substantial rewrite: added the three HDMI-related keys, restart-only annotations, a Display Settings sub-screen walkthrough (mirroring the existing Audio Settings one), and an explicit note on the removed `hdmi`/`boot_exclusive` keys and `display=both` value.
+- **User-facing docs brought back in sync with the config/menu changes from this whole week**: `README.md`/`_en.md`, `doc/usage_guide.md`/`_en.md`, `doc/config_and_menu_guide.md`/`_en.md`, and `doc/dev_guide.md`/`_en.md` still referred to `config.txt` (renamed `msx.ini`, moved to the SD root, days ago), a single `save.bin` (superseded by per-cartridge rotating save slots), and were both missing the "Display Settings" menu item and its full `msx.ini` key reference (`display`/`hdmi_frame_skip`/`hdmi_baud`) entirely. `config_and_menu_guide.md`/`_en.md`'s "Complete Reference" section — the single authoritative config-key listing — got the most substantial rewrite: added the three HDMI-related keys, restart-only annotations, a Display Settings sub-screen walkthrough (mirroring the existing Audio Settings one), and an explicit note on the removed `hdmi`/`boot_exclusive` keys and `display=both` value.
 
 ### Changed/Added (2026-09-08, real-hardware confirmed)
 
@@ -98,3 +98,55 @@ All notable changes to this project are documented in this file. Japanese versio
 ### Added (2026-09-11, real-hardware confirmed)
 
 - **Lightweight preventive HDMI re-assert on every runtime-menu exit** (`display=hdmi` only): after the menu closes, `main.py` now calls `msx.init_hdmi_output()` once — which re-applies the HDMI SPI settings and re-sends the fixed 16-colour palette, nothing else (no receiver reset pulse, no `clear_hdmi()`), so it's invisible (~24 bytes blocking, microseconds; no black flash). Counters a plausible receiver-side palette/SPI-mode drift left behind by the menu's RAW332 draws and `hdmi_suspend()`/`lcd_suspend()` cycling — the suspected cause of long-session "HDMI goes black" reports. LCD is deliberately not re-inited on this path (it's reliable, and `init_display_hardware()`'s panel SWRESET *would* flash). The full HDMI reinit with the receiver reset pulse is still available on demand via GUI+ESC / Display Settings' "Reinit ... now". Pure MicroPython change, no firmware rebuild needed.
+
+### Fixed/Added (2026-09-19)
+
+- **JP keyboard matrix rows 1/2 corrected**: this project always boots `MSX_jp.rom`, but the matrix had drifted from the real Japanese MSX layout in two places — row 1 had `@`/`¥`'s bits swapped with `[`'s (a user report that `@` couldn't be typed at all), and row 2 had `M` inserted at bit 0 (displacing the real `*` there) and comma/period/slash each shifted one bit off (a report that `M` produced `*` and `.` produced `,`). Both corrected and cross-checked against two independent JP matrix references; see `msx_keymap.py`'s row 1/2 comments.
+- **Ctrl+Alt+Delete hotkey** (`HID_DELETE`, hard-exits `main.py` back to the REPL): added after a real-hardware lockout where Ctrl+C over mpremote's serial connection didn't interrupt a stuck `main.py` — gives a keyboard-only escape hatch independent of the PC side.
+
+### Added (2026-09-19)
+
+- **Virtual FDD (floppy disk drive) support**: a WD179x/WD2793-compatible FDC emulation (`src/msx/wd179x.c`/`.h`) intercepted at a configurable Z80 address (`fdc_base=`, default `0x7FB8`), driven by a new `mode=disk` config mode (mutually exclusive with `cart=`) backed by a `diskrom=` (required) and `disk=` (a `.DSK` image, 360KB/720KB, single drive). `mp/msx_fdd.py` adds a DSKCHG hook so MSX-DOS/Disk BASIC notices a hot-swapped disk on its own, no reset needed — the runtime menu shows "Swap Disk" in place of "Swap Cartridge" under this mode. `tools/dsk_manager.py`: a standalone PC-side tool for creating/inspecting `.DSK` images. Real-hardware confirmed: Disk BASIC SAVE/LOAD and a full MSX-DOS boot (MSXDOS.SYS/COMMAND.COM load, both disk sides).
+- **Fixed a real-hardware MSX-DOS boot hang** found during the above bring-up: FDC register interception compared the *absolute* Z80 address, but MSXDOS.SYS itself remaps the Disk ROM from page 1 to page 2 (`0x7FB8` → `0xBFB8`) before accessing the FDC — the stale absolute-address check then read static ROM bytes instead of the emulated FDC, so the BUSY-bit wait loop span forever (screen stuck blue, unresponsive). Fixed by comparing the in-page offset instead.
+
+### Added (2026-09-29, real-hardware confirmed)
+
+- **Waveshare RP2350-PiZero board support** (onboard DVI output + PIO-USB keyboard host) — a second, experimental build target alongside the Pico 2 (`bldfrm_msx.sh pizero`; `src/msx/boards/WAVESHARE_RP2350_PIZERO/`, not part of the stock MicroPython board list). DVI (`src/msx/display/disp_dvi.c` + vendored libdvi): encodes TMDS directly from `msx->framebuf` on core1 (no separate scanout buffer), with `DVI_N_TMDS_BUFFERS` pre-fill, a dedicated DMA IRQ/spinlock, and `multicore_lockout_victim_init()` — all real-hardware bring-up findings. PIO-USB keyboard host: vendors sekigon-gonnoc/Pico-PIO-USB (MIT, tag 0.7.2) on a dedicated PIO block, driving its own 1ms tick via `hardware_alarm_*` directly (bypassing `alarm_pool`'s shared striped spinlock, which caused real hard-asserts). The pico2-only HDMI bridge feature (~24KB) is excluded from pizero builds to make room. Real-hardware confirmed: MSX BASIC over DVI, USB keyboard input. **Experimental** — see `doc/usage_guide.md`'s Mega ROM section for a known limitation.
+
+### Changed (2026-09-29)
+
+- **Subroutine hook mechanism extended from CALL/RST-only to JP/JR/generic trap**: hook interception now also covers immediate `JP nn`/conditional `JP`, `JR e`/conditional `JR`/`DJNZ`, and a generic per-instruction fetch-time trap in `z80_step()` (covers indirect jumps, `RET` landings, fall-through, etc.) — four interception paths total, following the design already used for the sibling PB-1000 emulator's HD61700 CALL hooks. See `doc/extension_api.md`/`_en.md` and `doc/config_and_menu_guide.md`/`_en.md` for the updated API; `mp/ext/` gained `dht20.py`/`sample.py` as worked examples.
+
+### Documentation (2026-09-29)
+
+- **Mega ROM cache's shared victim pool** (`MSX_CART_VICTIM_SLOTS`, already implemented in `msx_core.c`/`.h`): wrote up the root cause of the original 0%-cache-hit-rate bug (bank-switch ping-pong — each window could only hold one page), the rejected fix (a dedicated 2nd page per window, +32KB, which fragmented the GC heap enough to cause boot-time `MemoryError`s), and the adopted shared-pool design (2 victim slots, +16KB) along with the `cart_cache[]` reuse pitfalls hit along the way.
+- **PWM audio external buffer circuit**: documented an optional add-on circuit (3-stage RC low-pass + unity-gain op-amp buffer) for driving a standard 3.5mm headphone/line input from the GP14 PWM output, lowering its output impedance without any firmware change.
+
+### Fixed (2026-09-29)
+
+- **Virtual FDD: `mode=disk` boot with no disk image specified left the FDC entirely disabled** (`path=None` skipped `msx.fdc_mount()` outright, unlike real WD179x hardware, which still responds to register reads even with no media inserted) — the Disk ROM's drive-detection routine then busy-waited forever against static ROM bytes instead of falling through to Disk BASIC. Fixed to enable the FDC (with no backing file) even when `path=None`.
+
+### Added (2026-09-29)
+
+- **Runtime menu: "Switch to Cart Mode" / "Switch to Disk Mode"**, for moving between `cart=` and `mode=disk` sessions without manually editing `msx.ini`: pick a ROM/Disk ROM, confirm, and the menu rewrites the relevant `msx.ini` keys and does a full `machine.reset()` — a clean restart loads from an unfragmented heap, rather than attempting a live eject+load across modes. Cartridge/disk load logic (Swap Cartridge plus the two new items) was split out of `msx_runtime_menu.py` into a new `msx_mode_switch.py`, lazily imported only when one of these items is actually selected — `msx_runtime_menu.py` alone had grown large enough to risk a real-hardware `MemoryError` on its first GUI+F7 compile.
+
+### Fixed (2026-10-08, real-hardware confirmed)
+
+- **PiZero: GUI+F7 runtime menu froze the whole board** the first time it was opened in a DVI session: `msx_wait_display()`'s existing guard assumed `display_ready == true` implied a non-NULL `msx->spi_inst` (true for LCD/HDMI, the only backends that existed when that invariant was written) — DVI also sets `display_ready = true` (reused as a generic "a display backend is up" flag) but never sets `spi_inst` at all (PIO/DMA only, no SPI), so the call fell through to a NULL-pointer hardware-register dereference. Fixed by checking `spi_inst` directly.
+- **pico2: Swap Cartridge to a Mega ROM could fail** two different ways, both only once gameplay (not a fresh boot) had already fragmented the heap:
+  - a GC-heap `MemoryError` allocating the 4KB mapper-detection scratch buffer, from `msx_runtime_menu`/`msx_rom_browser`'s lazy-import compiles fragmenting the GC heap — fixed by keeping that buffer on the (non-fragmenting) C heap via `msx.get_scratch_view()` instead of a GC-heap `bytearray`;
+  - a C-heap `cart_cache` allocation failure (48KB, `MSX_CART_VICTIM_SLOTS=2`) right after freeing a small in-RAM cart's 32KB block — classic external fragmentation. This had been assumed pizero-only (see the 2026-09-29 Mega ROM cache entry above); real-hardware testing during this investigation showed it reproduces identically on pico2 — so pico2 now also uses `MSX_CART_VICTIM_SLOTS=0` (32KB cache, no victim pool), trading some bank-switch cache-hit rate for reliability on both boards.
+
+  Loading a Mega ROM directly at boot (`cart=` pointing at it, no prior small cart) was unaffected by either bug even before this fix — only the Swap-Cartridge-from-a-small-cart path was broken.
+
+### Added (2026-10-08)
+
+- **Status messages in the runtime menu/Display Settings screens now wrap to two lines** (`_wrap_msg()`, `msx_menu.py`) instead of being hard-truncated at 31 characters — e.g. the PiZero Mega ROM refusal message was previously cut off mid-word.
+
+### Fixed (2026-10-08)
+
+- **`hdmi_scale` was missing from `config_and_menu_guide.md`/`_en.md`'s `msx.ini` reference table**, despite being a real, live-adjustable config key already read by `main.py`/`board_config.py`.
+
+### Documentation (2026-10-08)
+
+- **Renamed `doc/ext_hooks_guide.md`/`_en.md` → `doc/config_and_menu_guide.md`/`_en.md`**: despite its own heading always having been "Runtime Menu, Hotkey, and Config Key Reference" (and the file holding no actual code-hook content — see its own opening note, which explicitly disclaims having a PB-1000-style subroutine-hook mechanism), the filename itself was inherited from the sibling PB-1000 emulator's docs, where "ext hooks" genuinely means a programmatic subroutine-hook API. This project separately has its own real subroutine-hook mechanism too (`doc/extension_api.md`/`dev_guide.md`), so the old filename collided with a different, unrelated concept and made the `msx.ini`/menu reference hard to find by name. All cross-references (`README.md`/`_en.md`, `doc/usage_guide.md`/`_en.md`, `doc/extension_api.md`/`_en.md`) updated accordingly.

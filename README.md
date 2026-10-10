@@ -43,7 +43,7 @@ Z80 CPU・TMS9918A VDP・AY-3-8910 PSGを搭載した MSX1 をエミュレート
 - [Development Guide](doc/dev_guide.md) - コード構造、内部 API、デバッグのヒント
 - [Architecture](doc/architecture.md) - エミュレータ内部設計の全体像
 - [Extension API](doc/extension_api.md) - `msx` Cモジュールの公開API一覧
-- [Extension Hooks Guide](doc/ext_hooks_guide.md) - 実行時メニュー等の拡張ポイント解説
+- [設定・実行時メニュー リファレンス](doc/config_and_menu_guide.md) - `msx.ini`設定キー・実行時メニュー・ホットキーの詳細リファレンス
 - [Memory Map](doc/memory_map.md) - セーブステートのバイナリレイアウト
 - [Memory Usage](doc/memory_usage.md) - ヒープメモリ使用量の内訳
 

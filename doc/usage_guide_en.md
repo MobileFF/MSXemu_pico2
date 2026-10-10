@@ -34,7 +34,7 @@ audio_filter=0
 display=lcd
 ```
 
-Every key is optional. See "Complete `msx.ini` Reference" in `ext_hooks_guide_en.md` for defaults and details on each key. Omitting `cart` shows a menu at boot to pick a ROM from the SD card (subfolders included).
+Every key is optional. See "Complete `msx.ini` Reference" in `config_and_menu_guide_en.md` for defaults and details on each key. Omitting `cart` shows a menu at boot to pick a ROM from the SD card (subfolders included).
 
 ---
 
@@ -69,7 +69,7 @@ The USB keyboard's HID reports are mapped directly onto MSX's keyboard matrix. T
 | GUI (Win/Cmd) + P | Toggles the LCD/HDMI display live, without opening a menu |
 | GUI (Win/Cmd) + ESC | Reinitializes the currently active display (LCD/HDMI) in place, without opening a menu — recovers from "No Signal" during long `display=hdmi` sessions |
 
-See `ext_hooks_guide_en.md` for details.
+See `config_and_menu_guide_en.md` for details.
 
 ---
 
@@ -90,7 +90,7 @@ Pressing **GUI + F7** during gameplay opens a menu with:
 - **Reset MSX** — resets the Z80
 - **Resume** — returns to gameplay
 
-See `ext_hooks_guide_en.md` for exactly what each item does.
+See `config_and_menu_guide_en.md` for exactly what each item does.
 
 ---
 
@@ -98,7 +98,7 @@ See `ext_hooks_guide_en.md` for exactly what each item does.
 
 Bank-switched cartridges of 128KB or more (some Konami titles like Gradius/Nemesis, and other ASCII-8/ASCII-16-mapper titles) can be played just like any other ROM: place them in `/sd/msx/` and select via `cart=` or the menu.
 
-The first time you select one, it takes a few seconds to copy to the Pico 2's onboard flash (shown as "Loading…" on screen). After that, it loads quickly from that cache and plays at a speed comparable to a regular cartridge. See `ext_hooks_guide_en.md` and `architecture_en.md` for the technical details.
+The first time you select one, it takes a few seconds to copy to the Pico 2's onboard flash (shown as "Loading…" on screen). After that, it loads quickly from that cache and plays at a speed comparable to a regular cartridge. See `config_and_menu_guide_en.md` and `architecture_en.md` for the technical details.
 
 > Supported mappers are ASCII-8 / ASCII-16 / KONAMI (no SCC). KONAMI SCC cartridges (with the extra sound chip) are not currently supported on the audio side.
 
@@ -129,5 +129,5 @@ Using the runtime menu's (GUI+F7) `Save State` / `Load State`, you can save/rest
 
 - `hardware_guide_en.md` — wiring and parts
 - `build_guide_en.md` — build and flash instructions
-- `ext_hooks_guide_en.md` — detailed reference for the runtime menu, hotkeys, and `msx.ini`
+- `config_and_menu_guide_en.md` — detailed reference for the runtime menu, hotkeys, and `msx.ini`
 - `architecture_en.md` / `memory_map_en.md` / `extension_api_en.md` / `dev_guide_en.md` — developer-facing technical docs

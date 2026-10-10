@@ -43,7 +43,7 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - [Development Guide](doc/dev_guide_en.md) - Code structure, internal APIs, and debugging tips.
 - [Architecture](doc/architecture_en.md) - Overview of the emulator's internal design.
 - [Extension API](doc/extension_api_en.md) - Reference for the `msx` C module's public API.
-- [Extension Hooks Guide](doc/ext_hooks_guide_en.md) - Runtime menu and other extension points.
+- [Config & Runtime Menu Reference](doc/config_and_menu_guide_en.md) - Detailed reference for `msx.ini` config keys, the runtime menu, and hotkeys.
 - [Memory Map](doc/memory_map_en.md) - Save-state binary layout.
 
 *(Japanese documentation is available in files without the `_en` suffix)*

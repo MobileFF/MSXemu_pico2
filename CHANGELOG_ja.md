@@ -83,11 +83,11 @@
 
 ### 削除(2026-09-08)
 
-- **単体のF5(クイックセーブ)/F8(クイックロード)ホットキー**: これらを押すと、セーブ/ロード処理の後に通常のF5/F8キー入力もそのままMSX本体に転送されてしまっていた(`apply_hid_report()`には、そのキーが既にセーブ/ロード用に「消費」済みかどうかを知る手段がないため)。これはF5/F8を自身の機能に使うMSXソフトと衝突しうる。セーブ/ロードは引き続き実行時メニュー(GUI+F7)の`Save State`/`Load State`から利用可能 — GUI+F7自体はMSXキーマトリクスへ転送されることが一切ないため、この問題は起こらない。`msx_keymap.py`の特別扱い用エクスポートから`HID_F5`/`HID_F8`を削除(F5/F8は`HID_TO_MSX`経由の通常のMSXキーとしては引き続き動作し、影響なし)。`main.py`の`save_state()`/`load_state()`関数は、他に呼び出し元がなくなったため呼び出し箇所ごと削除。`doc/usage_guide.md`/`_en.md`、`doc/ext_hooks_guide.md`/`_en.md`のドキュメントも合わせて更新(後者2つは元々抜けていたGUI+P/GUI+ESCの行も追加)。
+- **単体のF5(クイックセーブ)/F8(クイックロード)ホットキー**: これらを押すと、セーブ/ロード処理の後に通常のF5/F8キー入力もそのままMSX本体に転送されてしまっていた(`apply_hid_report()`には、そのキーが既にセーブ/ロード用に「消費」済みかどうかを知る手段がないため)。これはF5/F8を自身の機能に使うMSXソフトと衝突しうる。セーブ/ロードは引き続き実行時メニュー(GUI+F7)の`Save State`/`Load State`から利用可能 — GUI+F7自体はMSXキーマトリクスへ転送されることが一切ないため、この問題は起こらない。`msx_keymap.py`の特別扱い用エクスポートから`HID_F5`/`HID_F8`を削除(F5/F8は`HID_TO_MSX`経由の通常のMSXキーとしては引き続き動作し、影響なし)。`main.py`の`save_state()`/`load_state()`関数は、他に呼び出し元がなくなったため呼び出し箇所ごと削除。`doc/usage_guide.md`/`_en.md`、`doc/config_and_menu_guide.md`/`_en.md`のドキュメントも合わせて更新(後者2つは元々抜けていたGUI+P/GUI+ESCの行も追加)。
 
 ### ドキュメント(2026-09-08)
 
-- **今週一連の設定・メニュー変更に、ユーザー向けドキュメントを追従させた**: `README.md`/`_en.md`、`doc/usage_guide.md`/`_en.md`、`doc/ext_hooks_guide.md`/`_en.md`、`doc/dev_guide.md`/`_en.md`が、数日前に`msx.ini`へ改名・SDルートへ移動したはずの`config.txt`のままだったり、カートリッジごとのローテーション式セーブに置き換わったはずの単一`save.bin`のままだったり、そもそも「Display Settings」メニュー項目とその`msx.ini`キー一式(`display`/`hdmi_frame_skip`/`hdmi_baud`)がまるごと記載漏れになっていたりした。特に`ext_hooks_guide.md`/`_en.md`の「完全リファレンス」節(設定キーの唯一の正式な一覧)は大幅に書き直し、HDMI関連3キーの追加、再起動要否の注記、Display Settingsサブ画面の解説(既存のAudio Settings解説と同じ形式)、廃止済みの`hdmi`/`boot_exclusive`キーと`display=both`値についての明記を行った。
+- **今週一連の設定・メニュー変更に、ユーザー向けドキュメントを追従させた**: `README.md`/`_en.md`、`doc/usage_guide.md`/`_en.md`、`doc/config_and_menu_guide.md`/`_en.md`、`doc/dev_guide.md`/`_en.md`が、数日前に`msx.ini`へ改名・SDルートへ移動したはずの`config.txt`のままだったり、カートリッジごとのローテーション式セーブに置き換わったはずの単一`save.bin`のままだったり、そもそも「Display Settings」メニュー項目とその`msx.ini`キー一式(`display`/`hdmi_frame_skip`/`hdmi_baud`)がまるごと記載漏れになっていたりした。特に`config_and_menu_guide.md`/`_en.md`の「完全リファレンス」節(設定キーの唯一の正式な一覧)は大幅に書き直し、HDMI関連3キーの追加、再起動要否の注記、Display Settingsサブ画面の解説(既存のAudio Settings解説と同じ形式)、廃止済みの`hdmi`/`boot_exclusive`キーと`display=both`値についての明記を行った。
 
 ### 変更・追加(2026-09-08、実機確認済み)
 
@@ -98,3 +98,55 @@
 ### 追加(2026-09-11、実機確認済み)
 
 - **ランタイムメニュー終了時の軽量なHDMI状態再適用**(`display=hdmi`のときのみ): メニューを閉じた後、`main.py`が`msx.init_hdmi_output()`を1回呼ぶようにした — これはHDMI用SPI設定の再適用と16色固定パレットの再送信だけを行い(受信側リセットパルスも`clear_hdmi()`もなし)、画面のちらつきは一切なし(約24バイトのブロッキング送信、数マイクロ秒)。メニューのRAW332描画や`hdmi_suspend()`/`lcd_suspend()`のサイクリングが受信側のパレット/SPIモード状態にずれを残す可能性(長時間セッションでの「HDMIが黒画面になる」報告の推定原因)への予防措置。LCD側はこの経路では再初期化しない(信頼性が高く、`init_display_hardware()`のパネルSWRESETのほうが目立つため)。受信側リセットパルス込みのフル再初期化は従来通りGUI+ESC / Display Settingsの「Reinit ... now」で実行可能。純粋なMicroPython側の変更のため、ファームウェアの再ビルドは不要。
+
+### 修正/追加(2026-09-19)
+
+- **日本語キーボードマトリクスの行1・行2を修正**: 本プロジェクトは常に`MSX_jp.rom`で起動するが、マトリクスが実機の日本語MSX配列から2箇所ずれていた — 行1は`@`/`¥`のビットが`[`と入れ替わっていた(「@が一切入力できない」という実機報告)。行2は`M`がbit0に紛れ込んで本来の`*`を押しのけ、カンマ/ピリオド/スラッシュがそれぞれ1ビットずつずれていた(「Mを押すと`*`、`.`を押すと`,`になる」という実機報告)。独立した2つの日本語マトリクス資料と突き合わせて修正済み。詳細は`msx_keymap.py`の行1・行2のコメントを参照。
+- **Ctrl+Alt+Delete ホットキーを追加**(`HID_DELETE`、`main.py`を強制終了してREPLへ戻す): mpremote経由のシリアル接続でのCtrl+Cが固まった`main.py`を止められなかった実機ロックアウトを受けて追加。PC側の状態に依存しない、キーボードだけでの脱出手段を提供する。
+
+### 追加(2026-09-19)
+
+- **仮想FDD(フロッピーディスクドライブ)対応**: WD179x/WD2793互換のFDCエミュレーション(`src/msx/wd179x.c`/`.h`)を、設定可能なZ80アドレス(`fdc_base=`、既定`0x7FB8`)でインターセプトする方式。新しい`mode=disk`設定モード(`cart=`とは排他)で有効化し、`diskrom=`(必須)と`disk=`(`.DSK`イメージ、360KB/720KB、単一ドライブ)を使う。`mp/msx_fdd.py`がDSKCHGフックを追加し、MSX-DOS/Disk BASIC側がディスクのホットスワップを自動的に認識する(リセット不要) — このモードでは実行時メニューの「Swap Cartridge」が「Swap Disk」に置き換わる。`tools/dsk_manager.py`: `.DSK`イメージの作成・検査を行うPC側の単体ツール。実機確認済み: Disk BASICのSAVE/LOAD、完全なMSX-DOS起動(MSXDOS.SYS/COMMAND.COMロード、両面アクセス)。
+- **上記の立ち上げ作業中に見つかった実機MSX-DOS起動ハングを修正**: FDCレジスタのインターセプトが絶対Z80アドレスで比較していたが、MSXDOS.SYS自身がDisk ROMをページ1からページ2(`0x7FB8`→`0xBFB8`)へ再マッピングした後にFDCへアクセスするため、古い絶対アドレス判定ではエミュレートされたFDCではなく静的なROMバイトを読んでしまい、BUSYビット待ちループが無限ループしていた(画面が青いまま応答しない)。ページ内オフセットで比較するよう修正。
+
+### 追加(2026-09-29、実機確認済み)
+
+- **Waveshare RP2350-PiZeroボード対応**(オンボードDVI出力 + PIO-USBキーボードホスト) — Pico 2に加えた2つ目の実験的ビルドターゲット(`bldfrm_msx.sh pizero`、`src/msx/boards/WAVESHARE_RP2350_PIZERO/`、MicroPython標準ボード一覧には含まれない)。DVI(`src/msx/display/disp_dvi.c` + vendoringしたlibdvi): `msx->framebuf`からcore1上で直接TMDSエンコードする設計(専用のスキャンアウトバッファを持たない)。`DVI_N_TMDS_BUFFERS`の事前充填、専用のDMA IRQ/スピンロック、`multicore_lockout_victim_init()`は、いずれも実機ブリングアップで得られた知見。PIO-USBキーボードホスト: sekigon-gonnoc/Pico-PIO-USB(MIT、tag 0.7.2)を専用PIOブロックにvendoring、自前の1msティックを`hardware_alarm_*`で直接駆動(`alarm_pool`の共有ストライプ・スピンロックが実機でhard assertを引き起こすため回避)。Pico2専用のHDMIブリッジ機能(約24KB)はpizeroビルドでは除外して容量を確保。実機確認済み: DVI経由のMSX BASIC表示、USBキーボード入力。**実験的機能** — 既知の制限事項は`doc/usage_guide.md`のメガロムの節を参照。
+
+### 変更(2026-09-29)
+
+- **サブルーチンフック機構をCALL/RST専用からJP/JR/汎用トラップに拡張**: フック判定が、即値`JP nn`/条件付き`JP`、`JR e`/条件付き`JR`/`DJNZ`、および`z80_step()`毎回の汎用フェッチ時トラップ(間接ジャンプ・`RET`着地・フォールスルー等をカバー)の4経路に対応した — 姉妹PB-1000エミュレータのHD61700向けCALLフック設計を踏襲。更新されたAPIは`doc/extension_api.md`/`_en.md`と`doc/config_and_menu_guide.md`/`_en.md`を参照。`mp/ext/`に実例として`dht20.py`/`sample.py`を追加。
+
+### ドキュメント(2026-09-29)
+
+- **メガロムキャッシュの共有victimプール**(`MSX_CART_VICTIM_SLOTS`、`msx_core.c`/`.h`に実装済み): キャッシュヒット率0%だった当初のバグの根本原因(バンク切替のping-pong — 各ウィンドウが1ページしか保持できなかった)、撤回した対策案(ウィンドウ毎の2ページ目保持、+32KB、GCヒープを圧迫して起動時`MemoryError`を誘発)、採用した共有プール方式(victim 2スロット、+16KB)の経緯、途中で踏んだ`cart_cache[]`再利用まわりの罠を記録した。
+- **PWMオーディオ出力用の外付けバッファ回路**: GP14のPWM出力から一般的な3.5mmヘッドホン/ライン入力機器を駆動するための、任意の追加回路(3段RCローパスフィルタ + オペアンプのユニティゲインバッファ)を文書化。ファームウェア変更なしで出力インピーダンスを下げられる。
+
+### 修正(2026-09-29)
+
+- **仮想FDD: ディスクイメージ未指定での`mode=disk`起動時、FDCが完全に無効のままだった**(`path=None`で`msx.fdc_mount()`自体を呼ばず、実機のWD179xチップとは異なりレジスタ読み取りに一切応答しなかった — 実機はメディア未挿入でもレジスタ読み取りには応答する)。Disk ROMのドライブ検出ルーチンが静的なROMバイト列に対して無限ビジーウェイトし、Disk BASICへフォールスルーできなかった。`path=None`でもバッキングファイルなしでFDCだけ有効化するよう修正。
+
+### 追加(2026-09-29)
+
+- **実行時メニューに「Switch to Cart Mode」/「Switch to Disk Mode」を追加**: `msx.ini`を手動編集せずに`cart=`セッションと`mode=disk`セッションを行き来できる — ROM/Disk ROMを選び、確認すると、メニューが該当する`msx.ini`キーを書き換えたうえで完全な`machine.reset()`を行う(モード間でのその場でのeject+loadではなく、断片化していないクリーンなヒープからの通常起動シーケンスに乗せる方式)。カートリッジ/ディスクのロード処理(Swap Cartridgeと上記2項目)を`msx_runtime_menu.py`から新しい`msx_mode_switch.py`へ分離し、これらの項目を実際に選択したときだけ遅延importするようにした — `msx_runtime_menu.py`単体ではすでに、GUI+F7初回押下時のコンパイルで実機`MemoryError`を起こしかねないほど肥大化していた。
+
+### 修正(2026-10-08、実機確認済み)
+
+- **PiZero: GUI+F7実行時メニューを初めて開いたときにボード全体がフリーズ**: `msx_wait_display()`の既存ガードは「`display_ready == true`なら`msx->spi_inst`は非NULL」という前提だった(このガードが書かれた当時はLCD/HDMIしか存在せず、それは真だった) — DVIも`display_ready = true`をセットする(「何らかの表示バックエンドが起動済み」という汎用フラグとして流用)が、`spi_inst`は一切セットしない(PIO/DMAのみでSPIを使わない)ため、NULLポインタのハードウェアレジスタ参照に落ちていた。`spi_inst`を直接チェックするよう修正。
+- **pico2: Swap CartridgeでメガロムへのSwapが2通りの原因で失敗しうる問題** — どちらも、起動直後ではなくゲームプレイが進んでヒープが断片化した後にのみ発生:
+  - マッパー判定用4KBスクラッチバッファの確保で、GCヒープの`MemoryError`が発生。`msx_runtime_menu`/`msx_rom_browser`の遅延importのコンパイルがGCヒープを断片化させるのが原因 — このバッファを(断片化しない)Cヒープ側に置く`msx.get_scratch_view()`を使うことで、GCヒープの`bytearray`を避けて解消。
+  - 小容量インメモリカートの32KBブロック解放直後に、`cart_cache`の48KB確保(`MSX_CART_VICTIM_SLOTS=2`)が失敗する、典型的な外部断片化。これは従来pizero限定の問題とみなしていたが(上記2026-09-29のメガロムキャッシュの項参照)、今回の調査の実機テストで、pico2でも全く同じ再現をすることが判明した — そのためpico2も`MSX_CART_VICTIM_SLOTS=0`(32KBキャッシュ、victimプールなし)に統一し、両ボードともバンク切替キャッシュヒット率を多少犠牲にして信頼性を取った。
+
+  起動時に`cart=`で直接メガロムを指定する(小容量カートを事前に読んでいない)場合は、この修正前からどちらのバグの影響も受けていなかった — 影響があったのは、小容量カートからのSwap Cartridgeの経路のみ。
+
+### 追加(2026-10-08)
+
+- **実行時メニュー/Display Settings画面のステータスメッセージを2行表示に対応**(`_wrap_msg()`、`msx_menu.py`): 従来の31文字での強制打ち切りをやめた — 例えばPiZeroのメガロム拒否メッセージが単語の途中で切れていた問題など。
+
+### 修正(2026-10-08)
+
+- **`hdmi_scale`が`config_and_menu_guide.md`/`_en.md`の`msx.ini`リファレンス表に記載漏れだった**: `main.py`/`board_config.py`がすでに読み込んでいる、ライブ調整可能な実在の設定キーにもかかわらず未記載だった。
+
+### ドキュメント(2026-10-08)
+
+- **`doc/ext_hooks_guide.md`/`_en.md` を `doc/config_and_menu_guide.md`/`_en.md` にリネーム**: 見出し自体は最初から「実行時メニュー・ホットキー・設定キー リファレンス」で、内容にも実際のコードフックは一切無かった(冒頭の注記で、PB-1000版のようなサブルーチンフック機構は無いと明記している)にもかかわらず、ファイル名だけが姉妹PB-1000エミュレータのドキュメント(そちらでは「ext hooks」が文字通りプログラム的なサブルーチンフックAPIを指す)から流用されたままだった。本プロジェクトには別途、本物のサブルーチンフック機構も存在する(`doc/extension_api.md`/`dev_guide.md`)ため、旧ファイル名が無関係な別概念と衝突し、`msx.ini`/メニューのリファレンスを名前から見つけにくくしていた。`README.md`/`_en.md`、`doc/usage_guide.md`/`_en.md`、`doc/extension_api.md`/`_en.md`の相互参照もすべて追従して更新した。

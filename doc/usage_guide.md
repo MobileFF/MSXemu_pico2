@@ -34,7 +34,7 @@ audio_filter=0
 display=lcd
 ```
 
-全キー省略可能。省略時のデフォルトや各キーの詳細は `ext_hooks_guide.md` の「`msx.ini` 完全リファレンス」を参照してください。`cart` を省略すると、起動時にSDカード上のROM一覧（サブフォルダ含む）から選ぶメニューが表示されます。
+全キー省略可能。省略時のデフォルトや各キーの詳細は `config_and_menu_guide.md` の「`msx.ini` 完全リファレンス」を参照してください。`cart` を省略すると、起動時にSDカード上のROM一覧（サブフォルダ含む）から選ぶメニューが表示されます。
 
 ---
 
@@ -69,7 +69,7 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 | GUI（Win/Cmd）+ P | LCD/HDMI表示をその場で切り替え（メニューを開かない） |
 | GUI（Win/Cmd）+ ESC | 現在使用中の表示（LCD/HDMI）を再初期化（メニューを開かない。HDMIの長時間プレイ後のNo Signal復旧用） |
 
-詳細は `ext_hooks_guide.md` を参照。
+詳細は `config_and_menu_guide.md` を参照。
 
 ---
 
@@ -90,7 +90,7 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 - **Reset MSX** — Z80をリセットする
 - **Resume** — ゲームプレイに戻る
 
-各項目の詳細な挙動は `ext_hooks_guide.md` を参照してください。
+各項目の詳細な挙動は `config_and_menu_guide.md` を参照してください。
 
 ---
 
@@ -98,7 +98,7 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 
 128KB以上のバンク切替カートリッジ（グラディウス/ネメシス等の一部KONAMIタイトル、その他ASCII-8/ASCII-16マッパー採用タイトル）も、通常のROMと同じようにSDカードの `/sd/msx/` に置いて `cart=` またはメニューから選択するだけでプレイできます。
 
-初回選択時のみ、Pico2内蔵フラッシュへ数秒かけてコピーする処理が入ります（画面に「Loading…」と表示されます）。以降はそのキャッシュから高速に読み込まれ、通常のカートリッジと同等の速度でプレイできます。技術的な詳細は `ext_hooks_guide.md`・`architecture.md` を参照してください。
+初回選択時のみ、Pico2内蔵フラッシュへ数秒かけてコピーする処理が入ります（画面に「Loading…」と表示されます）。以降はそのキャッシュから高速に読み込まれ、通常のカートリッジと同等の速度でプレイできます。技術的な詳細は `config_and_menu_guide.md`・`architecture.md` を参照してください。
 
 > 対応マッパーは ASCII-8 / ASCII-16 / KONAMI（SCC無し）です。KONAMI SCC（拡張音源チップ搭載）カートリッジは現時点で音源チップ部分が未対応です。
 
@@ -129,5 +129,5 @@ USB キーボードは HID レポートを直接 MSX のキーボード行列に
 
 - `hardware_guide.md` — 配線・部品
 - `build_guide.md` — ビルド・書き込み手順
-- `ext_hooks_guide.md` — 実行時メニュー・ホットキー・`msx.ini` の詳細リファレンス
+- `config_and_menu_guide.md` — 実行時メニュー・ホットキー・`msx.ini` の詳細リファレンス
 - `architecture.md` / `memory_map.md` / `extension_api.md` / `dev_guide.md` — 開発者向け技術資料
