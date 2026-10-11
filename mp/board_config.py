@@ -233,3 +233,11 @@ else:
     JOY_RIGHT_PIN  = 21
     JOY_TRIG_A_PIN = 26
     JOY_TRIG_B_PIN = 27
+
+    # 2026-10-11: only meaningful when this firmware was built with
+    # bldfrm_msx.sh's "pico2_piousb" target (MSX_USE_PIO_USB_HOST,
+    # src/usb_host_core.c's usb_host_core_init_pico2_piousb()) — unused
+    # (purely documentation, kept in sync with that hardcoded C value) on
+    # a normal native-USB-host pico2 build. Not read by any Python code;
+    # see pizero's own USB_HOST_DP_PIN comment above for why.
+    USB_HOST_DP_PIN = 4  # D-, if needed, is always this + 1 (GPIO5)

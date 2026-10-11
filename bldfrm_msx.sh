@@ -22,19 +22,24 @@
 #
 # Usage:
 #   chmod +x bldfrm_msx.sh   (see NOTE below — may not persist on this filesystem)
-#   ./bldfrm_msx.sh              # Pico 2 (default)
-#   ./bldfrm_msx.sh pico2        # Pico 2, explicit
-#   ./bldfrm_msx.sh pizero       # Waveshare RP2350-PiZero
+#   ./bldfrm_msx.sh                # Pico 2, native USB host (default)
+#   ./bldfrm_msx.sh pico2          # Pico 2, native USB host, explicit
+#   ./bldfrm_msx.sh pico2_piousb   # Pico 2, PIO-USB host (GP4/GP5) +
+#                                  # native USB CDC REPL — see 2026-10-11
+#                                  # section below
+#   ./bldfrm_msx.sh pizero         # Waveshare RP2350-PiZero
 #
 # NOTE: this file lives on a Google-Drive-mounted filesystem that has been
 # observed to not persist chmod reliably — if `./bldfrm_msx.sh` reports
 # "Permission denied", use `bash bldfrm_msx.sh [target]` instead.
 #
 # Output:
-#   pico2 : ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
-#           → firmware/firmware_msx.uf2
-#   pizero: ~/projects/micropython.msx/ports/rp2/build-WAVESHARE_RP2350_PIZERO/firmware.uf2
-#           → firmware/firmware_msx_pizero.uf2
+#   pico2       : ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
+#                 → firmware/firmware_msx.uf2
+#   pico2_piousb: ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
+#                 → firmware/firmware_msx_piousb.uf2
+#   pizero      : ~/projects/micropython.msx/ports/rp2/build-WAVESHARE_RP2350_PIZERO/firmware.uf2
+#                 → firmware/firmware_msx_pizero.uf2
 #
 # To flash: hold BOOTSEL, plug USB, copy the .uf2 to the RPI-RP2 drive.
 #
@@ -52,12 +57,30 @@ case "${TARGET}" in
         BOARD_DIR_ARG=""
         UF2_NAME="firmware_msx.uf2"
         ;;
+    pico2_piousb)
+        # 2026-10-11: same board/board-dir as plain pico2 — only the USB
+        # host backend differs (PIO-USB on GP4/GP5 instead of RP2350's
+        # native controller, which becomes a CDC REPL instead — see
+        # micropython_msx.cmake's USE_PIO_USB option and
+        # src/usb_host_core.c's usb_host_core_init_pico2_piousb()).
+        # Requires a pico2 board that has actually been wired with a
+        # second USB connector on GP4(D+)/GP5(D-) via 22Ω series
+        # resistors (no external pull-up/down) — see
+        # 調査用/RP2350-PiZero_USBキーボード対応調査.md's 2026-10-11
+        # addendum. Do NOT flash this onto a board without that wiring:
+        # the keyboard will not work (no PIO-USB port), and the native
+        # USB port will come up as a CDC serial device instead of a
+        # keyboard host.
+        MP_BOARD="RPI_PICO2"
+        BOARD_DIR_ARG=""
+        UF2_NAME="firmware_msx_piousb.uf2"
+        ;;
     pizero)
         MP_BOARD="WAVESHARE_RP2350_PIZERO"
         UF2_NAME="firmware_msx_pizero.uf2"
         ;;
     *)
-        echo "ERROR: unknown target '${TARGET}' (expected: pico2, pizero)"
+        echo "ERROR: unknown target '${TARGET}' (expected: pico2, pico2_piousb, pizero)"
         exit 1
         ;;
 esac
@@ -120,6 +143,29 @@ fi
 # MICROPY_HW_ENABLE_UART_REPL above.
 if [ "${TARGET}" = "pizero" ]; then
     export CFLAGS_EXTRA="${CFLAGS_EXTRA:-} -DMSX_BOARD_PIZERO=1 -DPICO_PIO_USE_GPIO_BASE=1"
+fi
+
+# 2026-10-11: pico2_piousb target. MSX_USE_PIO_USB_HOST (the C-side
+# #ifdef macro, usb_host_core.c/modusb_host.c) reaches every compilation
+# unit via CFLAGS_EXTRA, same mechanism as MSX_BOARD_PIZERO above — still
+# needed for that one macro because it gates a new MP_QSTR_* registration
+# (usb_host.debug()) that must reach the QSTR pre-pass (see
+# micropython_msx.cmake's comment for why). USE_PIO_USB (the cmake-level
+# option(), no project prefix) is instead passed as an actual cmake
+# option via CMAKE_ARGS — ports/rp2's own Makefile forwards CMAKE_ARGS to
+# its cmake invocation (`cmake -S . -B $(BUILD) ... ${CMAKE_ARGS}`), and
+# since this script always does a full clean rebuild (rm -rf
+# "${BUILD_DIR}" below) cmake always re-runs fresh, so this reaches it
+# reliably without needing the CFLAGS_EXTRA detour (that variable only
+# steers micropython_msx.cmake's own cmake-level branches — source-file
+# selection, MICROPY_HW_USB_CDC — none of which gate new MP_QSTR_* names).
+# Aligned 2026-10-11 with the sibling PB-1000 emulator project's own
+# established convention for this exact native-vs-PIO-USB choice (same
+# option name, same CMAKE_ARGS mechanism) — see micropython_msx.cmake's
+# own comment for the full cross-project rationale.
+if [ "${TARGET}" = "pico2_piousb" ]; then
+    export CFLAGS_EXTRA="${CFLAGS_EXTRA:-} -DMSX_USE_PIO_USB_HOST=1"
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DUSE_PIO_USB=ON"
 fi
 
 # 2026-09-21/22: same bring-up session — a stack-size increase was tried
@@ -397,6 +443,48 @@ echo ""
 # 73728 attempt, which left the DVI TMDS buffers + Mega ROM cache's
 # worst case uncomfortably tight against it).
 MICROPY_C_HEAP_SIZE_VAL=81920
+# 2026-10-11: pico2_piousb hit the exact same link-time
+# `ASSERT(GcHeap is too small)` floor pizero once did (see the long
+# comment above) — real build attempt, not a guess: at 81920 the GC heap
+# came out to 64092 bytes, 1444 bytes short of the required >65536. The
+# vendored pio_usb library's static state (endpoint pool, root port) plus
+# TinyUSB's device-mode CDC stack (now compiled in via
+# MICROPY_HW_USB_CDC=1, previously entirely absent on a native-USB-host
+# pico2 build) add ~15.8KB of new .bss relative to a plain pico2 build —
+# confirmed via the actual link map (__bss_end__ moved from 0x200577fc to
+# 0x2005b5a4 between the two builds).
+#
+# First tried a "modest, surgical" 4KB-only cut (77824) on the theory
+# that the HDMI-bridge buffers (unlike pizero, this variant keeps them —
+# it still has a real LCD + optional HDMI bridge) meant little further
+# slack was safe to take. That cleared the link-time floor (GC heap
+# 68188 bytes) but was NOT actually enough: real-hardware testing hit a
+# genuine `MemoryError: memory allocation failed, allocating 1016 bytes`
+# compiling msx_menu.py on boot (mp/main.py's `from msx_menu import
+# ...`) — the exact same class of mistake pizero's own 2026-09-27 "first
+# tried shrinking by 8KB" attempt made (see the long comment above): the
+# link-time 64KB floor is a minimum for the linker to accept the build
+# at all, not evidence the real program fits. 68188 bytes (~66.6KB) is
+# ~11.7KB LESS GC heap than a plain pico2 build actually has (79876
+# bytes, ~78KB) — not enough margin for this project's larger lazily-
+# imported modules (msx_menu.py, the runtime menu's own further lazy
+# imports) to compile without hitting a real, not just nominal,
+# MemoryError.
+#
+# Fixed by going back to 65536 (64KB) instead — NOT an arbitrary further
+# cut: this is the exact ORIGINAL C-heap value bldfrm_msx.sh used before
+# MSX_CART_VICTIM_SLOTS's shared victim pool was ever added (see the
+# "65536 -> 73728 -> 81920" progression in the long comment above), sized
+# for the same 32KB cart_cache[] this project's Mega ROM cache now uses
+# again on BOTH boards (MSX_CART_VICTIM_SLOTS=0 since the 2026-10-08
+# cache-fragmentation fix — see msx_core.h) — i.e. this is a previously
+# real-hardware-proven-safe value for this exact cart_cache size, not a
+# new guess. Gives a GC heap of ~80476 bytes, slightly MORE than plain
+# pico2's 79876 — comfortable parity with the one configuration already
+# known to run this project's full menu system without issue.
+if [ "${TARGET}" = "pico2_piousb" ]; then
+    MICROPY_C_HEAP_SIZE_VAL=65536
+fi
 make -C "${MP_RPI_PORT}" \
      BOARD="${MP_BOARD}" \
      ${BOARD_DIR_ARG} \

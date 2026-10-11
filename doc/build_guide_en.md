@@ -42,33 +42,53 @@ MicroPython's `ports/rp2` pulls in the Pico SDK as a submodule, so `git submodul
 
 ## Build Steps
 
-`bldfrm_msx.sh` automates the whole build. Run it from the project root (`MSX_emu_pico2/`).
+`bldfrm_msx.sh` automates the whole build. Run it from the project root (`MSX_emu_pico2/`). There are three build targets:
+
+```bash
+./bldfrm_msx.sh                # Pico 2, native USB host (default)
+./bldfrm_msx.sh pico2          # same, explicit
+./bldfrm_msx.sh pico2_piousb   # Pico 2, PIO-USB host (GP4/GP5) + native USB CDC REPL
+                                # — only for a board that has actually been wired with a
+                                #   second USB connector on GP4(D+)/GP5(D-) via 22Ω series
+                                #   resistors. Do NOT flash this onto an unwired board
+                                #   (see the Hardware Guide for details)
+./bldfrm_msx.sh pizero         # Waveshare RP2350-PiZero
+```
+
+The first time, you'll also need:
 
 ```bash
 chmod +x bldfrm_msx.sh
-./bldfrm_msx.sh
 ```
 
 ### What the script does
 
 1. Copies the `src/` folder (the Google Drive source, the authoritative copy) to `~/projects/msx_emu/src` (local disk, for build I/O speed)
-2. Deletes the previous build directory (`~/projects/micropython/ports/rp2/build-RPI_PICO2`) to force cmake to reconfigure
-3. Runs `make` with:
+2. Deletes the previous build directory (`~/projects/micropython/ports/rp2/build-RPI_PICO2`, or `build-WAVESHARE_RP2350_PIZERO` for pizero) to force cmake to reconfigure
+3. Runs `make` with (the `pico2` default shown):
 
 ```bash
 make -C ~/projects/micropython/ports/rp2 \
      BOARD=RPI_PICO2 \
      USER_C_MODULES=~/projects/msx_emu/src/msx/micropython_msx.cmake \
      WERROR=0 \
-     MICROPY_C_HEAP_SIZE=65536 \
+     MICROPY_C_HEAP_SIZE=81920 \
      -j$(nproc)
 ```
 
-4. On success, copies `firmware.uf2` into the project's `firmware/firmware_msx.uf2` (the standing rule: always flash real hardware from this path; named `firmware_msx.uf2` rather than `firmware.uf2` to avoid mix-ups with other Pico2 projects worked on in parallel)
+`pico2_piousb` additionally passes `CMAKE_ARGS="-DUSE_PIO_USB=ON"` (enabling `src/msx/micropython_msx.cmake`'s `option(USE_PIO_USB ...)`) and overrides `MICROPY_C_HEAP_SIZE` to `65536` (see below).
 
-### About `MICROPY_C_HEAP_SIZE=65536`
+4. On success, copies `firmware.uf2` into the project's `firmware/<per-target name>.uf2` (the standing rule: always flash real hardware from this path):
+   - `pico2` → `firmware/firmware_msx.uf2`
+   - `pico2_piousb` → `firmware/firmware_msx_piousb.uf2`
+   - `pizero` → `firmware/firmware_msx_pizero.uf2`
 
-The MicroPython RP2 port's dedicated heap for C-level `malloc()`/`calloc()` (used by the VDP core, PSG core, and the Mega ROM page cache) **defaults to 0 bytes**. Without setting this explicitly, those `malloc()` calls silently corrupt MicroPython's GC heap region, causing unexplained hangs — a real bug hit earlier in this project. 64KB is chosen to comfortably cover the VDP core (~16.8KB) plus one Mega ROM page-cache slot (32KB) with room to spare.
+### About `MICROPY_C_HEAP_SIZE`
+
+The MicroPython RP2 port's dedicated heap for C-level `malloc()`/`calloc()` (used by the VDP core, PSG core, and the Mega ROM page cache) **defaults to 0 bytes**. Without setting this explicitly, those `malloc()` calls silently corrupt MicroPython's GC heap region, causing unexplained hangs — a real bug hit earlier in this project.
+
+- `pico2`/`pizero`: **81920 bytes (80KB)** — enough to comfortably cover the VDP core (~16.3KB) plus the Mega ROM page cache (32KB, `MSX_CART_VICTIM_SLOTS=0`) with room to spare. See [memory_usage.md](memory_usage.md) (Japanese only) for details.
+- `pico2_piousb`: **65536 bytes (64KB)** — the PIO-USB library plus the native USB CDC stack it enables add ~15.8KB of new `.bss`, squeezing the GC heap, so the C heap is cut to compensate. This is not a new guess — it's the exact value this project used before the Mega ROM victim pool was ever added. Tuned against a real-hardware `MemoryError` compiling `msx_menu.py` on boot, so don't change it casually (see `bldfrm_msx.sh`'s own comment for the full story).
 
 ### Build Optimizations in `micropython_msx.cmake`
 

@@ -69,10 +69,12 @@ static mp_obj_t mod_usb_host_get_hid_report(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_usb_host_get_hid_report_obj,
                                   mod_usb_host_get_hid_report);
 
-#ifdef MSX_BOARD_PIZERO
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
 // Python API: usb_host.debug() -> (tick_count, connected, suspended, ints)
-// Real-hardware bring-up diagnostic, Phase 4 (PIO-USB) — see
-// usb_host_core.c's own comment.
+// Real-hardware bring-up diagnostic, originally Phase 4 (pizero's
+// PIO-USB) — see usb_host_core.c's own comment. Equally available on
+// pico2's optional PIO-USB build variant (bldfrm_msx.sh's
+// "pico2_piousb" target).
 static mp_obj_t mod_usb_host_debug(void) {
   uint32_t tick_count, connected, suspended, ints;
   usb_host_core_debug_pizero(&tick_count, &connected, &suspended, &ints);
@@ -87,6 +89,23 @@ static mp_obj_t mod_usb_host_debug(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_usb_host_debug_obj, mod_usb_host_debug);
 #endif
 
+// Python API: usb_host.is_pio_usb() -> bool
+// True when this firmware build drives the keyboard through PIO-USB
+// (pizero's onboard port, or pico2's optional "pico2_piousb" build
+// variant — see bldfrm_msx.sh) rather than RP2350's native USB host
+// controller. Always registered (no #ifdef around the binding itself,
+// unlike usb_host.debug() above) so board/variant-agnostic Python code
+// (mp/boot.py's CDC-vs-UART-REPL choice) can call it unconditionally;
+// only the return value differs per build.
+static mp_obj_t mod_usb_host_is_pio_usb(void) {
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
+  return mp_const_true;
+#else
+  return mp_const_false;
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_usb_host_is_pio_usb_obj, mod_usb_host_is_pio_usb);
+
 static const mp_rom_map_elem_t usb_host_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_usb_host)},
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&mod_usb_host_init_obj)},
@@ -98,7 +117,8 @@ static const mp_rom_map_elem_t usb_host_module_globals_table[] = {
      MP_ROM_PTR(&mod_usb_host_stop_bg_timer_obj)},
     {MP_ROM_QSTR(MP_QSTR_get_hid_report),
      MP_ROM_PTR(&mod_usb_host_get_hid_report_obj)},
-#ifdef MSX_BOARD_PIZERO
+    {MP_ROM_QSTR(MP_QSTR_is_pio_usb), MP_ROM_PTR(&mod_usb_host_is_pio_usb_obj)},
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
     {MP_ROM_QSTR(MP_QSTR_debug), MP_ROM_PTR(&mod_usb_host_debug_obj)},
 #endif
 };

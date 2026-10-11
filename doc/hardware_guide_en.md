@@ -112,6 +112,19 @@ Leaving the pins unconnected is fine (the internal pull-up keeps them HIGH, read
 - Connect a USB keyboard via a USB OTG adapter to the Pico 2's native Micro-USB port (GP24/25, using the TinyUSB host stack).
 - USB host initialization forces `clk_sys` to 240MHz (needed for USB full-speed timing accuracy); the impact on emulation speed is minor.
 
+#### Optional: PIO-USB keyboard + native USB CDC REPL (the `pico2_piousb` build)
+
+For the `bldfrm_msx.sh pico2_piousb` target, wire the board as follows instead, to free the native USB port from the keyboard so it can be used as a CDC serial port for mpremote (real-hardware confirmed 2026-10-11: keyboard recognition, CDC REPL, and Mega ROM loading all working).
+
+- Add a new USB connector (Micro-USB or USB-C female) and wire its D+/D- lines to the following GPIOs, each through a **22Ω series resistor**. No external pull-up/pull-down resistors are needed (RP2350's own internal pull-down is sufficient; the PIO-USB library drives it).
+  | Signal | Pico 2 pin |
+  | :--- | :--- |
+  | D+ | GP4 |
+  | D- | GP5 |
+- Also wire GND and 5V (VBUS, to power the keyboard) to this connector.
+- **Practical note (from a sibling project's own real-hardware bring-up)**: a temporary breadboard wiring combined with an external pull-down resistor was found to make SETUP packets (short control transfers) succeed while DATA-IN packets (longer transfers) frequently failed with CRC/receive errors. Prefer a solid connection (e.g. soldered to perfboard) over a breadboard for this wiring.
+- Since the keyboard moves to PIO-USB on GP4/GP5 with this build, **do not flash it onto a Pico 2 that hasn't been wired this way** — the keyboard will simply not respond. Use the default `pico2` target (native USB host) for a normal Pico 2.
+
 ## Wiring Notes
 
 - **SPI sharing**: the LCD and SD card's CS (chip select) pins must be independent GPIOs. Drive all CS pins HIGH at startup before initializing anything (the firmware does this automatically).

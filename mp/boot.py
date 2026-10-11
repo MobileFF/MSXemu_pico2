@@ -16,6 +16,20 @@ try:
 except Exception:
     _board = "pico2"
 
+# 2026-10-11: pico2 now has an OPTIONAL PIO-USB build variant
+# (bldfrm_msx.sh's "pico2_piousb" target) that moves the keyboard off
+# the native USB controller the same way pizero's onboard PIO-USB does —
+# msx.get_board_type() still reports "pico2" either way (same physical
+# board), so the UART-REPL-vs-CDC-REPL choice below can't branch on
+# _board alone like it used to; usb_host.is_pio_usb() (always available,
+# see src/modusb_host.c) reports which USB host backend THIS firmware
+# build actually uses.
+try:
+    import usb_host
+    _pio_usb = usb_host.is_pio_usb()
+except Exception:
+    _pio_usb = False
+
 if _board == "pico2":
     # OC: set CPU clock before UART so baud divisor uses the new frequency
     try:
@@ -36,7 +50,12 @@ if _board == "pico2":
 # pizeroではビルド時にMICROPY_HW_USB_CDC=1が有効になっており、ネイティブ
 # USB CDC REPLがC側で自動的に立ち上がるため、GP0/1のUART REPLは不要かつ
 # ユーザー指示により無効化。pico2は従来通りUART REPLを複製する。
-if _board == "pico2":
+#
+# 2026-10-11: pico2の"pico2_piousb"ビルド(_pio_usb=True)も同じ理由で
+# UART REPL複製が不要(キーボードがGP4/GP5のPIO-USBへ移り、ネイティブ
+# USBがCDC REPLとして使えるようになるため)。_board=="pico2"のみでの
+# 判定ではこの2バリアントを区別できないため、_pio_usbも併せて見る。
+if _board == "pico2" and not _pio_usb:
     # UART0を起動し、REPLをUARTに複製する設定
     # Baudrateを115200に設定（標準設定）
     uart = machine.UART(0, baudrate=115200, tx=machine.Pin(0), rx=machine.Pin(1), txbuf=256, rxbuf=512)

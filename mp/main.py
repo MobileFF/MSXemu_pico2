@@ -6,7 +6,10 @@
 #                    ST7796 480x320 (MSP4021) or ILI9341 320x240 (MSP2402) —
 #                    same wiring/init sequence for both, see LCD_SIZES below.
 #   SD card          SPI1: MOSI=GP11  SCK=GP10  MISO=GP12 CS=GP15  (shared with LCD SPI)
-#   USB keyboard     native host (GP24/25)
+#   USB keyboard     native host (GP24/25) — or PIO-USB (GP4/GP5) +
+#                    native USB CDC REPL, on a board built with
+#                    bldfrm_msx.sh's optional "pico2_piousb" target
+#                    (board_config.py's USB_HOST_DP_PIN, _USB_IS_PIO below)
 #   Audio PWM        GP14
 #   HDMI bridge      SPI1: MOSI=GP11  SCK=GP10  CS=GP28  (optional, shares LCD/SD
 #                    SPI bus; second Pico2+PICO-HDMI-PLUS, see hdmi_bridge/README.md;
@@ -163,6 +166,21 @@ log_mem("boot, after main.py/msx_menu.py compiled")
 # -----------------------------------------------------------------------
 from board_config import *
 
+# 2026-10-11: pico2's optional PIO-USB build variant (bldfrm_msx.sh's
+# "pico2_piousb" target, src/usb_host_core.c's
+# usb_host_core_init_pico2_piousb()) hits the exact same clk_sys-
+# independence / dedicated-hardware-alarm-tick situation pizero's onboard
+# PIO-USB already does (see init_usb()/poll_keyboard()'s own comments
+# below) — but BOARD still reports "pico2" for it (same physical board,
+# see board_config.py's USB_HOST_DP_PIN comment), so the several
+# `BOARD == "pizero"` checks below that are really about "is the keyboard
+# on PIO-USB" (not about pizero's LCD-less/DVI hardware specifically)
+# need to also catch this variant. usb_host.is_pio_usb() (always
+# available — see src/modusb_host.c) reports which USB host backend THIS
+# firmware build actually uses; _USB_IS_PIO just caches that once.
+_USB_IS_PIO = (usb_host is not None and hasattr(usb_host, 'is_pio_usb')
+               and usb_host.is_pio_usb())
+
 # ROM_DIR is the SD root — select_rom() browses subfolders too (see
 # msx_rom_browser.py's _list_dir_entries()). BIOS stays under /sd/msx/.
 ROM_DIR      = "/sd"
@@ -270,8 +288,10 @@ def init_usb():
     # usb_host_core.c's usb_host_core_init_pizero() comment — clk_sys
     # must stay at onboard DVI's required 252MHz. Only the native
     # RP2350 host controller (pico2) needs the clk_sys/clk_peri dance
-    # below; skip it entirely on pizero.
-    if BOARD != "pizero":
+    # below; skip it entirely on pizero. 2026-10-11: pico2's own
+    # optional PIO-USB variant (usb_host_core_init_pico2_piousb()) is
+    # the same way — see _USB_IS_PIO's own comment above.
+    if not _USB_IS_PIO:
         # usb_host.init() reconfigures clk_sys for USB PHY timing (see
         # usb_host_core.c: set_sys_clock_khz(240000, ...) — 240MHz is the
         # highest clean multiple of 12MHz this board runs reliably at with
@@ -300,8 +320,10 @@ def init_usb():
     # entirely, after real-hardware hangs/panics tracing back to its
     # shared striped-spinlock use). Calling start_bg_timer() here too
     # would register a SECOND, redundant tuh_task() poller through
-    # exactly the alarm_pool path just avoided — skip it on pizero.
-    if BOARD != "pizero":
+    # exactly the alarm_pool path just avoided — skip it on pizero (and,
+    # 2026-10-11, pico2's own PIO-USB variant — same mechanism, see
+    # _USB_IS_PIO's own comment above).
+    if not _USB_IS_PIO:
         try:
             if hasattr(usb_host, 'start_bg_timer'):
                 usb_host.start_bg_timer(8)
@@ -410,8 +432,9 @@ def poll_keyboard():
     global _fdd_mode, _diskrom_path
     if not _usb_ready:
         return
-    if BOARD == "pizero":
-        # pizero's dedicated hardware-alarm 1ms tick (usb_host_core.c's
+    if _USB_IS_PIO:
+        # pizero's (and, 2026-10-11, pico2's own PIO-USB variant's)
+        # dedicated hardware-alarm 1ms tick (usb_host_core.c's
         # pio_usb_sof_alarm_handler()) only drives pio_usb_host_frame()
         # itself — tuh_task() (actual device/HID enumeration + report
         # dequeuing) is deliberately NOT called from that interrupt
@@ -770,12 +793,20 @@ def _boost_clock_and_start_usb():
         return
 
     msx.boost_peri_clock()
-    try:
-        _uart = machine.UART(0, baudrate=115200,
-                              tx=machine.Pin(0), rx=machine.Pin(1), txbuf=32)
-        uos.dupterm(_uart)
-    except Exception as e:
-        print(f"UART refresh after clk_peri change failed: {e}")
+    # 2026-10-11: pico2's PIO-USB variant still has an LCD (unlike
+    # pizero), so boost_peri_clock() itself (the SPI-baud-ceiling boost
+    # above) is still wanted here — only this UART-REPL-refresh part is
+    # pizero/PIO-USB-specific: boot.py deliberately does NOT set up a
+    # UART dupterm on a PIO-USB build (native USB is CDC REPL instead —
+    # see boot.py's _pio_usb check), so re-establishing one here would
+    # silently undo that choice.
+    if not _USB_IS_PIO:
+        try:
+            _uart = machine.UART(0, baudrate=115200,
+                                  tx=machine.Pin(0), rx=machine.Pin(1), txbuf=32)
+            uos.dupterm(_uart)
+        except Exception as e:
+            print(f"UART refresh after clk_peri change failed: {e}")
 
     # 2 — USB host
     init_usb()

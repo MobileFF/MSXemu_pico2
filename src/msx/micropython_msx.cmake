@@ -44,20 +44,62 @@ if(MICROPY_BOARD STREQUAL "WAVESHARE_RP2350_PIZERO")
     # instead, which reaches every compilation unit including that pass.
 endif()
 
+# 2026-10-11: Pico 2's optional PIO-USB build variant (bldfrm_msx.sh's
+# "pico2_piousb" target) — same MICROPY_BOARD ("RPI_PICO2") as the
+# default native-USB-host pico2 build, so it can't be distinguished via
+# MICROPY_BOARD like MSX_IS_PIZERO above.
+#
+# Aligned with the sibling PB-1000 emulator project's own established
+# native-vs-PIO-USB coexistence convention (per its own session's
+# explicit write-up, shared 2026-10-11): a single `option()`
+# (USE_PIO_USB, unprefixed — matches that project's own cmake option
+# name exactly, for easy cross-project comparison) that bldfrm_msx.sh
+# sets via a plain `-DUSE_PIO_USB=ON` CMAKE_ARGS entry (ports/rp2's own
+# Makefile already forwards CMAKE_ARGS to its cmake invocation — the
+# same mechanism PB-1000 itself uses), rather than a project-specific env
+# var as an earlier version of this file did. Internally still tracked
+# as MSX_USE_PIO_USB (this project's existing naming convention for its
+# own cmake-level board/variant switches, e.g. MSX_IS_PIZERO above) to
+# avoid renaming every use site below.
+#
+# The separate MSX_USE_PIO_USB_HOST compiler macro (-DMSX_USE_PIO_USB_HOST=1,
+# set by bldfrm_msx.sh via CFLAGS_EXTRA — see usb_host_core.c/
+# modusb_host.c) is DELIBERATELY a different name from this cmake option,
+# matching PB-1000's own explicit reasoning for using two different names
+# for its cmake option (USE_PIO_USB) vs. its C-side #ifdef macro
+# (PB1000_USE_PIO_USB): purely a naming-role distinction (build-selection
+# name vs. C-guard name), not a functional one. It still needs the
+# CFLAGS_EXTRA route rather than USE_PIO_USB itself, because it gates a
+# new MP_QSTR_* registration (usb_host.debug()) that MUST reach
+# MicroPython's QSTR-extraction pre-pass — see the MSX_IS_PIZERO comment
+# above for why a plain cmake option()/add_compile_definitions() value
+# does NOT reach that pass in THIS project's build (a real, previously-
+# hit build failure, 2026-09-22) — PB-1000's own project does not have
+# this particular constraint, which is why its single option()+macro
+# pair is sufficient there but not here for that one QSTR-gated symbol.
+option(USE_PIO_USB "Pico 2: use PIO-USB (GP4/GP5) for the keyboard host instead of the native USB host controller, freeing native USB for a CDC REPL" OFF)
+set(MSX_USE_PIO_USB ${USE_PIO_USB})
+
 # 2026-10-02: native USB CDC REPL — pico2-only restriction, now scoped
 # per board instead of the previous unconditional MICROPY_HW_USB_CDC=0.
-# pico2's native RP2350 USB controller is dedicated to keyboard host mode
-# (usb_host_core.c's usb_host_core_init() -> tuh_init(0) — the chip has
-# only one native USB controller, and it can't be host and CDC device at
-# the same time), so CDC must stay off there. pizero's keyboard instead
-# goes through PIO-USB on a separate virtual port (tuh_init(1), bit-banged
-# on GPIO28/29 — see usb_host_core_init_pizero()), leaving pizero's native
-# USB controller (the same Type-C port used for BOOTSEL/programming)
-# completely unused — safe to enable CDC there. Requested explicitly: the
-# keyboard being on a physically separate port makes native-USB REPL more
-# convenient than the UART REPL (GP0/1,
+# pico2's native RP2350 USB controller is normally dedicated to keyboard
+# host mode (usb_host_core.c's usb_host_core_init() -> tuh_init(0) — the
+# chip has only one native USB controller, and it can't be host and CDC
+# device at the same time), so CDC must stay off there. pizero's keyboard
+# instead goes through PIO-USB on a separate virtual port (tuh_init(1),
+# bit-banged on GPIO28/29 — see usb_host_core_init_pizero()), leaving
+# pizero's native USB controller (the same Type-C port used for
+# BOOTSEL/programming) completely unused — safe to enable CDC there.
+# Requested explicitly: the keyboard being on a physically separate port
+# makes native-USB REPL more convenient than the UART REPL (GP0/1,
 # bldfrm_msx.sh's MICROPY_HW_ENABLE_UART_REPL) pizero has used until now.
-if(MSX_IS_PIZERO)
+#
+# 2026-10-11: pico2's own optional "pico2_piousb" build variant
+# (MSX_USE_PIO_USB, set above) applies this exact same reasoning to pico2
+# itself — its keyboard moves to a second, separately-wired PIO-USB port
+# (GP4/GP5, usb_host_core_init_pico2_piousb()), freeing the native USB
+# controller for CDC the same way pizero's already does.
+if(MSX_IS_PIZERO OR MSX_USE_PIO_USB)
     add_compile_definitions(MICROPY_HW_USB_CDC=1)
 else()
     add_compile_definitions(MICROPY_HW_USB_CDC=0)
@@ -141,6 +183,21 @@ if(MSX_IS_PIZERO)
     )
 endif()
 
+# 2026-10-11: pico2's own optional PIO-USB build variant needs
+# hardware_pio too (pio_usb.c/pio_usb_host.c, same as pizero's PIO-USB
+# use above) but none of libdvi's other dependencies (no DVI/core1 on
+# this variant) — linked separately here rather than folding into the
+# MSX_IS_PIZERO block above, so a plain pico2 build's link line stays
+# byte-for-byte unchanged (this only applies when MSX_USE_PIO_USB is
+# actually set — see that variable's own comment near the top of this
+# file). hardware_dma/pico_time are already linked to usermod
+# unconditionally below (section 3) regardless of board/variant.
+if(MSX_USE_PIO_USB)
+    target_link_libraries(usermod INTERFACE
+        hardware_pio
+    )
+endif()
+
 # vrEmuTms9918 needs to know it is being linked statically
 target_compile_definitions(msx_lib INTERFACE
     VR_EMU_TMS9918_STATIC
@@ -171,16 +228,21 @@ set_source_files_properties(
 # ============================================================
 # 2) USB host core (STATIC, isolated from MicroPython)
 #
-#    Pico 2's USB-host port is wired to RP2350's native USB host
-#    controller (hcd_rp2040.c). The Waveshare RP2350-PiZero's USB-host
-#    port is NOT — it's a PIO-USB port (GPIO28/29) — so pizero instead
-#    builds sekigon-gonnoc/Pico-PIO-USB (vendored in src/usb_host/pio_usb/,
-#    see its PROVENANCE.md) plus this project's own HCD glue for it
-#    (src/usb_host/hcd_pio_usb_pizero.c, Phase 4,
-#    調査用/RP2350-PiZero_USBキーボード対応調査.md). usb_host_core.c/
-#    modusb_host.c (HID report handling, Python bindings) and TinyUSB's
-#    own board-agnostic host stack (usbh.c/hub.c/hid_host.c) are the same
-#    for both boards — only the HCD layer underneath differs.
+#    Pico 2's USB-host port is, by default, wired to RP2350's native USB
+#    host controller (hcd_rp2040.c). The Waveshare RP2350-PiZero's
+#    USB-host port is NOT — it's a PIO-USB port (GPIO28/29) — so pizero
+#    instead builds sekigon-gonnoc/Pico-PIO-USB (vendored in
+#    src/usb_host/pio_usb/, see its PROVENANCE.md) plus this project's
+#    own HCD glue for it (src/usb_host/hcd_pio_usb_pizero.c, Phase 4,
+#    調査用/RP2350-PiZero_USBキーボード対応調査.md). pico2 ALSO has an
+#    optional PIO-USB build variant (MSX_USE_PIO_USB, "pico2_piousb"
+#    target — see that same investigation doc's 2026-10-11 addendum) for
+#    boards wired with a second USB connector on GP4/GP5, which frees the
+#    native controller for a CDC REPL exactly like pizero's does.
+#    usb_host_core.c/modusb_host.c (HID report handling, Python bindings)
+#    and TinyUSB's own board-agnostic host stack (usbh.c/hub.c/
+#    hid_host.c) are the same across all three configurations — only the
+#    HCD layer underneath differs.
 # ============================================================
 add_library(msx_usb_host_core_lib STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../usb_host_core.c
@@ -189,18 +251,33 @@ add_library(msx_usb_host_core_lib STATIC
     ${PICO_SDK_PATH}/lib/tinyusb/src/class/hid/hid_host.c
 )
 
-if(MSX_IS_PIZERO)
+if(MSX_IS_PIZERO OR MSX_USE_PIO_USB)
     target_sources(msx_usb_host_core_lib PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/../usb_host/hcd_pio_usb_pizero.c
         ${CMAKE_CURRENT_LIST_DIR}/../usb_host/pio_usb/pio_usb.c
         ${CMAKE_CURRENT_LIST_DIR}/../usb_host/pio_usb/pio_usb_host.c
         ${CMAKE_CURRENT_LIST_DIR}/../usb_host/pio_usb/usb_crc.c
         # pio_usb_device.c (upstream's DEVICE-mode implementation)
         # deliberately NOT built — this project only ever uses pio_usb as
         # a HOST (keyboard); nothing in pio_usb.c/pio_usb_host.c/
-        # hcd_pio_usb_pizero.c calls anything from it (confirmed by grep),
-        # so it's dead weight (flash + a little .bss) if compiled in.
+        # hcd_pio_usb_*.c calls anything from it (confirmed by grep), so
+        # it's dead weight (flash + a little .bss) if compiled in.
     )
+    if(MSX_IS_PIZERO)
+        target_sources(msx_usb_host_core_lib PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/../usb_host/hcd_pio_usb_pizero.c
+        )
+    else()
+        # 2026-10-11: pico2's own optional PIO-USB build variant (see
+        # MICROPY_HW_USB_CDC's comment above) — hcd_pio_usb_pico2.c is a
+        # deliberate content-duplicate of hcd_pio_usb_pizero.c (the HCD
+        # glue layer itself has no board-specific code at all; see that
+        # file's own header comment), kept as a separate per-variant file
+        # rather than shared so that this addition can never risk
+        # pizero's existing, real-hardware-confirmed build.
+        target_sources(msx_usb_host_core_lib PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/../usb_host/hcd_pio_usb_pico2.c
+        )
+    endif()
     target_include_directories(msx_usb_host_core_lib PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/../usb_host/pio_usb
     )
@@ -258,7 +335,7 @@ target_compile_definitions(msx_usb_host_core_lib PRIVATE
     CFG_TUH_HID_EPOUT_BUFSIZE=64
 )
 
-if(MSX_IS_PIZERO)
+if(MSX_IS_PIZERO OR MSX_USE_PIO_USB)
     # Not routed through CFLAGS_EXTRA/bldfrm_msx.sh like MSX_BOARD_PIZERO
     # (DVI) had to be — that workaround was only needed because MicroPython's
     # QSTR-extraction pre-pass doesn't see add_compile_definitions() from

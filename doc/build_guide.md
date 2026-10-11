@@ -42,33 +42,52 @@ MicroPython の `ports/rp2` は Pico SDK を submodule として取り込んで�
 
 ## ビルド手順
 
-`bldfrm_msx.sh` がビルド全体を自動化します。プロジェクトルート（`MSX_emu_pico2/`）で実行してください。
+`bldfrm_msx.sh` がビルド全体を自動化します。プロジェクトルート（`MSX_emu_pico2/`）で実行してください。3つのビルドターゲットがあります:
+
+```bash
+./bldfrm_msx.sh                # Pico 2、ネイティブUSBホスト（デフォルト）
+./bldfrm_msx.sh pico2          # 同上、明示指定
+./bldfrm_msx.sh pico2_piousb   # Pico 2、PIO-USBホスト(GP4/GP5) + ネイティブUSB CDC REPL
+                                # — GP4(D+)/GP5(D-)に22Ω直列抵抗経由で第2のUSBコネクタを
+                                #   実際に配線済みの機体専用。配線していない機体には書き込まないこと
+                                #   （詳細はハードウェア・ガイドを参照）
+./bldfrm_msx.sh pizero         # Waveshare RP2350-PiZero
+```
+
+初回は以下も必要です:
 
 ```bash
 chmod +x bldfrm_msx.sh
-./bldfrm_msx.sh
 ```
 
 ### スクリプトが行うこと
 
 1. `src/` フォルダ（Google Drive上のソース、正本）を `~/projects/msx_emu/src` へコピー（ビルドI/O速度のためローカルディスクを使用）
-2. 前回のビルドディレクトリ（`~/projects/micropython/ports/rp2/build-RPI_PICO2`）を削除し、cmakeを強制的に再構成
-3. 以下のオプションで `make` を実行:
+2. 前回のビルドディレクトリ（`~/projects/micropython/ports/rp2/build-RPI_PICO2`、pizeroの場合は`build-WAVESHARE_RP2350_PIZERO`）を削除し、cmakeを強制的に再構成
+3. 以下のオプションで `make` を実行（`pico2`のデフォルト値を例示）:
 
 ```bash
 make -C ~/projects/micropython/ports/rp2 \
      BOARD=RPI_PICO2 \
      USER_C_MODULES=~/projects/msx_emu/src/msx/micropython_msx.cmake \
      WERROR=0 \
-     MICROPY_C_HEAP_SIZE=65536 \
+     MICROPY_C_HEAP_SIZE=81920 \
      -j$(nproc)
 ```
 
-4. ビルド成功時、`firmware.uf2` を自動的にプロジェクトの `firmware/firmware_msx.uf2` にコピー（実機書き込みは常にこのパスから行う運用ルール。他のPico2プロジェクトと並行作業中に取り違えないよう`firmware_msx.uf2`という名前にしている）
+`pico2_piousb`では、これに加えて`CMAKE_ARGS="-DUSE_PIO_USB=ON"`が渡され（`src/msx/micropython_msx.cmake`の`option(USE_PIO_USB ...)`を有効化）、`MICROPY_C_HEAP_SIZE`も`65536`に変更されます（後述）。
 
-### `MICROPY_C_HEAP_SIZE=65536` について
+4. ビルド成功時、`firmware.uf2` を自動的にプロジェクトの `firmware/<対象別のファイル名>.uf2` にコピー（実機書き込みは常にこのパスから行う運用ルール）:
+   - `pico2` → `firmware/firmware_msx.uf2`
+   - `pico2_piousb` → `firmware/firmware_msx_piousb.uf2`
+   - `pizero` → `firmware/firmware_msx_pizero.uf2`
 
-MicroPython RP2ポートは、C言語の `malloc()`/`calloc()`（VDPコア・PSGコア・メガロムのページキャッシュがこれを使用）向けの専用ヒープサイズが**デフォルトで0バイト**です。これを明示的に設定しないと、これらの `malloc()` がMicroPythonのGCヒープ領域に静かに食い込んで破壊し、原因不明のハングを引き起こします（過去に実際に踏んだバグ）。64KBはVDPコア（約16.8KB）＋メガロムページキャッシュ1スロット分（32KB）＋余裕を賄うのに十分なサイズとして選定されています。
+### `MICROPY_C_HEAP_SIZE` について
+
+MicroPython RP2ポートは、C言語の `malloc()`/`calloc()`（VDPコア・PSGコア・メガロムのページキャッシュがこれを使用）向けの専用ヒープサイズが**デフォルトで0バイト**です。これを明示的に設定しないと、これらの `malloc()` がMicroPythonのGCヒープ領域に静かに食い込んで破壊し、原因不明のハングを引き起こします（過去に実際に踏んだバグ）。
+
+- `pico2`/`pizero`: **81920バイト(80KB)**。VDPコア（約16.3KB）＋メガロムページキャッシュ（32KB、`MSX_CART_VICTIM_SLOTS=0`）＋余裕を賄うサイズ。詳細は[Memory Usage](memory_usage.md)を参照。
+- `pico2_piousb`: **65536バイト(64KB)**。PIO-USBライブラリ＋ネイティブUSB CDCスタックの追加分（約15.8KBの`.bss`増）でGCヒープが窮迫するため、Cヒープ側を削って補っている。これは victim プール導入前にこのプロジェクトが実際に使っていた値そのもので、新規の推測値ではない。実機で`msx_menu.py`コンパイル時の`MemoryError`を実際に踏んで調整した値なので、安易に変更しないこと（詳細は`bldfrm_msx.sh`自身のコメント参照）。
 
 ### `micropython_msx.cmake` のビルド最適化
 

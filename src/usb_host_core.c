@@ -8,7 +8,7 @@
 #include "hardware/clocks.h"
 #include <string.h>
 
-#ifdef MSX_BOARD_PIZERO
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
 #include "hardware/pio.h"
 #include "hardware/timer.h"
 #include "pico/time.h"
@@ -135,10 +135,17 @@ const uint8_t *usb_host_core_get_hid_report(void) {
   return last_hid_report;
 }
 
-#ifdef MSX_BOARD_PIZERO
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
 /* Drives pio_usb's 1ms SOF/keepalive/transfer tick ourselves — see the
  * skip_alarm_pool comment in usb_host_core_init_pizero() for why this
  * exists instead of letting the library create its own internal timer.
+ *
+ * 2026-10-11: this helper (tick counter + alarm handler + the debug
+ * query below) is shared verbatim by pico2's optional PIO-USB build
+ * variant (usb_host_core_init_pico2_piousb(), further down) — the
+ * mechanism is pio_usb-library-level, not board-specific. Only the pin/
+ * PIO-instance choice differs per board/variant, in each board's own
+ * usb_host_core_init_*() function.
  *
  * 2026-09-27/28 real-hardware finding: this was originally driven via
  * pico_time's alarm_pool API (add_repeating_timer_us(), and before that
@@ -173,6 +180,7 @@ static void pio_usb_sof_alarm_handler(uint alarm_num) {
   hardware_alarm_set_target(alarm_num, delayed_by_us(get_absolute_time(), 1000));
 }
 
+#ifdef MSX_BOARD_PIZERO
 /* Waveshare RP2350-PiZero: the USB-host connector (GPIO28/29) is wired
  * as a PIO-USB port, not RP2350's native USB host controller — see
  * board_config.py's USB_HOST_DP_PIN comment and
@@ -274,12 +282,85 @@ static void usb_host_core_init_pizero(void) {
   hardware_alarm_set_callback(pio_usb_sof_alarm_num, pio_usb_sof_alarm_handler);
   hardware_alarm_set_target(pio_usb_sof_alarm_num, delayed_by_us(get_absolute_time(), 1000));
 }
+#endif /* MSX_BOARD_PIZERO */
+
+#ifdef MSX_USE_PIO_USB_HOST
+/* Pico 2 (main board) optional PIO-USB build variant — bldfrm_msx.sh's
+ * "pico2_piousb" target. Pico 2's USB-host port is normally wired to
+ * RP2350's native USB host controller (see the plain "#else" path in
+ * usb_host_core_init() below), which this variant deliberately does NOT
+ * use: a second, separate USB connector is instead wired to a free GPIO
+ * pair (GP4=D+, GP5=D-, 22Ω series resistors, no external pull-up/down —
+ * see 調査用/RP2350-PiZero_USBキーボード対応調査.md's 2026-10-11 addendum
+ * for the cross-project wiring notes this is based on), freeing the
+ * native USB controller entirely for a CDC REPL (mpremote over USB-C
+ * directly, replacing the external USB-UART adapter this project used
+ * before — see micropython_msx.cmake's MICROPY_HW_USB_CDC condition and
+ * mp/boot.py's usb_host.is_pio_usb() check).
+ *
+ * Ported 2026-10-11 from a sibling project (PB-1000 emulator)'s own
+ * working Pico 2 + PIO-USB + native-CDC port, itself originally based on
+ * this project's pizero PIO-USB work — see the same addendum above for
+ * the full knowledge-sharing trail. Structurally this is
+ * usb_host_core_init_pizero() with only the pin/PIO-instance choice
+ * changed (GP4/pio0 instead of GP28/pio1 — pio0 is completely unused on
+ * a pico2 build, unlike pizero where it's committed to onboard DVI); the
+ * skip_alarm_pool requirement, the hardware_alarm_*-driven SOF tick, and
+ * every other real-hardware finding documented on that function apply
+ * identically here and are not repeated. Does NOT call
+ * set_sys_clock_khz()/stdio_uart_init() for the same reason pizero's
+ * version doesn't: pio_usb_host_init() computes its PIO clock dividers
+ * dynamically from clk_sys at call time, so pico2's normal 250MHz
+ * (board_config.py's SYS_CLOCK_HZ) needs no adjustment for USB timing,
+ * and there is no UART0 REPL active on this variant to corrupt (CDC
+ * REPL only — see above). Not yet real-hardware verified on this
+ * project's own pico2 board as of this commit; see the addendum for
+ * what IS independently confirmed (PB-1000's own Pico 2 build, same
+ * library/pins/approach, different codebase).
+ */
+static void usb_host_core_init_pico2_piousb(void) {
+  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+  pio_cfg.pin_dp = 4;      /* GP4; D- = +1 = GP5 */
+  pio_cfg.pio_tx_num = 0;  /* pio0 — unused elsewhere on a pico2 build */
+  pio_cfg.sm_tx = 0;
+  pio_cfg.pio_rx_num = 0;
+  pio_cfg.sm_rx = 1;
+  pio_cfg.sm_eop = 2;
+  pio_cfg.tx_ch = 15;      /* highest DMA channel — see
+                            * usb_host_core_init_pizero()'s own comment
+                            * on why (defensive, avoids collision with
+                            * anything else that claims low channel
+                            * numbers first). */
+  pio_cfg.skip_alarm_pool = true;  /* mandatory — see
+                                    * usb_host_core_init_pizero()'s
+                                    * finding #1/#2/#3 comment. */
+
+  if (!tuh_configure(1, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg)) {
+    DEBUG_PRINTF("[USB Host] ERROR: tuh_configure (PIO-USB) failed!\n");
+    return;
+  }
+  if (!tuh_init(1)) {
+    DEBUG_PRINTF("[USB Host] ERROR: tuh_init failed!\n");
+    return;
+  }
+
+  pio_usb_sof_alarm_num = hardware_alarm_claim_unused(true);
+  hardware_alarm_set_callback(pio_usb_sof_alarm_num, pio_usb_sof_alarm_handler);
+  hardware_alarm_set_target(pio_usb_sof_alarm_num, delayed_by_us(get_absolute_time(), 1000));
+}
+#endif /* MSX_USE_PIO_USB_HOST */
 
 /* Real-hardware bring-up diagnostic — lets Python poll core0/PIO-USB
  * root-port liveness (msx.dvi_debug()'s own sibling, same rationale —
  * see disp_dvi.c). Exposed as usb_host.debug(). Kept as a permanent,
  * low-cost tool rather than removed, matching this project's established
- * pattern for this class of hard-won bring-up diagnostics. */
+ * pattern for this class of hard-won bring-up diagnostics.
+ *
+ * Still inside the outer "#if defined(MSX_BOARD_PIZERO) ||
+ * defined(MSX_USE_PIO_USB_HOST)" guard opened near the top of this tick-
+ * counter/alarm-handler section (not reopened here — pio_usb_sof_tick_
+ * count/PIO_USB_ROOT_PORT below are only declared/available inside that
+ * same guard). */
 void usb_host_core_debug_pizero(uint32_t *tick_count, uint32_t *connected,
                                  uint32_t *suspended, uint32_t *ints) {
   *tick_count = pio_usb_sof_tick_count;
@@ -288,11 +369,15 @@ void usb_host_core_debug_pizero(uint32_t *tick_count, uint32_t *connected,
   *suspended = root->suspended;
   *ints = root->ints;
 }
-#endif /* MSX_BOARD_PIZERO */
+#endif /* MSX_BOARD_PIZERO || MSX_USE_PIO_USB_HOST (opened near this
+          section's start, around pio_usb_sof_tick_count's declaration) */
 
 void usb_host_core_init(void) {
 #ifdef MSX_BOARD_PIZERO
   usb_host_core_init_pizero();
+  return;
+#elif defined(MSX_USE_PIO_USB_HOST)
+  usb_host_core_init_pico2_piousb();
   return;
 #else
   /* clk_sys must be a clean multiple of 12 MHz for the USB SIE's

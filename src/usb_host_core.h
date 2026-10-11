@@ -14,10 +14,16 @@ void usb_host_core_stop_bg_timer(void);
  * Layout: [modifier, reserved, keycode×6]  (USB HID boot protocol) */
 const uint8_t *usb_host_core_get_hid_report(void);
 
-#ifdef MSX_BOARD_PIZERO
-/* Real-hardware bring-up diagnostic (Phase 4, PIO-USB) — see
- * usb_host_core.c's own comment. Exposed via modusb_host.c as
- * usb_host.debug() -> (tick_count, connected, suspended, ints). */
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
+/* Real-hardware bring-up diagnostic, originally Phase 4 (pizero's
+ * onboard PIO-USB) — see usb_host_core.c's own comment. Equally
+ * applicable to pico2's optional PIO-USB build variant
+ * (bldfrm_msx.sh's "pico2_piousb" target, MSX_USE_PIO_USB_HOST), since
+ * the underlying mechanism (pio_usb's SOF tick + root-port state) is
+ * identical on both — kept under its original name rather than renamed,
+ * to avoid touching pizero's already real-hardware-confirmed code path
+ * for a cosmetic reason. Exposed via modusb_host.c as usb_host.debug()
+ * -> (tick_count, connected, suspended, ints). */
 void usb_host_core_debug_pizero(uint32_t *tick_count, uint32_t *connected,
                                  uint32_t *suspended, uint32_t *ints);
 #endif
