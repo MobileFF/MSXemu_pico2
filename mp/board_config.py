@@ -217,10 +217,28 @@ else:
     # *SD card* itself can tolerate: an LCD controller and an SD card in SPI
     # mode have very different input timing margins, so "the bus already runs
     # this fast for something else" is not evidence it's safe for the card.
-    # 4MHz is a deliberately conservative starting point (still 10x the
-    # previous 400kHz) — raise it later only after confirming reads are
-    # reliable at this rate first.
-    SD_DATA_BAUD = 4_000_000
+    # 4MHz was a deliberately conservative starting point (still 10x the
+    # previous 400kHz).
+    #
+    # 2026-10-13: raised to 12MHz after a real-hardware step sweep
+    # (mp/test/sweep_sd_baud.py) confirmed byte-exact reads (vs a 4MHz
+    # baseline, re-verified 3x per step) at 4/6/8/10/12/16MHz, with
+    # measured throughput of 355/500/630/630/850/849 KB/s respectively —
+    # i.e. it plateaus right at 12MHz (16MHz gave no further real gain,
+    # meaning per-block/command overhead, not SPI clock, is the limiting
+    # factor above this point). 12MHz was chosen over 16MHz specifically
+    # *because* of that plateau: same practical throughput, but more
+    # safety margin below the known-bad 20MHz.
+    #
+    # IMPORTANT: the sweep above only exercises reads *after* the card is
+    # already initialized and has been read from many times. The known
+    # 20MHz failure happened specifically on uos.mount()'s very first,
+    # cold readblocks() call (right after CMD16, reading the filesystem
+    # header) — a different, less-forgiving moment that this sweep does
+    # not reproduce. This 12MHz value has NOT yet been confirmed across a
+    # full cold power-cycle boot (real uos.mount() at startup) — do that
+    # check before relying on it / before committing this change.
+    SD_DATA_BAUD = 12_000_000
 
     AUDIO_PIN    = 14
 

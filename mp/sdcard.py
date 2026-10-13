@@ -174,6 +174,29 @@ class SDCard:
         self.spi.write(b"\xff")
         return -1
 
+    # 2026-10-13: data-start-token wait tuning. Every other busy-wait loop
+    # in this file (cmd()'s R1-response wait, write()/write_token()'s
+    # write-complete wait, _readblocks_once()'s CMD12 busy wait) polls at
+    # full SPI speed with no sleep at all. This loop used to be the one
+    # exception: it called time.sleep_ms(1) on *every* failed poll,
+    # unconditionally, even though on real hardware the data token
+    # typically arrives within a handful of byte-times (sub-millisecond).
+    # Since readinto() runs once per 512-byte block -- including every
+    # sub-block of a CMD18 multi-block transfer -- that stray ~1ms of
+    # pure sleep latency was being paid per block. On a multi-thousand-
+    # block sequential transfer (e.g. the Mega ROM SD->flash cache copy,
+    # see msx_menu.py's _copy_to_flash_cache()) this adds up to multiple
+    # seconds of dead time that has nothing to do with actual SPI bus
+    # bandwidth or the card's real response latency.
+    #
+    # Fix: busy-poll (no sleep) for the first _FAST_POLL iterations --
+    # covers the common case at essentially zero added latency, matching
+    # every other wait loop in this file -- and only fall back to
+    # sleep_ms(1) polling once that fast phase is exhausted, so a
+    # genuinely slow card still gets close to the original ~500ms worst-
+    # case timeout grace before this raises OSError.
+    _FAST_POLL = 100
+
     def readinto(self, buf):
         self.cs(0)
 
@@ -182,7 +205,8 @@ class SDCard:
             self.spi.readinto(self.tokenbuf, 0xFF)
             if self.tokenbuf[0] == _TOKEN_DATA:
                 break
-            time.sleep_ms(1)
+            if i >= self._FAST_POLL:
+                time.sleep_ms(1)
         else:
             self.cs(1)
             raise OSError("timeout waiting for response")
@@ -193,9 +217,10 @@ class SDCard:
             mv = mv[: len(buf)]
         self.spi.write_readinto(mv, buf)
 
-        # read checksum
-        self.spi.write(b"\xff")
-        self.spi.write(b"\xff")
+        # read checksum (2 bytes in one transfer instead of two 1-byte
+        # calls -- same bytes on the wire, one fewer Python/SPI call per
+        # block)
+        self.spi.write(b"\xff\xff")
 
         self.cs(1)
         self.spi.write(b"\xff")
@@ -203,11 +228,11 @@ class SDCard:
     def write(self, token, buf):
         self.cs(0)
 
-        # send: start of block, data, checksum
+        # send: start of block, data, checksum (2 bytes in one call --
+        # see the comment above readinto()'s own checksum read)
         self.spi.read(1, token)
         self.spi.write(buf)
-        self.spi.write(b"\xff")
-        self.spi.write(b"\xff")
+        self.spi.write(b"\xff\xff")
 
         # check valid response
         if (self.spi.read(1, 0xFF)[0] & 0x1F) != 0x05:
