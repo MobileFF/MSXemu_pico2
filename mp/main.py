@@ -203,16 +203,35 @@ SAVE_BASE    = "/sd/msx/save"
 # Kept as a toggle in case it's useful again later; not currently used for
 # active investigation (see SD_DATA_BAUD in board_config.py instead).
 _DIAG_ENABLE_USB = True
-# -----------------------------------------------------------------------
+
+# 2026-10-13: C-implemented SD driver (modsdcard_c.c, module `sdcard_c`,
+# built into the firmware — see its own header comment for why: removes
+# machine.SPI's per-call DMA-channel claim/unclaim and the whole SD SPI
+# protocol's Python-interpreter overhead from the hot path, both of which
+# became the real bottleneck once SD_DATA_BAUD's own increase plateaued
+# at 12MHz, see CHANGELOG.md). Set to False to force the original,
+# long-proven pure-Python driver (mp/sdcard.py) without needing to touch
+# anything else — mount_sd() below already falls back to it automatically
+# if sdcard_c is missing (older firmware) or fails for any reason, but
+# this toggle is for forcing the fallback deliberately (e.g. while still
+# validating the C driver on real hardware).
+_USE_C_SDCARD = True
+
+
 def mount_sd():
     try:
-        import machine, sdcard
+        import machine
+        # Construct machine.SPI once, purely for its side effect of
+        # configuring the physical bus (GPIO pin functions + spi_init()).
+        # Both drivers below "take over" the raw spi_inst_t* directly
+        # afterward without going through this object's own transfer
+        # methods — the same established convention msx_core.c already
+        # uses to share this bus with the LCD/HDMI code.
         sd_spi = machine.SPI(SD_SPI_ID,
                               baudrate=SD_INIT_BAUD,
                               sck=machine.Pin(SD_SCK_PIN),
                               mosi=machine.Pin(SD_MOSI_PIN),
                               miso=machine.Pin(SD_MISO_PIN))
-        sd_cs = machine.Pin(SD_CS_PIN, machine.Pin.OUT, value=1)
         # restore_baudrate exists so pico2's SD driver can hand the shared
         # SPI1 bus back to the expected LCD speed after each SD
         # transaction (SD and LCD are on the same bus there). pizero has
@@ -220,9 +239,27 @@ def mount_sd():
         # has its own independent bus, so there's nothing to "restore" to
         # — fall back to SD's own data baud (a no-op) instead of passing
         # None through to machine.SPI.init(), which can't convert it.
-        sd = sdcard.SDCard(sd_spi, sd_cs,
-                           baudrate=SD_DATA_BAUD,
-                           restore_baudrate=SPI_BAUD if SPI_BAUD is not None else SD_DATA_BAUD)
+        restore_baud = SPI_BAUD if SPI_BAUD is not None else SD_DATA_BAUD
+
+        sd = None
+        if _USE_C_SDCARD:
+            try:
+                import sdcard_c
+                sd = sdcard_c.SDCard(SD_SPI_ID, SD_CS_PIN,
+                                      baudrate=SD_DATA_BAUD,
+                                      restore_baudrate=restore_baud)
+                print("SD: using C driver (sdcard_c)")
+            except Exception as e:
+                print(f"SD: C driver unavailable/failed ({e}), falling back to Python driver")
+                sd = None
+
+        if sd is None:
+            import sdcard
+            sd_cs = machine.Pin(SD_CS_PIN, machine.Pin.OUT, value=1)
+            sd = sdcard.SDCard(sd_spi, sd_cs,
+                               baudrate=SD_DATA_BAUD,
+                               restore_baudrate=restore_baud)
+
         uos.mount(sd, '/sd')
         print("SD mounted at /sd")
         return True

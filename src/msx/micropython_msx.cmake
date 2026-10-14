@@ -127,6 +127,12 @@ target_sources(msx_lib INTERFACE
 
     # USB host (reused from PB-1000 project)
     ${CMAKE_CURRENT_LIST_DIR}/../modusb_host.c
+
+    # C-implemented SD card SPI block device (2026-10-13) — see its own
+    # header comment in modsdcard_c.c. Board/variant-agnostic (no #ifdef
+    # gating), unlike the PIO-USB additions above, so it's unconditionally
+    # part of every build (pico2/pico2_piousb/pizero alike).
+    ${CMAKE_CURRENT_LIST_DIR}/../modsdcard_c.c
 )
 
 target_include_directories(msx_lib INTERFACE
