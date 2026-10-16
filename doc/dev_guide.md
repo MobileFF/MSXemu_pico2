@@ -17,17 +17,21 @@ MSX_emu_pico2/
 ├── bldfrm_msx.sh              # ビルドスクリプト
 ├── firmware/                  # ビルド成功時に自動コピーされるfirmware_msx.uf2置き場
 ├── doc/                       # このドキュメント群
-├── src/msx/
-│   ├── msx_core.h             # msx_state_t / 公開API宣言
-│   ├── msx_core.c             # MSXシステム本体（Z80/VDP/PSG統合、メモリ管理、フレームループ、表示DMA）
-│   ├── modmsx.c               # MicroPython Cユーザーモジュール（`msx`）
-│   ├── micropython_msx.cmake  # CMakeビルド設定
-│   ├── z80/                   # superzazu/z80 (MIT) — Z80 CPUコア
-│   ├── tms9918/                # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDPコア
-│   └── emu2149/                # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSGコア
+├── src/
+│   ├── modmsx_ui.c             # UI層のCユーザーモジュール（`msx_ui`）— MenuCanvas/キー入力/
+│   │                           # セーブステートI/O/config I/O/カートロード制御フロー
+│   └── msx/
+│       ├── msx_core.h             # msx_state_t / 公開API宣言
+│       ├── msx_core.c             # MSXシステム本体（Z80/VDP/PSG統合、メモリ管理、フレームループ、表示DMA）
+│       ├── modmsx.c               # MicroPython Cユーザーモジュール（`msx`）
+│       ├── micropython_msx.cmake  # CMakeビルド設定
+│       ├── z80/                   # superzazu/z80 (MIT) — Z80 CPUコア
+│       ├── tms9918/                # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDPコア
+│       └── emu2149/                # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSGコア
 └── mp/
     ├── main.py             # 起動フロー・メインループ
-    ├── msx_menu.py             # ROM選択・実行時メニュー・セーブステート・カートリッジロード
+    ├── msx_menu.py             # select_rom/show_emulator_menuへの薄い遅延importラッパー
+    │                           # （実装の大半は上記msx_uiへ移動済み。詳細はarchitecture.md参照）
     └── msx_keymap.py           # USB HID → MSXキー行列マッピング
 ```
 
@@ -67,6 +71,23 @@ MSXシステムそのもの。Pico SDK に依存しないよう設計されて�
 - Python バッファ（`bytes`/`bytearray`）とのやり取りは `mp_get_buffer_raise()` で取得したポインタをそのまま C コアに渡す（コピーしない）。
 - 大きなデータ（RAM/VRAM/フレームバッファ）を Python に渡す際は `mp_obj_new_bytearray_by_ref()` でゼロコピーの参照ビューを返す。
 - メガロムのページフェッチでは、Python 側で開いたファイルオブジェクトを `MP_REGISTER_ROOT_POINTER` で MicroPython の GC ルートポインタとして保持し、C から `mp_stream_seek()`/`mp_stream_read_exactly()` で直接読み込む（Pythonメソッド呼び出しのオーバーヘッドなし、例外はerrcodeベースで受け取る）。
+
+### `msx_ui` モジュール（`src/modmsx_ui.c`）
+
+`mp/msx_menu.py`は他のメニュー系モジュール（`msx_rom_browser.py`等）と違って`main.py`から毎起動eager importされるため、そのコンパイルコストが定常的なGCヒープ圧迫の主要因になっていた（`doc/memory_usage.md`§8）。2026-10-16〜17にこの実装の大半を`msx_ui`という別のCユーザーモジュールへ3フェーズに分けて移植し、`msx_menu.py`は929行→165行に縮小した。
+
+- フェーズ1: `MenuCanvas`描画コア・色/HID定数・表示サスペンド状態・USBキーボードポーリング・メッセージ表示
+- フェーズ2: セーブステートI/O・実機チューニング済みのchunked file I/Oヘルパー（`readinto_chunked`/`write_chunked`）
+- フェーズ3: `msx.ini`のconfig I/O（`load_config`/`save_config`）・カートリッジロード制御フロー（`load_cart_smart`、メガロムフラッシュキャッシュ、マッパー自動判定）
+
+実装上のポイント:
+
+- `msx_get_state()`/`msx_get_scratch_buf()`（`msx_core.h`宣言、`modmsx.c`定義）経由で`modmsx.c`が保持するグローバル`msx_state_t`とスクラッチバッファに直接アクセスし、Pythonバインディングを経由しない。
+- `msx.load_cart_paged()`自体（ページ切替ファイルのGCルート管理を伴う複雑な状態機械）はC化せず、汎用メソッド呼び出しヘルパー（`ui_call_method_n()`、`mp_load_method`/`mp_call_method_n_kw`ベース）経由で既存の`modmsx.c`実装にそのまま委譲している。
+- サブルーチン（CALL/RST）フック機構（§6）は対象外で、引き続きPython専用のまま。
+- `msx_menu.py`は`from msx_ui import ...`で全ての名前を同名のまま再公開しているだけなので、呼び出し側（`main.py`/`msx_rom_browser.py`/`msx_runtime_menu.py`等）は一切変更不要。新しい関数を`msx_ui`側に追加する場合も、`msx_menu.py`側の再公開リストへの追記を忘れないこと。
+
+詳細な設計意図は`architecture.md`および`src/modmsx_ui.c`冒頭のコメントを参照。
 
 ---
 

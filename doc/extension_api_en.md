@@ -22,6 +22,8 @@ while True:
 
 Emulator state lives as a single global instance inside the module (one MSX system per Pico). Every function operates on that implicit instance.
 
+> **About `msx_ui`**: UI-layer functionality — `MenuCanvas` drawing, save-state I/O, `msx.ini` config I/O, the cartridge-loading control flow — lives in a separate C user module, `msx_ui` (`src/modmsx_ui.c`), and is out of scope for this reference. `mp/msx_menu.py` re-exports it all under the original Python names, so application code keeps calling it as `msx_menu.xxx` (no need to `import msx_ui` directly). See `architecture_en.md`'s "`msx_ui` Module" section for the design rationale, and `src/modmsx_ui.c`'s own comments for per-function detail.
+
 ---
 
 ## Lifecycle

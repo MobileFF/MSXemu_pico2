@@ -133,6 +133,14 @@ target_sources(msx_lib INTERFACE
     # gating), unlike the PIO-USB additions above, so it's unconditionally
     # part of every build (pico2/pico2_piousb/pizero alike).
     ${CMAKE_CURRENT_LIST_DIR}/../modsdcard_c.c
+
+    # C-implemented UI foundation (2026-10-16) — MenuCanvas/draw
+    # primitives/key polling/display-suspend state, ported from
+    # mp/msx_menu.py's eagerly-compiled (every boot) foundation to reduce
+    # chronic GC-heap pressure (doc/memory_usage.md). See its own header
+    # comment in modmsx_ui.c. Board/variant-agnostic, same as
+    # modsdcard_c.c above.
+    ${CMAKE_CURRENT_LIST_DIR}/../modmsx_ui.c
 )
 
 target_include_directories(msx_lib INTERFACE

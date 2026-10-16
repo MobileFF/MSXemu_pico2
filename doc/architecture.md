@@ -17,15 +17,21 @@
 ```text
 ┌─────────────────────────────────────────────┐
 │  mp/main.py   起動フロー・メインループ    │
-│  mp/msx_menu.py   ROM選択/実行時メニュー/セーブ │
+│  mp/msx_menu.py   select_rom/show_emulator_menuの │
+│                    遅延importラッパー(薄い)        │
 │  mp/msx_keymap.py USB HID → MSXキー行列変換   │
 └───────────────────┬───────────────────────────┘
-                     │ import msx  (Cユーザーモジュール)
+                     │ import msx / msx_ui (Cユーザーモジュール)
 ┌───────────────────▼───────────────────────────┐
 │  src/msx/modmsx.c     MicroPython ⇔ C 橋渡し層   │
 │    - msx_state_t のグローバルインスタンスを保持    │
 │    - Python オブジェクト ⇔ C 構造体の変換          │
 │    - PWM音声・ファイルI/O(メガロムfetch)のPico SDK依存部 │
+│  src/modmsx_ui.c      UI層のC実装(msx_ui)         │
+│    - MenuCanvas描画/キー入力/セーブステートI/O/    │
+│      config I/O/カートロード制御フローをC化        │
+│    - msx_get_state()/msx_get_scratch_buf()経由で   │
+│      modmsx.cのmsx_state_tに直接アクセス(詳細は下記)│
 └───────────────────┬───────────────────────────┘
                      │
 ┌───────────────────▼───────────────────────────┐
@@ -92,6 +98,20 @@
 
 完全な関数一覧は `extension_api.md` を参照。
 
+### `msx_ui` モジュール（`src/modmsx_ui.c`）
+
+`mp/msx_menu.py` は（`msx_rom_browser.py`/`msx_runtime_menu.py`等の他のメニュー系モジュールと違って）`main.py`から毎起動eager importされるため、そのコンパイルコストは起動のたびに必ず支払われる。これが定常的なGCヒープ圧迫の主要因だった（`doc/memory_usage.md`§8に詳細）ため、2026-10-16〜17にかけて`msx_menu.py`の実装の大半を3フェーズに分けて`msx_ui`という別のCユーザーモジュール（`src/modmsx_ui.c`）へ移植した。結果、`msx_menu.py`自体は929行→165行に縮小し、呼び出し側（`main.py`/`msx_rom_browser.py`等）の呼び出し規約は一切変更していない。
+
+- **フェーズ1**: `MenuCanvas`描画コア（`framebuf`非経由、`msx_core.c`と同じRGB565バイトスワップ処理を直接実装）、色/HID定数、表示サスペンド状態、USBキーボードポーリング、メッセージ表示
+- **フェーズ2**: セーブステートI/O（`save_state_to`/`load_state_from`）、SDカード信頼性のため実機チューニング済みのchunked file I/Oヘルパー（`readinto_chunked`/`write_chunked`、1チャンクあたり最大4096バイト・ストリーム呼び出し1回という挙動を厳密に踏襲）
+- **フェーズ3**: `msx.ini`のconfig I/O（`load_config`/`save_config`）、カートリッジロード制御フロー（`load_cart_smart`、メガロムの内蔵フラッシュキャッシュ検証/コピー、マッパー自動判定とKONAMIフォールバック）
+
+実装上のポイント:
+
+- `msx_get_state()`/`msx_get_scratch_buf()`（`msx_core.h`で宣言、`modmsx.c`で定義）経由で`modmsx.c`が保持するグローバル`msx_state_t`インスタンスとスクラッチバッファへ直接アクセスしており、Pythonバインディングを経由しない。
+- 唯一の例外として、`msx.load_cart_paged()`（ページ切替ファイルをGCルートポインタとして保持する複雑な状態機械）だけはC化せず、`mp_load_method`/`mp_call_method_n_kw`ベースの汎用メソッド呼び出しヘルパー（`ui_call_method_n()`）経由で既存の`modmsx.c`実装にそのまま委譲している。実機実績のある複雑な機構を目的と無関係に再実装するリスクを避けるための意図的な設計判断。
+- サブルーチン（CALL/RST）フック機構（§6参照）は本C化と無関係で、引き続きPython専用の仕組みのまま変更していない。
+
 ### ゼロコピー設計の徹底
 
 MicroPythonのGCヒープは**非圧縮（non-compacting）**であり、生きたオブジェクトが多少散らかった状態では、たとえ「合計の空き容量」が十分でも大きな連続ブロックの確保が高確率で失敗する（`MemoryError`）。この教訓から、以下は徹底してゼロコピー（既存のC側メモリをそのまま `bytearray_by_ref` 等で参照）にしている:
@@ -119,13 +139,19 @@ MicroPythonのGCヒープは**非圧縮（non-compacting）**であり、生き�
 
 > **注意**: バンク切替時のROMフェッチ（メガロム）が LCD/SD と同じ SPI1 バスを使う SD カードに対して行われる設計だと、このパイプライン処理と衝突して DMA 転送中の SD 読み込みが `I/O error` を起こす。現在の実装ではメガロムのフェッチ元を Pico2 内蔵フラッシュ（QSPIバス、SPI1とは独立）に限定することでこの問題を回避し、パイプライン処理を安全に維持している（詳細は `usage_guide.md` のメガロム節を参照）。
 
-### `msx_menu.py` — ROM選択・実行時メニュー・カートリッジロード
+### `msx_menu.py` — ROM選択・実行時メニューへの薄いラッパー
 
-- `select_rom()` — SDカード上の `.ROM` ファイル一覧から選択するUI（USBキーボード操作、タイムアウトで自動選択）
+上記の通り、以下の機能の実装自体は`msx_ui`（`src/modmsx_ui.c`）へ移植済み。`msx_menu.py`はこれらを`from msx_ui import ...`で同名のまま再公開しているだけで、呼び出し側からは従来通り`msx_menu.xxx`として見える:
+
 - `load_cart_smart()` — カートリッジサイズに応じてフル RAM ロード / メガロムページングを自動選択。メガロムの場合、SDカードから Pico2 内蔵フラッシュへ一度だけコピーし（`/megarom_cache.rom`）、以降はそこから読み込む
 - `save_state_to()` / `load_state_from()` — ゼロコピー設計のセーブステート実装
-- `show_emulator_menu()` — GUI+F7 で起動するランタイムメニュー（カートリッジ交換・セーブ/ロード・音量/フィルタ調整・リセット）
 - `load_config()` / `save_config()` — `config.txt` の読み書き
+
+`msx_menu.py`自身に残っているのは以下のみ（いずれも遅延import、他の`.py`ファイルの多さに比して`msx_menu.py`自体は常にコンパイルされるため意図的に薄く保ってある）:
+
+- `select_rom()` — `msx_rom_browser.py`（SDカード上の`.ROM`一覧からUSBキーボードで選ぶUI、タイムアウトで自動選択）への遅延importラッパー
+- `show_emulator_menu()` — `msx_runtime_menu.py`（GUI+F7で起動するランタイムメニュー: カートリッジ交換・セーブ/ロード・音量/フィルタ調整・リセット）への遅延importラッパー
+- `log_mem()` — ヒープ診断ヘルパー（`doc/memory_usage.md`§4.1参照）
 
 ### `msx_keymap.py` — キーボードマッピング
 
@@ -142,8 +168,13 @@ main.py
   -> msx_menu.py
 
 msx_menu.py
-  -> msx (Cモジュール)
-  -> uos / framebuf (MicroPython標準)
+  -> msx_ui (Cモジュール、大半のロジックはここへ委譲済み)
+  -> msx_rom_browser.py / msx_runtime_menu.py (遅延import)
+
+msx_ui (modmsx_ui.c)
+  -> msx_core.h 経由で msx_state_t に直接アクセス
+     (msx_get_state()/msx_get_scratch_buf())
+  -> msx (Cモジュール、load_cart_paged()のみメソッド呼び出しで委譲)
 
 msx (modmsx.c)
   -> msx_core.c/h

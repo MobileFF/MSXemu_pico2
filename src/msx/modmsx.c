@@ -46,6 +46,18 @@
 static msx_state_t msx_state;
 static bool msx_global_initialized = false;
 
+/* msx_get_state() — direct C-level accessor to the single global
+ * msx_state instance, for OTHER C modules in this project (e.g.
+ * src/modmsx_ui.c, the 2026-10-16 UI-layer C port) that need to call
+ * msx_render_to_display_1to1()/msx_get_vram_ptr()/etc. directly instead
+ * of bouncing through this module's Python bindings. msx_state itself
+ * stays `static` (this file remains its sole owner/initializer) — this
+ * is a deliberate narrow accessor, not a reason to make the global
+ * itself extern. */
+msx_state_t *msx_get_state(void) {
+    return &msx_state;
+}
+
 /* Save-state header scratch buffer — MSX_SAVE_HDR_SZ (64) bytes only.
  * The ~64KB RAM portion is NOT duplicated here: msx.get_ram_view() hands
  * out a zero-copy view of msx_state.ram directly (that memory already
@@ -264,16 +276,32 @@ static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_bios_view_obj, msx_py_get_bios_view)
 #define MSX_SCRATCH_SIZE 4096
 static uint8_t *msx_scratch_buf = NULL;
 
-static mp_obj_t msx_py_get_scratch_view(void) {
+/* Shared by msx_py_get_scratch_view() below and msx_get_scratch_buf()
+ * (src/msx/msx_core.h) — the single lazy-malloc'd 4KB buffer, however
+ * it's reached. */
+static uint8_t *msx_scratch_buf_ensure(void) {
     if (msx_scratch_buf == NULL) {
         msx_scratch_buf = malloc(MSX_SCRATCH_SIZE);
         if (msx_scratch_buf == NULL) {
             mp_raise_type(&mp_type_MemoryError);
         }
     }
-    return mp_obj_new_bytearray_by_ref(MSX_SCRATCH_SIZE, msx_scratch_buf);
+    return msx_scratch_buf;
+}
+
+static mp_obj_t msx_py_get_scratch_view(void) {
+    return mp_obj_new_bytearray_by_ref(MSX_SCRATCH_SIZE, msx_scratch_buf_ensure());
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_scratch_view_obj, msx_py_get_scratch_view);
+
+/* C-level accessor to the same buffer, for src/modmsx_ui.c's (2026-10-16,
+ * phase 3) C port of msx_menu.get_rom_load_buf() — same rationale as
+ * msx_get_state() above: one more narrow accessor rather than exposing
+ * msx_scratch_buf itself as extern. Size is fixed at MSX_SCRATCH_SIZE
+ * (4096) either way, so no separate size getter is needed. */
+uint8_t *msx_get_scratch_buf(void) {
+    return msx_scratch_buf_ensure();
+}
 
 /* -----------------------------------------------------------------------
  * msx.mark_bios_loaded(size: int) -> bool

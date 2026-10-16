@@ -17,15 +17,21 @@ This document lays out the overall structure of the MSX1 emulator running on a R
 ```text
 ┌─────────────────────────────────────────────┐
 │  mp/main.py   boot flow, main loop        │
-│  mp/msx_menu.py   ROM select / runtime menu / save-state │
+│  mp/msx_menu.py   thin lazy-import wrapper around         │
+│                    select_rom/show_emulator_menu           │
 │  mp/msx_keymap.py USB HID -> MSX key-matrix mapping      │
 └───────────────────┬───────────────────────────┘
-                     │ import msx  (C user module)
+                     │ import msx / msx_ui  (C user modules)
 ┌───────────────────▼───────────────────────────┐
 │  src/msx/modmsx.c     MicroPython <-> C bridge layer          │
 │    - holds the global msx_state_t instance                    │
 │    - converts between Python objects and C structs            │
 │    - Pico-SDK-dependent bits: PWM audio, file I/O (Mega ROM fetch) │
+│  src/modmsx_ui.c      the UI layer, in C (msx_ui)              │
+│    - MenuCanvas drawing / key input / save-state I/O /        │
+│      config I/O / cart-loading control flow, all ported here  │
+│    - reaches modmsx.c's msx_state_t directly via               │
+│      msx_get_state()/msx_get_scratch_buf() (see below)        │
 └───────────────────┬───────────────────────────┘
                      │
 ┌───────────────────▼───────────────────────────┐
@@ -88,6 +94,20 @@ Exposes `msx_core.c`'s functionality to Python as a C user module named `msx`. I
 
 See `extension_api_en.md` for the complete function list.
 
+### The `msx_ui` Module (`src/modmsx_ui.c`)
+
+Unlike the other menu-related modules (`msx_rom_browser.py`/`msx_runtime_menu.py`, etc.), `mp/msx_menu.py` is imported eagerly by `main.py` on every single boot, so its compile cost was always paid up front. That turned out to be the main driver of a chronic GC-heap squeeze (see `doc/memory_usage.md` §8), so between 2026-10-16 and 2026-10-17 most of `msx_menu.py`'s implementation was ported, in three phases, into a separate C user module, `msx_ui` (`src/modmsx_ui.c`). `msx_menu.py` itself shrank from 929 to 165 lines, with zero change to how any caller (`main.py`, `msx_rom_browser.py`, etc.) invokes it.
+
+- **Phase 1**: the `MenuCanvas` drawing core (bypasses `framebuf`, reusing `msx_core.c`'s own RGB565 byte-swap logic directly), color/HID constants, display-suspend state, USB keyboard polling, message display
+- **Phase 2**: save-state I/O (`save_state_to`/`load_state_from`), and the chunked file-I/O helpers (`readinto_chunked`/`write_chunked`) tuned against real-hardware SD-card reliability (preserving the exact "at most 4096 bytes and one stream call per chunk" behavior)
+- **Phase 3**: `msx.ini` config I/O (`load_config`/`save_config`), and the cartridge-loading control flow (`load_cart_smart`, the Mega ROM onboard-flash cache validate/copy, mapper auto-detection with its KONAMI fallback)
+
+Implementation notes:
+
+- It reaches `modmsx.c`'s global `msx_state_t` instance and scratch buffer directly via `msx_get_state()`/`msx_get_scratch_buf()` (declared in `msx_core.h`, defined in `modmsx.c`), bypassing the Python bindings entirely.
+- The one deliberate exception is `msx.load_cart_paged()` itself (a complex state machine that holds the paging file as a GC root pointer) — rather than reimplementing it, `msx_ui` delegates that one call to the existing, already-proven `modmsx.c` implementation via a generic `mp_load_method`/`mp_call_method_n_kw`-based method-call helper (`ui_call_method_n()`). This avoids re-deriving genuinely complex, real-hardware-validated machinery for a part that was never the actual target of this effort.
+- The subroutine (CALL/RST) hook mechanism (§6) is unrelated to this work and remains a Python-only facility, unchanged.
+
 ### Committing to Zero-Copy
 
 MicroPython's GC heap is **non-compacting** — even when the *total* free space is plenty, a single large contiguous allocation can fail (`MemoryError`) with high probability once the heap has any scattered live objects. Learning this the hard way drove a strict zero-copy policy (referencing existing C-side memory directly, e.g. via `bytearray_by_ref`, instead of allocating and copying):
@@ -115,13 +135,19 @@ The main loop uses **pipelining**: frame N's display DMA transfer runs concurren
 
 > **Note**: if Mega ROM bank-switch fetches were to read from the SD card (which shares the SPI1 bus with the LCD), they would collide with this pipelining and cause `I/O error`s during an in-flight display DMA transfer. The current implementation avoids this entirely by only ever fetching Mega ROM pages from the Pico 2's onboard flash (a separate QSPI bus, independent of SPI1), keeping pipelining safe. See the Mega ROM section in `usage_guide_en.md` for details.
 
-### `msx_menu.py` — ROM Selection, Runtime Menu, Cart Loading
+### `msx_menu.py` — a Thin Wrapper Around ROM Selection / the Runtime Menu
 
-- `select_rom()` — a UI for picking a `.ROM` file from the SD card (keyboard-driven, with a timeout-based auto-select)
+As noted above, the following are now implemented in `msx_ui` (`src/modmsx_ui.c`); `msx_menu.py` just re-exports them under their original names via `from msx_ui import ...`, so every caller still sees them as `msx_menu.xxx`:
+
 - `load_cart_smart()` — automatically chooses full in-RAM loading vs. Mega ROM paging based on file size. For Mega ROMs, the file is copied once from SD to the Pico's onboard flash (`/megarom_cache.rom`) and read from there thereafter
 - `save_state_to()` / `load_state_from()` — the zero-copy save-state implementation
-- `show_emulator_menu()` — the GUI+F7 runtime menu (swap cartridge, save/load state, adjust volume/filter, reset)
 - `load_config()` / `save_config()` — reading and writing `config.txt`
+
+What's left defined directly in `msx_menu.py` (both still lazy-imported wrappers, kept deliberately thin since, unlike the modules they wrap, `msx_menu.py` itself is always compiled):
+
+- `select_rom()` — a thin lazy-import wrapper around `msx_rom_browser.py` (a UI for picking a `.ROM` file from the SD card, keyboard-driven, with a timeout-based auto-select)
+- `show_emulator_menu()` — a thin lazy-import wrapper around `msx_runtime_menu.py` (the GUI+F7 runtime menu: swap cartridge, save/load state, adjust volume/filter, reset)
+- `log_mem()` — the heap diagnostics helper (see `doc/memory_usage.md` §4.1)
 
 ### `msx_keymap.py` — Keyboard Mapping
 
@@ -138,8 +164,13 @@ main.py
   -> msx_menu.py
 
 msx_menu.py
-  -> msx (C module)
-  -> uos / framebuf (MicroPython standard library)
+  -> msx_ui (C module, most of the logic now lives here)
+  -> msx_rom_browser.py / msx_runtime_menu.py (lazy import)
+
+msx_ui (modmsx_ui.c)
+  -> msx_state_t, reached directly via msx_core.h
+     (msx_get_state()/msx_get_scratch_buf())
+  -> msx (C module; only load_cart_paged() is delegated via a method call)
 
 msx (modmsx.c)
   -> msx_core.c/h

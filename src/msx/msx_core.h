@@ -396,6 +396,20 @@ typedef struct __attribute__((packed)) {
 /* Initialize MSX state (does not start emulation). */
 void msx_init(msx_state_t *msx);
 
+/* Direct C-level accessor to the single global msx_state instance owned
+ * by modmsx.c (static there) — for other C modules in this project
+ * (e.g. modmsx_ui.c) that want to call msx_render_*()/msx_get_vram_ptr()/
+ * etc. directly instead of going through modmsx.c's Python bindings.
+ * Defined in modmsx.c. */
+msx_state_t *msx_get_state(void);
+
+/* Direct C-level accessor to modmsx.c's lazily-malloc'd 4KB scratch
+ * buffer (MSX_SCRATCH_SIZE there) — same buffer msx.get_scratch_view()
+ * hands out to Python, just reached without a Python call. Raises
+ * MemoryError (via mp_raise_type()) if the C heap is exhausted, same as
+ * msx.get_scratch_view(). Defined in modmsx.c. */
+uint8_t *msx_get_scratch_buf(void);
+
 /* Load 32KB MSX BIOS/BASIC ROM into slot 0. */
 bool msx_load_bios(msx_state_t *msx, const uint8_t *data, uint32_t size);
 

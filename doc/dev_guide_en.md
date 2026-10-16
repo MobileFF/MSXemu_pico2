@@ -17,17 +17,21 @@ MSX_emu_pico2/
 ├── bldfrm_msx.sh              # Build script
 ├── firmware/                  # firmware_msx.uf2 auto-copied here on a successful build
 ├── doc/                       # This documentation
-├── src/msx/
-│   ├── msx_core.h             # msx_state_t and the public API declarations
-│   ├── msx_core.c             # The MSX system itself (Z80/VDP/PSG integration, memory management, frame loop, display DMA)
-│   ├── modmsx.c                # The MicroPython C user module (`msx`)
-│   ├── micropython_msx.cmake   # CMake build configuration
-│   ├── z80/                    # superzazu/z80 (MIT) — Z80 CPU core
-│   ├── tms9918/                 # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDP core
-│   └── emu2149/                 # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSG core
+├── src/
+│   ├── modmsx_ui.c              # The UI-layer C user module (`msx_ui`) — MenuCanvas, key
+│   │                            # input, save-state I/O, config I/O, cart-loading flow
+│   └── msx/
+│       ├── msx_core.h             # msx_state_t and the public API declarations
+│       ├── msx_core.c             # The MSX system itself (Z80/VDP/PSG integration, memory management, frame loop, display DMA)
+│       ├── modmsx.c                # The MicroPython C user module (`msx`)
+│       ├── micropython_msx.cmake   # CMake build configuration
+│       ├── z80/                    # superzazu/z80 (MIT) — Z80 CPU core
+│       ├── tms9918/                 # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDP core
+│       └── emu2149/                 # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSG core
 └── mp/
     ├── main.py              # Boot flow and main loop
-    ├── msx_menu.py              # ROM selection, runtime menu, save state, cart loading
+    ├── msx_menu.py              # Thin lazy-import wrapper around select_rom/show_emulator_menu
+    │                            # (most of its old logic now lives in msx_ui above — see architecture_en.md)
     └── msx_keymap.py            # USB HID -> MSX key-matrix mapping
 ```
 
@@ -67,6 +71,23 @@ Implementation notes:
 - Python buffers (`bytes`/`bytearray`) are passed straight through to the C core as a pointer obtained via `mp_get_buffer_raise()` (never copied).
 - Large data (RAM/VRAM/framebuffer) handed back to Python uses `mp_obj_new_bytearray_by_ref()` for a zero-copy reference view.
 - For Mega ROM page fetches, a Python-opened file object is held as a MicroPython GC root pointer via `MP_REGISTER_ROOT_POINTER` and read directly from C using `mp_stream_seek()`/`mp_stream_read_exactly()` (no Python method-call overhead; errors come back as an errcode, not an exception).
+
+### The `msx_ui` module (`src/modmsx_ui.c`)
+
+Unlike the other menu-related modules (`msx_rom_browser.py`, etc.), `mp/msx_menu.py` is imported eagerly by `main.py` on every boot, so its compile cost was always paid up front — this turned out to be the main driver of a chronic GC-heap squeeze (see `doc/memory_usage.md` §8). Between 2026-10-16 and 2026-10-17 most of that implementation was ported, in three phases, into a separate C user module, `msx_ui`, shrinking `msx_menu.py` from 929 to 165 lines.
+
+- Phase 1: the `MenuCanvas` drawing core, color/HID constants, display-suspend state, USB keyboard polling, message display
+- Phase 2: save-state I/O, and the real-hardware-tuned chunked file-I/O helpers (`readinto_chunked`/`write_chunked`)
+- Phase 3: `msx.ini` config I/O (`load_config`/`save_config`), and the cartridge-loading control flow (`load_cart_smart`, the Mega ROM flash cache, mapper auto-detection)
+
+Implementation notes:
+
+- It reaches `modmsx.c`'s global `msx_state_t` and scratch buffer directly via `msx_get_state()`/`msx_get_scratch_buf()` (declared in `msx_core.h`, defined in `modmsx.c`), bypassing the Python bindings.
+- `msx.load_cart_paged()` itself (a complex state machine holding the paging file as a GC root pointer) was not ported — it's delegated to the existing `modmsx.c` implementation via a generic method-call helper (`ui_call_method_n()`, built on `mp_load_method`/`mp_call_method_n_kw`).
+- The subroutine (CALL/RST) hook mechanism (§6) is out of scope here and remains Python-only, unchanged.
+- `msx_menu.py` just re-exports every name under its original spelling via `from msx_ui import ...`, so no caller (`main.py`, `msx_rom_browser.py`, `msx_runtime_menu.py`, etc.) needed any change. When adding a new function to `msx_ui`, remember to also add it to `msx_menu.py`'s re-export list.
+
+See `architecture_en.md` and `src/modmsx_ui.c`'s own header comment for the full design rationale.
 
 ---
 
