@@ -159,7 +159,71 @@
  * since there's no 32KB hole yet to fragment things — it's specifically
  * Swap Cartridge from a small ROM to a Mega ROM that fails. Since that's
  * a normal, expected use of Swap Cartridge, both boards now use the same
- * value. */
+ * value.
+ *
+ * 2026-10-17: retried at 1 (40KB cart_cache[]) after the GC-heap
+ * compile-cost work (doc/memory_usage.md §8/§9 — msx_ui C-port +
+ * frozen modules) removed the specific failure mode that made a bigger
+ * MICROPY_C_HEAP_SIZE dangerous before (an eager-imported module's
+ * compile needing a large contiguous GC-heap block at the same moment
+ * the C heap's own ceiling grew). This does NOT by itself fix the
+ * external-fragmentation bug above (a bigger cart_cache[] request still
+ * can't reuse a same-or-smaller freed hole) — the actual mechanism is
+ * that bldfrm_msx.sh's matching MICROPY_C_HEAP_SIZE bump (+8KB, see
+ * its own comment) gives the C allocator's arena more room to extend
+ * into fresh space when the hole doesn't fit, rather than failing
+ * outright (msx.c_heap_info()'s arena/ceiling gap was the diagnostic
+ * signal this was worth retrying).
+ *
+ * 2026-10-17 real-hardware finding: 1 reproduced the *exact same*-
+ * LOOKING regression doc/memory_usage.md §3.1 already recorded once
+ * before (the 2026-09-20 victim-pool introduction) — Mega ROM load
+ * itself was fine, but FPS measurably dropped vs. the pre-victim-pool
+ * baseline on a KONAMI-mapper title (NEMESIS.ROM). §3.1's own diagnosis
+ * of that first occurrence was single-slot contention between windows,
+ * fixed by going to 2 shared slots — tried the same fix here (2), paired
+ * with bldfrm_msx.sh's matching +8KB C-heap bump.
+ *
+ * 2026-10-17 FURTHER real-hardware finding (what actually, fully
+ * explains both this and the original §3.1 episode): the 2-slot build
+ * ALSO dropped FPS on a completely unrelated, non-paged, flat cart
+ * (ANTADV.ROM — cart_page_refill()/the victim pool is never even
+ * entered for a non-paged cart, see cart_page_ptr()), which the victim
+ * pool cannot possibly cause by itself. A controlled isolation test
+ * (victim pool enabled at 1, but bldfrm_msx.sh's C-heap bump reverted to
+ * the original 65536 — i.e. only ONE of the two changes at a time) gave
+ * the answer in two parts:
+ *   (a) ANTADV.ROM stayed at its original ~58-59 FPS with the C heap
+ *       reverted, confirming the C-heap/GC-heap-shrink side effect
+ *       (not the victim pool) caused the flat-cart regression — a
+ *       smaller GC heap most likely makes MicroPython's automatic
+ *       gc.collect() trigger more often against the small per-frame
+ *       Python allocations the main loop does regardless of cart type
+ *       (e.g. poll_keyboard()'s report[2:8] slice in mp/msx_app.py).
+ *       This genuinely has nothing to do with MSX_CART_VICTIM_SLOTS —
+ *       any MICROPY_C_HEAP_SIZE increase at all pays this same tax.
+ *   (b) NEMESIS.ROM, in that SAME isolation build (victim pool at 1,
+ *       C heap untouched at the original 65536 — ruling out (a) as a
+ *       factor here), still settled at a flat ~45-46 FPS with none of
+ *       the 50-59.8 FPS bursts the true victim=0 baseline shows
+ *       (confirmed via the pre-today backup firmware, real hardware,
+ *       same ROM, same test). So the victim pool itself — not
+ *       contention between windows, not the C-heap side effect, just
+ *       the pool existing at all, even at 1 slot — measurably hurts
+ *       this title vs. no pool. 2 slots (an even bigger scan-and-swap
+ *       cost per miss) didn't recover the bursts either (~46-47 FPS,
+ *       same ballpark as 1 slot) — more evidence this is a genuine
+ *       per-title cost/benefit loss, not an undersized-pool artifact
+ *       §3.1's "go to 2" fix doesn't generalize to.
+ *
+ * Both (a) and (b) independently regress FPS from today's change, on
+ * two unrelated axes, on two unrelated cart types. Reverted to 0 — the
+ * real pre-2026-10-17 value, NOT a new guess — rather than chasing a
+ * slot count further. See bldfrm_msx.sh's matching revert of its C-heap
+ * bumps. Re-attempting this needs real evidence a specific slot count
+ * actually helps a specific title's measured FPS, not just its cache-hit
+ * counters (msx_get_cart_fetch_stats()) — a better hit rate here
+ * provably did NOT mean a better frame rate. */
 #define MSX_CART_VICTIM_SLOTS  0
 
 /* byte_offset/dest are always MSX_CART_PAGE_SIZE-aligned/sized. Return

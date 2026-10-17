@@ -484,6 +484,55 @@ echo ""
 # matching pico2's 81920 here, with real headroom to spare (unlike the
 # 73728 attempt, which left the DVI TMDS buffers + Mega ROM cache's
 # worst case uncomfortably tight against it).
+# 2026-10-17: 81920 -> 90112 (+8KB), to cover MSX_CART_VICTIM_SLOTS going
+# 0 -> 1 (src/msx/msx_core.h, cart_cache[] 32KB -> 40KB per slot) — see
+# that macro's own 2026-10-17 comment for why this is safer to retry now
+# (the GC-heap compile-cost work removed the specific failure mode a
+# bigger C heap used to trigger).
+#
+# 2026-10-17 (same day, follow-up): Mega ROM load itself was confirmed
+# fine at 1 slot, but real-hardware FPS measurably dropped on a KONAMI-
+# mapper title vs. the pre-victim-pool baseline — the exact same single-
+# slot contention regression doc/memory_usage.md §3.1 already recorded
+# once before (2026-09-20), whose fix was 2 shared slots, not reverting
+# to 0. Tried +8KB again (90112 -> 98304) to match MSX_CART_VICTIM_SLOTS
+# going 1 -> 2 symmetrically with the earlier 0 -> 1 bump — real build
+# attempt (pico2_nativeusb, a clean non-concurrent build, not corrupted
+# by the shared memmap_mp_rp2350.ld race a same-day earlier concurrent-
+# build mistake had caused on other attempts that day) hit the link-time
+# `ASSERT(GcHeap is too small)` floor: unlike the 0->1 bump, this
+# variant's headroom this time wasn't a full 8KB. Halved to +4KB instead
+# (90112 -> 94208) — this is a genuine asymmetry vs. the cart_cache[]
+# request itself (40KB -> 48KB, still a real +8KB there), not a typo:
+# the C heap doesn't need to grow by the same amount as cart_cache[]'s
+# own increase, only by enough that cart_cache[]'s new size still fits
+# inside whatever arena room remains after VDP+PSG — see
+# MSX_CART_VICTIM_SLOTS's own comment and the pico2(PIO-USB)-specific
+# override below (which found it needed *no* increase at all this round
+# for the same reason). Real-hardware re-test required before trusting
+# this value the way the surrounding numbers in this file are trusted
+# (each of which already has its own hard-won history) — in particular
+# the exact small-cart -> Swap Cartridge -> Mega ROM sequence that broke
+# the external-fragmentation allocator before, since 48KB is closer to
+# that old failure's 48KB trigger size than the 40KB trial that already
+# passed it.
+#
+# 2026-10-17 (same day, FULL REVERT): real-hardware testing found this
+# entire 2026-10-17 C-heap-growth line (81920 -> 90112 -> 94208) measurably
+# hurts FPS on EVERY cart, not just Mega ROM — confirmed by isolating it
+# from MSX_CART_VICTIM_SLOTS entirely (a build with the victim pool
+# enabled but this value held at its original 81920 kept a flat, non-
+# paged cart — ANTADV.ROM — at its normal ~58-59 FPS; this value alone,
+# even at just +8KB, is what dropped it to ~42-43). A smaller C heap
+# means a bigger GC heap (they share the same fixed 512KB SRAM via
+# MICROPY_C_HEAP_SIZE's static arena — see msx_core.h's matching revert
+# comment) — the likely mechanism is MicroPython's automatic gc.collect()
+# triggering more often against the small per-frame Python allocations
+# the main loop does for every cart regardless of mapper (e.g.
+# poll_keyboard()'s report[2:8] slice in mp/msx_app.py). Reverted to
+# 81920 — the real pre-2026-10-17 value, not a new guess — matching
+# MSX_CART_VICTIM_SLOTS's revert to 0 in msx_core.h. See that macro's
+# comment for the Mega-ROM-FPS half of this same finding.
 MICROPY_C_HEAP_SIZE_VAL=81920
 # 2026-10-11: pico2_piousb hit the exact same link-time
 # `ASSERT(GcHeap is too small)` floor pizero once did (see the long
@@ -526,7 +575,41 @@ MICROPY_C_HEAP_SIZE_VAL=81920
 # known to run this project's full menu system without issue.
 # 2026-10-17: flipped from checking "pico2_piousb" to "pico2" — see this
 # file's header comment on the PIO-USB/native-USB target-name swap.
-# pico2_nativeusb now gets the default 81920 set above instead.
+# pico2_nativeusb now gets the default (now 90112) set above instead.
+#
+# 2026-10-17 (same day, separate change): 65536 -> 73728 (+8KB), same
+# MSX_CART_VICTIM_SLOTS 0->1 reason as the default-case bump above —
+# keeps this value's own margin over the GC-heap floor (see the long
+# comment above) rather than letting the two configurations' cart_cache[]
+# sizes drift apart.
+#
+# 2026-10-17 (same day, follow-up attempt, REVERTED): tried 73728 -> 81920
+# (+8KB) for the same MSX_CART_VICTIM_SLOTS 1->2 reason as the default-
+# case's matching bump above, but real build attempt hit the exact same
+# link-time `ASSERT(GcHeap is too small)` floor this variant's 2026-10-11
+# history already found at 81920 (GC heap came out 1444 bytes short of
+# the required 65536 then; this is the same arithmetic, not a new
+# coincidence). MICROPY_C_HEAP_SIZE is a fixed-size static arena reserved
+# at link time — it alone determines the GC-heap floor check, independent
+# of MSX_CART_VICTIM_SLOTS/cart_cache[] (which is a runtime malloc() OUT
+# OF that arena, not a separate static allocation) — so there was no
+# actual need to grow this value at all for victim×2 to fit: 73728 (the
+# value already proven safe for victim×1) still leaves cart_cache[]'s new
+# 48KB request room to fit alongside VDP+PSG (~16.5KB) inside the same
+# 72KB arena, just with less nominal headroom (~9.2KB vs. the original
+# ~15.5KB) — unverified against real fragmentation yet, hence the
+# real-hardware re-test note above. Left at 73728; do not re-bump this
+# past what the link floor on THIS variant specifically allows without a
+# real build attempt first (its ~15.8KB extra PIO-USB/CDC .bss vs. a
+# plain pico2 build means it hits this ceiling well before the
+# default-case value does).
+#
+# 2026-10-17 (same day, FULL REVERT): same full-revert reasoning as the
+# default case's matching comment above — this variant's own +8KB (65536
+# -> 73728) carries the identical FPS-regressing side effect, confirmed
+# on this exact variant's build. Reverted to 65536, the real
+# pre-2026-10-17 value for this board, matching MSX_CART_VICTIM_SLOTS's
+# revert to 0 in msx_core.h.
 if [ "${TARGET}" = "pico2" ]; then
     MICROPY_C_HEAP_SIZE_VAL=65536
 fi

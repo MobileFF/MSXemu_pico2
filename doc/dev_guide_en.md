@@ -25,15 +25,19 @@ MSX_emu_pico2/
 │       ├── msx_core.c             # The MSX system itself (Z80/VDP/PSG integration, memory management, frame loop, display DMA)
 │       ├── modmsx.c                # The MicroPython C user module (`msx`)
 │       ├── micropython_msx.cmake   # CMake build configuration
+│       ├── manifest_freeze.py      # List of files frozen into the firmware (see doc/memory_usage.md §9)
 │       ├── z80/                    # superzazu/z80 (MIT) — Z80 CPU core
 │       ├── tms9918/                 # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDP core
 │       └── emu2149/                 # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSG core
 └── mp/
-    ├── main.py              # Boot flow and main loop
+    ├── main.py              # Thin launcher for boot flow/main loop (the body lives in msx_app.py)
+    ├── msx_app.py           # Boot flow and main loop itself (frozen; split out of main.py)
     ├── msx_menu.py              # Thin lazy-import wrapper around select_rom/show_emulator_menu
     │                            # (most of its old logic now lives in msx_ui above — see architecture_en.md)
     └── msx_keymap.py            # USB HID -> MSX key-matrix mapping
 ```
+
+> Most files under `mp/` (everything except `main.py`/`boot.py`) are frozen into the firmware image and therefore don't exist on a real device's filesystem (see `doc/memory_usage.md` §9) — they still live under `mp/` in source control as usual.
 
 > This repository also contains the original PB-1000 emulator's C sources (`src/*.c`), which are independent of the MSX emulator and out of scope for this guide. Only the USB host core (`src/usb_host_core.c`, `src/modusb_host.c`) is shared between the two. PB-1000's Python sources are source-controlled in a separate project, so `mp/` in this repository now contains only MSX emulator files.
 

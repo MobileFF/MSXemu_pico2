@@ -25,15 +25,19 @@ MSX_emu_pico2/
 │       ├── msx_core.c             # MSXシステム本体（Z80/VDP/PSG統合、メモリ管理、フレームループ、表示DMA）
 │       ├── modmsx.c               # MicroPython Cユーザーモジュール（`msx`）
 │       ├── micropython_msx.cmake  # CMakeビルド設定
+│       ├── manifest_freeze.py     # frozen module対象ファイル一覧（doc/memory_usage.md§9参照）
 │       ├── z80/                   # superzazu/z80 (MIT) — Z80 CPUコア
 │       ├── tms9918/                # visrealm/vrEmuTms9918 (MIT) — TMS9918A VDPコア
 │       └── emu2149/                # digital-sound-antiques/emu2149 (MIT) — AY-3-8910 PSGコア
 └── mp/
-    ├── main.py             # 起動フロー・メインループ
+    ├── main.py             # 起動フロー・メインループへの薄いランチャー（実体はmsx_app.py）
+    ├── msx_app.py          # 起動フロー・メインループの実体（frozen対象、main.pyから分割）
     ├── msx_menu.py             # select_rom/show_emulator_menuへの薄い遅延importラッパー
     │                           # （実装の大半は上記msx_uiへ移動済み。詳細はarchitecture.md参照）
     └── msx_keymap.py           # USB HID → MSXキー行列マッピング
 ```
+
+> `mp/`配下のほとんどのファイル（`main.py`/`boot.py`以外）はfrozen module化されファームウェアに焼き込まれているため、実機デバイスのファイルシステム上には存在しない（`doc/memory_usage.md`§9参照）。ソース管理上は引き続き`mp/`配下に存在する。
 
 > 同じリポジトリ内には元になった PB-1000 エミュレータの C ソース資産（`src/*.c`）も同居しているが、MSXエミュレータとは独立しており、このガイドの対象外。USBホストコア（`src/usb_host_core.c`、`src/modusb_host.c`）のみ両者で共有されている。PB-1000のPythonソース（`mp/`配下）は別プロジェクトでソース管理されているため、このリポジトリの`mp/`にはMSXエミュレータのファイルのみが存在する。
 

@@ -121,7 +121,9 @@ MicroPython's GC heap is **non-compacting** — even when the *total* free space
 
 ## Python Layer (`mp/`)
 
-### `main.py` — Boot Flow and Main Loop
+### `main.py` / `msx_app.py` — Boot Flow and Main Loop
+
+2026-10-17: `main.py` was this project's single largest always-eager-imported file (~1300 lines), so — following the same "eliminate the GC-heap compile cost" goal as `msx_ui` — its body was split out into `msx_app.py` and frozen into the firmware (see `doc/memory_usage.md` §9). `main.py` itself shrank to a thin launcher (`from msx_app import run` + `if __name__ == '__main__': run()`); the documented REPL dev shortcut (`import main; main.run()`) keeps working unchanged since `run` is re-exported. Everything below is now implemented in `msx_app.py`.
 
 Responsibilities:
 

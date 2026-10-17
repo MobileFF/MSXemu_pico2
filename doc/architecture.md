@@ -125,7 +125,9 @@ MicroPythonのGCヒープは**非圧縮（non-compacting）**であり、生き�
 
 ## Python 層 (`mp/`)
 
-### `main.py` — 起動フローとメインループ
+### `main.py` / `msx_app.py` — 起動フローとメインループ
+
+2026-10-17: `main.py`は本プロジェクト最大の常時eager importファイル(約1300行)だったため、`msx_ui`と同じ「GCヒープのコンパイルコストを無くす」目的で、実体を`msx_app.py`へ分割しfrozen module化した(`doc/memory_usage.md`§9参照)。`main.py`自体は`from msx_app import run` + `if __name__ == '__main__': run()`という薄いランチャーに縮小(開発時のREPLショートカット`import main; main.run()`は`run`の再公開により変更なく動作する)。以下の役割はすべて`msx_app.py`側の実装。
 
 役割:
 

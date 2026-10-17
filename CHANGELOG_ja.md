@@ -172,3 +172,27 @@
 - **検証過程で見つかったテスト手法上の落とし穴(本番には影響なし)**: `mp/test/verify_sdcard_c.py`は当初、両ドライバを同一セッションに同時マウントしてその場で比較する方式だった。これは2回の完全なSDカード再初期化(`CMD0`2連続送信)を引き起こし、実機で時々カードがマルチブロック転送の途中で止まったまま(実績あるPython版自身のリトライロジックでも同一セッション内では回復できない)になることが確認された。`mount_sd()`はドライバを1つしか構築しないため本番では発生しない -- このテストスクリプト固有の既知の制限として記録し、代わりに上記の「別セッション+ハッシュ比較」方式(`isolate_sdcard_py.py`/`isolate_sdcard_c.py`)を推奨方法とした。
 - **新ドライバのコンストラクタで防御的にGP12(SD MISO)プルアップを設定**: `src/msx/msx_core.c`のディスプレイ初期化が、通常起動シーケンスで`mount_sd()`より先に実行されるLCDセットアップの副作用として既にこのプルアップを設定している(MISOのフローティングがなぜ危険かはそのコメント参照)。`mpremote run`で単体実行する開発用スクリプトはこの起動シーケンスを一切経由しないため、そのコメントが説明する障害そのものが実機で再現した: `CMD18`がフローティングMISOの`0x00`読み取りを正常なR1応答と区別できずに見かけ上成功し、直後のデータトークン待ちが本当にタイムアウトする、というもの。`sdcard_c.SDCard()`のコンストラクタ自身がこのプルアップを設定するようにし(冪等、既に設定済みでも無害)、起動順序に関わらずドライバ単体で安全に動作するようにした。
 - `mp/test/`に開発用スクリプトを追加: `isolate_sdcard_py.py`/`isolate_sdcard_c.py`(単独ドライバの正しさ確認、FNV-1aハッシュ出力)、`bench_sdcard_c.py`(速度計測、既存の`bench_sdcard.py`と同じ方式)。
+
+### 変更(2026-10-16、実機確認済み)
+
+- **`mp/msx_menu.py`の実装の大半をCへ移植**(新規Cユーザーモジュール`msx_ui`、`src/modmsx_ui.c`)、3フェーズに分けてGCヒープのコンパイルコストを削減: 他のメニュー系モジュール(`msx_rom_browser.py`等)と違い、`msx_menu.py`は毎起動必ずeager importされる(遅延importされない)ため、そのコンパイルコストは起動のたびに無条件で支払われていた — このプロジェクトが繰り返し踏んできた実機`MemoryError`の定常的な原因(`doc/memory_usage.md`§3/§4参照)の一つがこれだった。
+  - フェーズ1: `MenuCanvas`描画コア(`msx_core.c`と同じRGB565バイトスワップを再利用、`framebuf`非経由)・色/HID定数・表示サスペンド状態・USBキーボードポーリング・メッセージ表示。
+  - フェーズ2: セーブステートI/O、実機のSD信頼性のため厳密にチューニングされていた「1チャンク最大4096バイト、ストリーム呼び出し1回」というchunked file I/Oヘルパー(`readinto_chunked`/`write_chunked`)の挙動をそのまま踏襲。
+  - フェーズ3: `msx.ini`のconfig I/O(`load_config`/`save_config`)、カートリッジロード制御フロー(`load_cart_smart`、メガロムの内蔵フラッシュキャッシュ検証/コピー、マッパー自動判定とKONAMIフォールバック)。
+  - `msx_menu.py`自体は929行→165行に縮小(`from msx_ui import ...`による薄い再公開レイヤー+引き続きPythonのままの`select_rom()`/`show_emulator_menu()`遅延importラッパーのみ) — プロジェクト内の他の呼び出し箇所は一切変更不要。`msx.load_cart_paged()`自体(ページ切替ファイルをGCルートポインタとして保持する複雑な状態機械)はあえて再実装せず、既存の実績ある`modmsx.c`バインディングへ汎用メソッド呼び出しヘルパー経由で委譲している。
+  - pico2/pico2_piousb/pizeroの3バリアント全てでビルド・動作を確認済み。各フェーズごとに実機テストを実施。
+
+### 変更(2026-10-17、実機確認済み)
+
+- **`mp/`配下の.pyファイル12個をファームウェアイメージへ直接frozen化**(MicroPythonの`FROZEN_MANIFEST`機構、新規`src/msx/manifest_freeze.py`)、GCヒープのコンパイルコストを完全にゼロへ(上記のC化を補う、ファームウェア再ビルド無しでのホット編集を諦められるファイル向けの、より低コストな対策): `board_config.py`・`msx_keymap.py`・`msx_ext.py`・`msx_menu.py`・`sdcard.py`・`msx_mode_switch.py`・`msx_fdd.py`・`msx_rom_browser.py`・`msx_runtime_menu.py`・`msx_save_slots.py`・`msx_display_settings.py`、および新規`msx_app.py`(下記参照)。`main.py`/`boot.py`は対象外 — MicroPythonの起動シーケンス(および`mpremote run`)がファイルシステムから直接自動execするスクリプトであり、通常の`import`経由でしか到達できないfrozen moduleでは代替できないため。
+- **`main.py`の約1300行の実体を新規`msx_app.py`へ分割**、これもfreeze対象に加えるため(この時点でプロジェクト最大の、常時eager importされるコンパイルコストだった)。`main.py`自体は`from msx_app import run` + `if __name__ == '__main__': run()`という約20行のランチャーになった。ドキュメント化されている開発時のREPLショートカット(`import main; main.run()`)は、`run`が`main`自身の名前で再公開されているため変更なく動作する。
+- **実機計測結果**(pico2、前後で同一BIOS/カートリッジ): 起動直後の空きヒープ(`gc.mem_free()`)が**+30,240バイト**、カートロード後の定常状態で**+18,304バイト**。上記のC化と合わせた、このプロジェクトのオリジナル(2026-10-16着手前)の`msx_menu.py`からの累計改善は、定常状態で**+26,160バイト**。詳細は`doc/memory_usage.md`§8/§9参照。興味深い副次効果として、以前のログに見られた「BIOSロード後の`gc.collect()`で空き容量が一時的に増える」という挙動が、回収すべきeager importのコンパイルゴミ自体が無くなったことで完全に消失した。
+- これは2026-09-30にpizeroで一度試して撤回した種類の変更(原因不明の実機USB/REPL接続不具合が再現、根本原因は未特定のまま — `src/msx/boards/WAVESHARE_RP2350_PIZERO/mpconfigboard.cmake`自身の記録参照)を、pico2(ネイティブUSBホスト版・PIO-USB版の両方)でより広い範囲に展開したものである。そのため意図的に慎重に進めた: まず低リスクな1ファイル(`board_config.py`)だけで両pico2構成での実機安全性を確認してから、全体へ拡大。pizero自身は今回のfreeze対象から引き続き除外している。
+
+### 変更(2026-10-17)
+
+- **pico2のデフォルトUSB構成を入れ替え**: PIO-USBキーボード配線(ネイティブUSBポートをCDC REPL用に解放する構成)が、実運用でネイティブUSBホストコントローラより安定していたため、このプロジェクトの既定のPico2構成になった。無印の`pico2`ターゲット/`firmware_msx.uf2`という名前(従来はネイティブUSBホスト版)をPIO-USB版が引き継ぎ、ネイティブUSBホスト版は明示的な`pico2_nativeusb`ターゲット/`firmware_msx_nativeusb.uf2`に変更。`bldfrm_msx.sh`内の、既存のPIO-USB向け`CFLAGS_EXTRA`/`CMAKE_ARGS`/Cヒープサイズ分岐がどの`TARGET`値で有効になるかという条件を入れ替えただけで、ボード/cmakeロジック自体の変更は無い。リネーム後の両ターゲットを再ビルドし、リネーム前と寸分違わぬRAM/flash使用量であることを確認済み。
+
+### 試行の上で撤回(2026-10-17、実機確認済み)
+
+- **メガロムのバンク切替キャッシュ拡張**(`MSX_CART_VICTIM_SLOTS`を0→1→2、対応する`MICROPY_C_HEAP_SIZE`も増量): 上記のfrozen module化で空いたGCヒープの余裕を使い、メガロムキャッシュの共有victimプールを拡張できないか試みた。実機テストで**2つの独立したFPS悪化**が判明し、元の値(`MSX_CART_VICTIM_SLOTS=0`、Cヒープ65536/81920)へ全面撤回した: (1) `MICROPY_C_HEAP_SIZE`の増量だけで、メガロムに限らず**全カートリッジでFPSが低下**した——victimプールは有効のままCヒープだけ元に戻す切り分けビルドで検証し、非ページングカート(`ANTADV.ROM`)が約42〜43FPSから本来の約58〜59FPSへ回復することを確認した。原因はおそらく、Cヒープと同じ固定SRAM予算を分け合うGCヒープが縮小し、MicroPythonの自動`gc.collect()`がメインループの(カート種別に関わらず毎フレーム発生する)小さなPythonオブジェクト確保に対してより頻繁に走るようになったため。(2) Cヒープの変更とは無関係に、**victimプール自体もKONAMIマッパータイトル(`NEMESIS.ROM`)でスロット数(1・2とも)に関わらず悪化**した——元のプール無しベースラインに対し、キャッシュヒット率の向上が実際のフレームレート向上には結びつかなかった。詳細は`doc/memory_usage.md`§3.3参照。
