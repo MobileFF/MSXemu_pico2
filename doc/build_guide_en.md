@@ -45,15 +45,17 @@ MicroPython's `ports/rp2` pulls in the Pico SDK as a submodule, so `git submodul
 `bldfrm_msx.sh` automates the whole build. Run it from the project root (`MSX_emu_pico2/`). There are three build targets:
 
 ```bash
-./bldfrm_msx.sh                # Pico 2, native USB host (default)
-./bldfrm_msx.sh pico2          # same, explicit
-./bldfrm_msx.sh pico2_piousb   # Pico 2, PIO-USB host (GP4/GP5) + native USB CDC REPL
-                                # — only for a board that has actually been wired with a
-                                #   second USB connector on GP4(D+)/GP5(D-) via 22Ω series
-                                #   resistors. Do NOT flash this onto an unwired board
-                                #   (see the Hardware Guide for details)
-./bldfrm_msx.sh pizero         # Waveshare RP2350-PiZero
+./bldfrm_msx.sh                   # Pico 2, PIO-USB host (GP4/GP5) (default, since 2026-10-17)
+./bldfrm_msx.sh pico2             # same, explicit
+                                   # — only for a board that has actually been wired with a
+                                   #   second USB connector on GP4(D+)/GP5(D-) via 22Ω series
+                                   #   resistors. Do NOT flash this onto an unwired board
+                                   #   (see the Hardware Guide for details)
+./bldfrm_msx.sh pico2_nativeusb   # Pico 2, native USB host
+./bldfrm_msx.sh pizero            # Waveshare RP2350-PiZero
 ```
+
+> **2026-10-17 naming change**: PIO-USB wiring became this project's default pico2 keyboard setup, so the plain `pico2` target/`firmware_msx.uf2` name now belongs to the PIO-USB build, and the native-USB-host build moved to `pico2_nativeusb`/`firmware_msx_nativeusb.uf2` (the old `pico2_piousb`/`firmware_msx_piousb.uf2` pairing is gone).
 
 The first time, you'll also need:
 
@@ -76,19 +78,19 @@ make -C ~/projects/micropython/ports/rp2 \
      -j$(nproc)
 ```
 
-`pico2_piousb` additionally passes `CMAKE_ARGS="-DUSE_PIO_USB=ON"` (enabling `src/msx/micropython_msx.cmake`'s `option(USE_PIO_USB ...)`) and overrides `MICROPY_C_HEAP_SIZE` to `65536` (see below).
+`pico2` (PIO-USB, default) additionally passes `CMAKE_ARGS="-DUSE_PIO_USB=ON"` (enabling `src/msx/micropython_msx.cmake`'s `option(USE_PIO_USB ...)`) and overrides `MICROPY_C_HEAP_SIZE` to `65536` (see below).
 
 4. On success, copies `firmware.uf2` into the project's `firmware/<per-target name>.uf2` (the standing rule: always flash real hardware from this path):
-   - `pico2` → `firmware/firmware_msx.uf2`
-   - `pico2_piousb` → `firmware/firmware_msx_piousb.uf2`
+   - `pico2` (PIO-USB, default) → `firmware/firmware_msx.uf2`
+   - `pico2_nativeusb` → `firmware/firmware_msx_nativeusb.uf2`
    - `pizero` → `firmware/firmware_msx_pizero.uf2`
 
 ### About `MICROPY_C_HEAP_SIZE`
 
 The MicroPython RP2 port's dedicated heap for C-level `malloc()`/`calloc()` (used by the VDP core, PSG core, and the Mega ROM page cache) **defaults to 0 bytes**. Without setting this explicitly, those `malloc()` calls silently corrupt MicroPython's GC heap region, causing unexplained hangs — a real bug hit earlier in this project.
 
-- `pico2`/`pizero`: **81920 bytes (80KB)** — enough to comfortably cover the VDP core (~16.3KB) plus the Mega ROM page cache (32KB, `MSX_CART_VICTIM_SLOTS=0`) with room to spare. See [memory_usage.md](memory_usage.md) (Japanese only) for details.
-- `pico2_piousb`: **65536 bytes (64KB)** — the PIO-USB library plus the native USB CDC stack it enables add ~15.8KB of new `.bss`, squeezing the GC heap, so the C heap is cut to compensate. This is not a new guess — it's the exact value this project used before the Mega ROM victim pool was ever added. Tuned against a real-hardware `MemoryError` compiling `msx_menu.py` on boot, so don't change it casually (see `bldfrm_msx.sh`'s own comment for the full story).
+- `pico2_nativeusb`/`pizero`: **81920 bytes (80KB)** — enough to comfortably cover the VDP core (~16.3KB) plus the Mega ROM page cache (32KB, `MSX_CART_VICTIM_SLOTS=0`) with room to spare. See [memory_usage.md](memory_usage.md) (Japanese only) for details.
+- `pico2` (PIO-USB, default): **65536 bytes (64KB)** — the PIO-USB library plus the native USB CDC stack it enables add ~15.8KB of new `.bss`, squeezing the GC heap, so the C heap is cut to compensate. This is not a new guess — it's the exact value this project used before the Mega ROM victim pool was ever added. Tuned against a real-hardware `MemoryError` compiling `msx_menu.py` on boot, so don't change it casually (see `bldfrm_msx.sh`'s own comment for the full story).
 
 ### Build Optimizations in `micropython_msx.cmake`
 

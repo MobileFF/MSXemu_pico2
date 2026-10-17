@@ -106,6 +106,41 @@ else()
 endif()
 
 # ============================================================
+# 0b) Frozen modules — a hand-picked subset of mp/*.py baked into the
+#     firmware image, removing their GC-heap compile cost entirely
+#     (complements modmsx_ui.c's C-port approach). See
+#     manifest_freeze.py's own header comment for the full file list/
+#     rationale and doc/memory_usage.md §9 for the project-level
+#     writeup.
+#
+#     2026-10-17: trial scope is pico2 + pico2_piousb, NOT pizero. A
+#     previous attempt at freezing pizero's menu modules (2026-09-30,
+#     since reverted — see src/msx/boards/WAVESHARE_RP2350_PIZERO/
+#     mpconfigboard.cmake's own writeup) caused an unexplained,
+#     reproducible real-hardware USB/REPL connection regression; root
+#     cause was never confirmed. pico2_piousb was deliberately added to
+#     this trial (2026-10-17, at the user's explicit request) specifically
+#     to test whether that regression was tied to UART REPL (plain pico2
+#     still uses it; pico2_piousb/pizero both use native USB CDC REPL
+#     instead, freed up by moving the keyboard to PIO-USB) — i.e. to
+#     compare the two REPL transports directly rather than assume either
+#     is safe. pizero itself stays excluded until pico2_piousb's own
+#     real-hardware result is in — do not widen this condition to pizero
+#     without that confirmation.
+#
+#     $(MSX_MP_DIR) resolves to this project's mp/ directory, copied
+#     locally by bldfrm_msx.sh alongside src/ (same reasoning as that
+#     copy itself — avoid reading from the Google-Drive-mounted path
+#     during the actual build).
+# ============================================================
+get_filename_component(MSX_MP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../mp" ABSOLUTE)
+set(MICROPY_MANIFEST_MSX_MP_DIR ${MSX_MP_DIR})
+
+if(NOT MSX_IS_PIZERO)
+    set(MICROPY_FROZEN_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/manifest_freeze.py")
+endif()
+
+# ============================================================
 # 1) MSX emulator core + third-party libraries (INTERFACE)
 # ============================================================
 add_library(msx_lib INTERFACE)

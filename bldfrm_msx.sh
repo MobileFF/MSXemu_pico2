@@ -22,24 +22,34 @@
 #
 # Usage:
 #   chmod +x bldfrm_msx.sh   (see NOTE below — may not persist on this filesystem)
-#   ./bldfrm_msx.sh                # Pico 2, native USB host (default)
-#   ./bldfrm_msx.sh pico2          # Pico 2, native USB host, explicit
-#   ./bldfrm_msx.sh pico2_piousb   # Pico 2, PIO-USB host (GP4/GP5) +
-#                                  # native USB CDC REPL — see 2026-10-11
-#                                  # section below
-#   ./bldfrm_msx.sh pizero         # Waveshare RP2350-PiZero
+#   ./bldfrm_msx.sh                   # Pico 2, PIO-USB host (GP4/GP5) (default — see 2026-10-17 below)
+#   ./bldfrm_msx.sh pico2             # Pico 2, PIO-USB host (GP4/GP5), explicit
+#   ./bldfrm_msx.sh pico2_nativeusb   # Pico 2, native USB host — see 2026-10-11
+#                                     # section below
+#   ./bldfrm_msx.sh pizero            # Waveshare RP2350-PiZero
+#
+# 2026-10-17: PIO-USB wiring is now this project's default/primary pico2
+# keyboard setup (more reliable in practice than the native USB host
+# controller — see memory_usage.md §9's real-hardware comparison), so it
+# took over the unsuffixed "pico2" target name and firmware_msx.uf2
+# output name that the native-USB-host build used to have. The native
+# build didn't go away — it moved to an explicit "pico2_nativeusb"
+# argument / firmware_msx_nativeusb.uf2 output instead. This is a naming
+# swap only: no board/cmake logic changed beyond which TARGET value
+# gates the PIO-USB-specific CFLAGS_EXTRA/CMAKE_ARGS/C-heap-size branches
+# below (each flipped from checking "pico2_piousb" to checking "pico2").
 #
 # NOTE: this file lives on a Google-Drive-mounted filesystem that has been
 # observed to not persist chmod reliably — if `./bldfrm_msx.sh` reports
 # "Permission denied", use `bash bldfrm_msx.sh [target]` instead.
 #
 # Output:
-#   pico2       : ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
-#                 → firmware/firmware_msx.uf2
-#   pico2_piousb: ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
-#                 → firmware/firmware_msx_piousb.uf2
-#   pizero      : ~/projects/micropython.msx/ports/rp2/build-WAVESHARE_RP2350_PIZERO/firmware.uf2
-#                 → firmware/firmware_msx_pizero.uf2
+#   pico2           : ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
+#                     → firmware/firmware_msx.uf2
+#   pico2_nativeusb : ~/projects/micropython.msx/ports/rp2/build-RPI_PICO2/firmware.uf2
+#                     → firmware/firmware_msx_nativeusb.uf2
+#   pizero          : ~/projects/micropython.msx/ports/rp2/build-WAVESHARE_RP2350_PIZERO/firmware.uf2
+#                     → firmware/firmware_msx_pizero.uf2
 #
 # To flash: hold BOOTSEL, plug USB, copy the .uf2 to the RPI-RP2 drive.
 #
@@ -53,34 +63,45 @@ set -e
 TARGET="${1:-pico2}"
 case "${TARGET}" in
     pico2)
-        MP_BOARD="RPI_PICO2"
-        BOARD_DIR_ARG=""
-        UF2_NAME="firmware_msx.uf2"
-        ;;
-    pico2_piousb)
-        # 2026-10-11: same board/board-dir as plain pico2 — only the USB
-        # host backend differs (PIO-USB on GP4/GP5 instead of RP2350's
-        # native controller, which becomes a CDC REPL instead — see
-        # micropython_msx.cmake's USE_PIO_USB option and
-        # src/usb_host_core.c's usb_host_core_init_pico2_piousb()).
-        # Requires a pico2 board that has actually been wired with a
-        # second USB connector on GP4(D+)/GP5(D-) via 22Ω series
+        # 2026-10-17: PIO-USB (GP4/GP5) is now this project's default
+        # pico2 keyboard wiring, so its output keeps the unsuffixed name
+        # (firmware_msx.uf2) even though the TARGET argument is still
+        # literally "pico2" and the native-USB-host build is the one
+        # that now needs an explicit "pico2_nativeusb" argument below —
+        # this asymmetry (argument name vs. output name) is intentional,
+        # not a mistake; only the .uf2 output names changed, not this
+        # script's own invocation syntax. Requires a pico2 board wired
+        # with a second USB connector on GP4(D+)/GP5(D-) via 22Ω series
         # resistors (no external pull-up/down) — see
         # 調査用/RP2350-PiZero_USBキーボード対応調査.md's 2026-10-11
         # addendum. Do NOT flash this onto a board without that wiring:
         # the keyboard will not work (no PIO-USB port), and the native
         # USB port will come up as a CDC serial device instead of a
-        # keyboard host.
+        # keyboard host — use "pico2_nativeusb" for that board instead.
         MP_BOARD="RPI_PICO2"
         BOARD_DIR_ARG=""
-        UF2_NAME="firmware_msx_piousb.uf2"
+        UF2_NAME="firmware_msx.uf2"
+        ;;
+    pico2_nativeusb)
+        # 2026-10-17: renamed from "pico2_piousb" (this case used to BE
+        # the default "pico2" target, back when native USB was the
+        # default keyboard wiring — see the "pico2" case above for why
+        # that flipped). Same board/board-dir as the PIO-USB case above —
+        # only the USB host backend differs (RP2350's native controller
+        # instead of PIO-USB on GP4/GP5, which also means no CDC REPL:
+        # native USB is busy being the keyboard host here instead — see
+        # micropython_msx.cmake's USE_PIO_USB option and
+        # src/usb_host_core.c's usb_host_core_init()).
+        MP_BOARD="RPI_PICO2"
+        BOARD_DIR_ARG=""
+        UF2_NAME="firmware_msx_nativeusb.uf2"
         ;;
     pizero)
         MP_BOARD="WAVESHARE_RP2350_PIZERO"
         UF2_NAME="firmware_msx_pizero.uf2"
         ;;
     *)
-        echo "ERROR: unknown target '${TARGET}' (expected: pico2, pico2_piousb, pizero)"
+        echo "ERROR: unknown target '${TARGET}' (expected: pico2, pico2_nativeusb, pizero)"
         exit 1
         ;;
 esac
@@ -145,7 +166,7 @@ if [ "${TARGET}" = "pizero" ]; then
     export CFLAGS_EXTRA="${CFLAGS_EXTRA:-} -DMSX_BOARD_PIZERO=1 -DPICO_PIO_USE_GPIO_BASE=1"
 fi
 
-# 2026-10-11: pico2_piousb target. MSX_USE_PIO_USB_HOST (the C-side
+# 2026-10-11: pico2's PIO-USB variant. MSX_USE_PIO_USB_HOST (the C-side
 # #ifdef macro, usb_host_core.c/modusb_host.c) reaches every compilation
 # unit via CFLAGS_EXTRA, same mechanism as MSX_BOARD_PIZERO above — still
 # needed for that one macro because it gates a new MP_QSTR_* registration
@@ -163,7 +184,12 @@ fi
 # established convention for this exact native-vs-PIO-USB choice (same
 # option name, same CMAKE_ARGS mechanism) — see micropython_msx.cmake's
 # own comment for the full cross-project rationale.
-if [ "${TARGET}" = "pico2_piousb" ]; then
+#
+# 2026-10-17: this gate used to check `"${TARGET}" = "pico2_piousb"` —
+# flipped to "pico2" when PIO-USB became the default pico2 target (see
+# this file's own header comment). pico2_nativeusb (the renamed former
+# default) is the one that now skips this block.
+if [ "${TARGET}" = "pico2" ]; then
     export CFLAGS_EXTRA="${CFLAGS_EXTRA:-} -DMSX_USE_PIO_USB_HOST=1"
     export CMAKE_ARGS="${CMAKE_ARGS:-} -DUSE_PIO_USB=ON"
 fi
@@ -378,6 +404,22 @@ cp -r "${SRC_ORIG}" "${DST_DIR}/src"
 echo "[copy] Done."
 echo ""
 
+# 2026-10-17: mp/ (the Python layer) is ALSO copied locally now, purely as
+# build-time input for src/msx/manifest_freeze.py's freeze() calls (see
+# that file's own comment) — same "avoid the Google-Drive-mounted path
+# during the actual build" reasoning as the src/ copy above. This does
+# NOT change how .py files are actually deployed to a device (still a
+# manual `mpremote cp`, same as always) — it only affects which files
+# manifest_freeze.py is able to bake into the firmware image. Subject to
+# the exact same "never run two board targets' builds concurrently" race
+# already documented for the src/ copy above (both copy into the same
+# shared ${DST_DIR}).
+echo "[copy] Copying mp/ (frozen-module build input only) to ${DST_DIR}/mp …"
+rm -rf "${DST_DIR}/mp"
+cp -r "${SCRIPT_DIR}/mp" "${DST_DIR}/mp"
+echo "[copy] Done."
+echo ""
+
 # 2026-09-30 TRIED AND REVERTED: this block used to populate frozen_mp/
 # for src/msx/boards/WAVESHARE_RP2350_PIZERO/manifest.py to freeze the
 # lazily-imported menu modules (fixing a real-hardware DVI "No Signal"
@@ -482,7 +524,10 @@ MICROPY_C_HEAP_SIZE_VAL=81920
 # new guess. Gives a GC heap of ~80476 bytes, slightly MORE than plain
 # pico2's 79876 — comfortable parity with the one configuration already
 # known to run this project's full menu system without issue.
-if [ "${TARGET}" = "pico2_piousb" ]; then
+# 2026-10-17: flipped from checking "pico2_piousb" to "pico2" — see this
+# file's header comment on the PIO-USB/native-USB target-name swap.
+# pico2_nativeusb now gets the default 81920 set above instead.
+if [ "${TARGET}" = "pico2" ]; then
     MICROPY_C_HEAP_SIZE_VAL=65536
 fi
 make -C "${MP_RPI_PORT}" \

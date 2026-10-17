@@ -256,3 +256,99 @@ C化した関数・定数自体は(フラッシュ上の`.text`が増える以�
 - **「常にeager importされるモジュールほど優先度が高い」という優先順位づけ**: `msx_rom_browser.py`等の遅延importされるモジュールはそもそも使われるまでコンパイルコストを払わないため、このC化の対象として急ぐ必要がない。eager importされる`msx_menu.py`(および`main.py`自身)こそが定常的な圧迫の実体だった。
 - **非string値を見落とさないための事前grep**: `save_config()`の呼び出し元を網羅的にgrepしたところ、大半は文字列化済みの値を渡していたが`msx_runtime_menu.py`の音量/フィルタ保存だけは整数を直接渡していることが判明。実装前に全呼び出し元を洗い出す習慣が、型を決め打ちした実装によるバグを未然に防いだ(詳細は`src/modmsx_ui.c`の`ui_save_config()`コメント参照)。
 - **ビルドツールの並行実行には要注意**: `bldfrm_msx.sh`は共有の中間ソースコピーディレクトリを使うため、複数バリアントを同時にバックグラウンドビルドすると一方の`cp`がもう一方のソースを破壊し、無関係な箇所のリンクエラーという紛らわしい形で現れることがある(詳細は`bldfrm_msx.sh`自身のコメント/コミット履歴参照)。複数バリアントのビルドは必ず逐次実行すること。
+
+---
+
+## 9. 2026-10-17: frozen module化によるさらなるヒープ確保(pico2/pico2_piousb)
+
+> §9.1〜9.6: 1ファイル(`board_config.py`)でのトライアル、実機確認済み。
+> §9.7以降: `main.py`分割+計12ファイルへの大幅拡大。起動時のヒープ実測(pico2ネイティブUSBホスト版)は確認済み(+30,240B@boot、§9.7参照)、**PIO-USB版やメニュー画面の網羅的な動作確認、接続安定性の再確認は引き続き未実施**。
+
+### 9.1 背景
+
+§8でC化した`msx_menu.py`以外にも、`main.py`からeager importされ常時コンパイルコストを払っているモジュールは複数残っている(`board_config.py` 261行、`msx_keymap.py` 250行、`msx_ext.py` 82行)。これらをC化する前段として、**より工数の少ない代替手段**としてMicroPythonのfrozen module機構(`FROZEN_MANIFEST`、ビルド時に対象`.py`をバイトコード化してファームウェアのflashへ直接焼き込み、GCヒープ上のコンパイルコストを完全にゼロにする仕組み)を試すことにした。
+
+### 9.2 ⚠️ 重要な前例: 2026-09-30、pizeroで一度試して撤回済み
+
+`src/msx/boards/WAVESHARE_RP2350_PIZERO/mpconfigboard.cmake`に記録が残っている通り、**このプロジェクトは以前に一度、遅延importされるメニュー系モジュールのfreezeをpizeroで試し、実機で「`mpremote`/UART接続が断続的に失敗する(`No such device`)」という原因不明の不具合が再現したため撤回している**(2種類の異なるUSBシリアルアダプタ・電源入れ直しでも再現確認済み、根本原因は未特定のまま)。
+
+2026-10-17時点でユーザーから「当時はpizeroのREPLがGP0/1のUART経由だったが、現在はpizero/pico2_piousbともネイティブUSB CDC REPLに切り替わっているため、当時の懸念は薄いのではないか」との指摘があった。これは合理的な仮説だが、**根本原因を特定しないまま撤回した事象であるため、REPLのトランスポートが変わったことで本当に解消したのかは実機で確かめるまで分からない**(plain pico2は現在もUART REPLのままであり、そもそもpico2でfreeze自体を試した実績が一度もない)。
+
+この仮説を直接検証するため、ユーザーから「UART REPLのpico2(ネイティブUSBでキーボード接続)とCDC REPLのpico2_piousb(PIO-USBでキーボード接続)の両方をビルドし、安定性を比較したい」との要望があり、トライアル対象を**pico2_piousbにも拡大**した(pizeroは引き続き対象外)。
+
+### 9.3 今回の方針: pico2/pico2_piousb・1ファイルのみでの慎重なトライアル
+
+上記を踏まえ、次の手順で慎重に進めることにした:
+
+1. **pico2とpico2_piousbのみ**でfreezeを有効化(`src/msx/micropython_msx.cmake`で`NOT MSX_IS_PIZERO`のときだけ`MICROPY_FROZEN_MANIFEST`を差し替え)。pizero向けの設定は一切変更していない。
+2. **対象ファイルは`board_config.py`1つだけ**(純粋な定数定義のみでロジックがほぼ無く、3候補の中で最もリスクが低いと判断)。`msx_keymap.py`/`msx_ext.py`は今回は対象外。
+3. `src/msx/manifest_freeze.py`(新規)で`include("$(PORT_DIR)/boards/manifest.py")`により既存のデフォルト設定(asyncio/onewire/ds18x20/dht/neopixel、本プロジェクトは未使用だが維持)を保持しつつ、`freeze("$(MSX_MP_DIR)", "board_config.py")`を追加。
+4. `bldfrm_msx.sh`は`mp/`をビルド時のみ`${DST_DIR}/mp`へローカルコピーする工程を追加(freeze処理がGoogle Driveマウント越しに読むのを避けるため、`src/`コピーと同じ理由)。**デバイスへの実際のデプロイ方法(`mpremote cp`)はこれにより一切変更していない**。
+
+### 9.4 ビルド結果(2026-10-17)
+
+| 項目 | pico2: freeze前 | pico2: freeze後 | pico2_piousb: freeze前 | pico2_piousb: freeze後 |
+| :--- | ---: | ---: | ---: | ---: |
+| RAM(`.data`+`.bss`) | 360,680 B (68.79%) | 360,680 B (68.79%) | 376,464 B (71.80%) | 376,464 B (71.80%) |
+| `.uf2`サイズ | 860,160 B | 862,720 B | 901,120 B | 903,680 B |
+
+両ボードともRAMが変化していないことは想定通り(frozen moduleはflash上のバイトコードのみで`.bss`を増やさない)。`.uf2`サイズの増分は両ボードとも+2,560Bで完全一致。ビルドログで`MPY board_config.py`→`GEN frozen_content.c`→`Built target BUILD_FROZEN_CONTENT`を確認し、freeze自体が正しく機能していることを両ボードで確認済み。
+
+### 9.5 実機検証結果(2026-10-17、pico2/pico2_piousb両方)
+
+**両ファームウェアとも問題なし**。`mpremote connect /dev/ttyUSB0 ls`でのファイル一覧確認により、**`board_config.py`がデバイスのファイルシステム上に存在しない状態で正常動作していることを実証**(frozen版が実際に使われていることの直接的な証拠——ファイルシステム上に無い以上、動作している`board_config`モジュールはfrozen版以外あり得ない)。§9.2で挙げた「`mpremote`/接続の断続的切断」症状も、UART REPL(pico2)・CDC REPL(pico2_piousb)のいずれでも再現しなかった。
+
+これにより:
+- 今回の1ファイル(`board_config.py`)・2ボード(pico2/pico2_piousb)構成でのfreezeは実機で安全性を確認できた
+- §9.2のユーザー仮説(2026-09-30のpizero不具合はUART REPL固有だったのでは)について、少なくとも「CDC REPL(pico2_piousb)でも、UART REPL(pico2)でも、freeze自体は問題を起こさない」ことは確認できた。ただし、pizero固有のハードウェアレイアウト逼迫(§9.2参照)が原因だった可能性は依然残っており、pizero自身での検証を経ない限り「pizeroでも安全」とは言い切れない。
+
+### 9.7 2026-10-17: ユーザー指示により大幅拡大(main.py分割+計12ファイル、実機未検証)
+
+§9.5の実機確認を受け、ユーザーから「フリーズ対象のpyファイルをもっと増やし、可能な限りヒープを確保する方向に進めてほしい」との明示的な指示があった。これに応じ、**`main.py`/`boot.py`以外の全`.py`ファイルをfreeze対象に拡大**した:
+
+- 追加: `msx_keymap.py`・`msx_ext.py`・`msx_menu.py`・`sdcard.py`・`msx_mode_switch.py`・`msx_fdd.py`・`msx_rom_browser.py`・`msx_runtime_menu.py`・`msx_save_slots.py`・`msx_display_settings.py`(計10ファイル、`board_config.py`と合わせて11ファイル)
+- 全ファイル、モジュールレベルでの副作用(import時に実行される関数呼び出し等)が無いこと、`__file__`等frozen moduleが提供できない機能に依存していないことを事前にgrepで確認済み。
+
+**さらに`main.py`自体(1353行、このプロジェクト最大の常時eager importファイル)もfreeze対象に加えるため、新規に`mp/msx_app.py`を作成し、`main.py`の実体(起動フロー・メインループの全ロジック)をそちらへそのまま移動した**。`main.py`自体は以下のような薄いランチャーに縮小:
+
+```python
+from msx_app import run
+
+if __name__ == '__main__':
+    run()
+```
+
+`main.py`は自動起動のエントリポイント(MicroPythonの起動シーケンスが直接execする実ファイル)であるためfreeze不可——frozen moduleは通常の`import`機構経由でしか到達できず、トップレベルスクリプトとして自動実行される対象にはなれない。そのため`main.py`自体は今後もeager importのコストを払い続けるが、その中身は「`from msx_app import run`」1行だけなので、コストはほぼゼロになる。`doc/build_guide.md`/`usage_guide.md`に記載された開発時のREPLショートカット`import main; main.run()`は、`main.run`が`msx_app.run`の再公開のため変更なく動作する(§8の`msx_menu.py`→`msx_ui`再公開と同じパターン)。
+
+**最終的なfreeze対象は計12ファイル**: `board_config.py`・`msx_keymap.py`・`msx_ext.py`・`msx_menu.py`・`sdcard.py`・`msx_mode_switch.py`・`msx_fdd.py`・`msx_rom_browser.py`・`msx_runtime_menu.py`・`msx_save_slots.py`・`msx_display_settings.py`・`msx_app.py`。
+
+#### ビルド結果(pico2/pico2_piousbとも12ファイル構成、2026-10-17)
+
+| 項目 | pico2 | pico2_piousb |
+| :--- | ---: | ---: |
+| RAM(`.data`+`.bss`) | 360,680 B (68.79%、§9.4から不変) | 376,464 B (71.80%、§9.4から不変) |
+| FLASH使用量 | 462,000 B (44.06%) | — |
+| `.uf2`サイズ | 924,672 B | 965,632 B |
+
+両ボードともRAMは完全に不変(想定通り)。ビルドログで全12ファイルの`MPY`出力(`msx_app.py`含む)を確認済み。
+
+**実機検証(2026-10-17、pico2ネイティブUSBホスト版のみ)**: `mpremote run mp/main.py`での起動ログを実測。同一実機・同一BIOS/カートリッジ(`MSX_jp.rom`+`ANTADV.ROM`)で§8.3と同じ3地点を比較した:
+
+| 計測タイミング | フェーズ3のみ(C化、freeze無し) | 今回(C化+12ファイルfreeze) | 今回の差分 | 累計差分(§8着手前比) |
+| :--- | ---: | ---: | ---: | ---: |
+| `boot, after main.py/msx_menu.py compiled` | 41,120 B | 71,360 B | **+30,240 B** | +38,400 B |
+| `after BIOS load` | 50,240 B | 68,512 B | +18,272 B | +26,032 B |
+| `after cart load` | 49,632 B | 67,936 B | +18,304 B | +26,160 B |
+
+正常起動・BIOS/カートロード・60FPS前後の動作いずれも問題なし。
+
+**観測された興味深い変化(「山」が消えた)**: freeze無しの場合、boot→BIOS後にかけて空き容量が**増えていた**(41,120→50,240、+9.1KB)——これは`_load_bios()`内の`gc.collect()`が、直前に`main.py`/`msx_menu.py`自体をコンパイルした際の一時的なパースツリー等のゴミを回収していたため(非圧縮GCヒープが一時的に断片化し、その後の`gc.collect()`で回収されるという典型パターン)。今回(12ファイルfreeze後)は同じ区間で**減っている**(71,360→68,512、-2.8KB、configパース等の通常の小さな確保によるもの)。これは、freezeによって「回収すべきコンパイル時のゴミ」自体がそもそも発生しなくなったことを裏付けている——以前の`gc.collect()`の「ボーナス」は、eager importされるコードが定常的に生み出していたゴミの副産物だった。
+
+これにより、**起動時点での実測+30,240B、定常状態(カートロード後)での実測+18,304B**というfreeze単体の効果と、**着手前(§8着手前、929行版`msx_menu.py`+freeze無し)からの累計で+26,160B(定常状態)**という本プロジェクト全体での改善量が、いずれも実測で確認された。
+
+**2026-10-17追記: PIO-USB版でも実機確認済み**。ネイティブUSBホスト版に続き、PIO-USB版(新命名`pico2`/`firmware_msx.uf2`、デフォルト)でも12ファイルfreeze+`main.py`/`msx_app.py`分割構成で正常動作を確認。これにより§9.2のユーザー仮説(2026-09-30のpizero不具合がUART REPL固有だったのでは)について、少なくとも「pico2系列(ネイティブUSB/PIO-USBいずれのREPLトランスポートでも)freeze自体が問題を起こさない」ことが、今回の拡大構成(12ファイル)でも裏付けられた。pizero自身は引き続き未検証(§9.2参照)。
+
+### 9.8 教訓(現時点、確定ではなく進行中の記録)
+
+- **过去の失敗は「原因不明のまま撤回」だったため、「似た条件がなくなったから大丈夫」という推測だけで前へ進めるべきではない**: ユーザー指摘のREPLトランスポートの変化は有力な仮説だが、plain pico2は当時と同じUART REPLのままであり、そもそもpico2での実績が無い以上、新規の実機検証と同等に慎重に扱う。
+- **1ファイル・2ボードまで刻んだ上で、仮説検証になるよう意図的に組み合わせを選ぶ**: pizeroを除外しつつpico2_piousbを加えたのは、単にリスクを均等に避けるためではなく、「UART REPL(pico2) vs CDC REPL(pico2_piousb)」という条件の違いを意図的に作ることで、§9.2の仮説(REPLトランスポートが原因かどうか)を実機データで直接比較できるようにするため。
