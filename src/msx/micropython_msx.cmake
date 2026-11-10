@@ -150,6 +150,8 @@ target_sources(msx_lib INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/msx_core.c
     ${CMAKE_CURRENT_LIST_DIR}/modmsx.c
     ${CMAKE_CURRENT_LIST_DIR}/wd179x.c
+    ${CMAKE_CURRENT_LIST_DIR}/scc_out.c
+    ${CMAKE_CURRENT_LIST_DIR}/cart_xip.c
 
     # Z80 CPU core (superzazu/z80, MIT)
     ${CMAKE_CURRENT_LIST_DIR}/z80/z80.c

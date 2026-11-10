@@ -81,6 +81,13 @@ static inline uint16_t rgb888_to_565be(uint32_t rgb888) {
  * msx_detect_mapper() below). */
 static uint8_t scan_mapper_patterns(const uint8_t *data, uint32_t size) {
     uint32_t ascii8_hits = 0, ascii16_hits = 0, konami_hits = 0;
+    /* Konami SCC (2026-11-08): selectors 0x5000/0x7000/0x9000/0xB000, same
+     * address set openMSX's ROM-type guesser counts. 0x7000 is shared with
+     * ASCII8/ASCII16's own ranges, so scc_hits (all four) decides the
+     * ranking while scc_excl (0x5000/0x9000/0xB000 only — addresses no
+     * other supported mapper uses) must be non-zero at all, or an ASCII
+     * cart that happens to write 0x7000 a lot would be misread as SCC. */
+    uint32_t scc_hits = 0, scc_excl = 0;
     for (uint32_t i = 0; i + 3 < size; i++) {
         /* LD (nn),A  opcode = 0x32 followed by 16-bit address */
         if (data[i] == 0x32) {
@@ -94,9 +101,17 @@ static uint8_t scan_mapper_patterns(const uint8_t *data, uint32_t size) {
             if (addr == 0x6000 || addr == 0x8000 || addr == 0xA000) {
                 konami_hits++;
             }
+            if (addr == 0x5000 || addr == 0x9000 || addr == 0xB000) {
+                scc_hits++;
+                scc_excl++;
+            } else if (addr == 0x7000) {
+                scc_hits++;
+            }
         }
     }
 
+    if (scc_excl > 0 && scc_hits >= konami_hits && scc_hits >= ascii8_hits)
+        return MSX_MAPPER_KONAMI_SCC;
     if (konami_hits >= ascii8_hits && konami_hits > 0) return MSX_MAPPER_KONAMI;
     if (ascii16_hits > ascii8_hits / 2)                return MSX_MAPPER_ASCII16;
     if (ascii8_hits > 0)                               return MSX_MAPPER_ASCII8;
@@ -140,7 +155,10 @@ static volatile uint32_t cart_fetch_count = 0;
  * to "nothing resident" — shared by msx_cart_alloc()'s paged-mode
  * cleanup, msx_load_cart_paged()'s initial setup, and msx_eject_cart(). */
 static void cart_reset_page_state(msx_state_t *msx, uint8_t slot) {
-    for (int win = 0; win < 4; win++) msx->cart_cache_page[slot][win] = -1;
+    for (int win = 0; win < 4; win++) {
+        msx->cart_cache_page[slot][win] = -1;
+        msx->cart_win[slot][win] = NULL;
+    }
     for (int v = 0; v < MSX_CART_VICTIM_SLOTS; v++) msx->cart_victim_page[slot][v] = -1;
     msx->cart_victim_next[slot] = 0;
 }
@@ -186,6 +204,17 @@ static void cart_page_refill(msx_state_t *msx, uint8_t slot_idx, uint8_t win,
     cart_bankswitch_count++;
     int32_t *page = &msx->cart_cache_page[slot_idx][win];
     if (*page == (int32_t)rom_page) return;
+
+    /* 2026-11-10: ROM resident in memory-mapped flash (msx_load_cart_xip())
+     * — a bank switch is just a pointer update, no copy, no fetch. */
+    if (msx->cart_xip[slot_idx]) {
+        uint32_t pages = msx->cart_size[slot_idx] / MSX_CART_PAGE_SIZE;
+        if (pages == 0) pages = 1;
+        msx->cart_win[slot_idx][win] = msx->cart_xip[slot_idx] +
+                                       (rom_page % pages) * MSX_CART_PAGE_SIZE;
+        *page = (int32_t)rom_page;
+        return;
+    }
 
     uint8_t *win_buf  = &msx->cart_cache[slot_idx][(uint32_t)win * MSX_CART_PAGE_SIZE];
 
@@ -249,11 +278,13 @@ static const uint8_t *cart_page_ptr(msx_state_t *msx, uint8_t slot_idx,
          * 8KB cache slots — see cart_mapper_write()'s paged branch), at a
          * fixed position each (unlike the shared victim pool past index
          * 4 — see cart_page_refill()), so reads need no indirection. */
-        if (!msx->cart_cache[slot_idx]) return NULL;
+        /* 2026-11-10: via cart_win[] (one pointer per window) so the same
+         * read path serves both the RAM cache (pointers fixed at the 4
+         * cache pages) and an XIP-mapped ROM (pointers move on every
+         * bank switch — see msx_load_cart_xip()). */
         if (addr < 0x4000 || addr >= 0xC000) return NULL;
-        uint8_t win = (uint8_t)((addr - 0x4000) >> 13);  /* 0–3 */
-        return &msx->cart_cache[slot_idx][(uint32_t)win * MSX_CART_PAGE_SIZE +
-                                            (addr & 0x1FFF)];
+        const uint8_t *w = msx->cart_win[slot_idx][(addr - 0x4000) >> 13];
+        return w ? w + (addr & 0x1FFF) : NULL;
     }
 
     if (!msx->cart[slot_idx]) return NULL;
@@ -300,9 +331,166 @@ static const uint8_t *cart_page_ptr(msx_state_t *msx, uint8_t slot_idx,
         if (offset >= size) return NULL;
         return rom + offset;
     }
+    case MSX_MAPPER_KONAMI_SCC: {
+        /* Four switchable 8KB windows (incl. 0x4000, unlike KONAMI).
+         * Bank numbers wrap at the ROM size like the real mapper's
+         * address decoding — the SCC-enable value 0x3F in particular is
+         * normally far past the end of the ROM. (The SCC register window
+         * itself is handled in msx_mem_read() before this is reached.) */
+        if (addr < 0x4000 || addr >= 0xC000) return NULL;
+        uint8_t  win    = (addr - 0x4000) >> 13;  /* 0–3 */
+        uint32_t pages  = size / 0x2000u;
+        if (pages == 0) return NULL;
+        uint32_t offset = ((uint32_t)bank[win] % pages) * 0x2000u + (addr & 0x1FFF);
+        if (offset >= size) return NULL;
+        return rom + offset;
+    }
     default:
         return NULL;
     }
+}
+
+/* -----------------------------------------------------------------------
+ * SCC (K051649) register window — see msx_core.h's SCC block
+ * ----------------------------------------------------------------------- */
+static msx_scc_out_fn scc_out_cb = NULL;
+
+void msx_set_scc_out_cb(msx_scc_out_fn cb) {
+    scc_out_cb = cb;
+}
+
+static uint8_t scc_read(const msx_state_t *msx, uint16_t addr);
+
+/* True when addr is inside an enabled SCC register window of this slot. */
+static inline bool scc_window(const msx_state_t *msx, uint8_t slot_idx,
+                              uint16_t addr) {
+    return msx->cart_type[slot_idx] == MSX_MAPPER_KONAMI_SCC &&
+           (uint16_t)(addr - 0x9800u) < 0x0800u &&
+           (msx->cart_bank[slot_idx][2] & 0x3F) == 0x3F;
+}
+
+/* Cart read for slot_idx. 2026-11-10: the paged (Mega ROM) case — the
+ * hot one, every Z80 fetch from such a cart — is inlined here as a
+ * single window-pointer lookup instead of a call into cart_page_ptr()'s
+ * mapper switch. */
+static inline __attribute__((always_inline))
+uint8_t cart_read(msx_state_t *msx, uint8_t slot_idx, uint16_t addr) {
+    if (msx->cart_paged[slot_idx]) {
+        uint16_t rel = (uint16_t)(addr - 0x4000u);
+        if (rel < 0x8000u) {
+            if (scc_window(msx, slot_idx, addr)) return scc_read(msx, addr);
+            const uint8_t *w = msx->cart_win[slot_idx][rel >> 13];
+            if (w) return w[addr & 0x1FFF];
+        }
+        return 0xFF;
+    }
+    if (scc_window(msx, slot_idx, addr)) return scc_read(msx, addr);
+    const uint8_t *p = cart_page_ptr(msx, slot_idx, addr);
+    return p ? *p : 0xFF;
+}
+
+/* Read side of the window (0x100-byte image, mirrored up to 0x9FFF).
+ * Only the waveform RAM is readable on a real SCC; the write-only
+ * frequency/volume/key-on registers read back as 0xFF. 0xA0-0xBF reads
+ * ch5's waveform (= the shared ch4/ch5 table), as on the real chip. */
+static uint8_t scc_read(const msx_state_t *msx, uint16_t addr) {
+    uint8_t off = (uint8_t)addr;
+    if (off < 0x80) return msx->scc_wave[off];
+    if (off >= 0xA0 && off < 0xC0) return msx->scc_wave[0x60u + (off & 0x1F)];
+    return 0xFF;
+}
+
+/* Built-in synthesis: per-channel phase step for the current period.
+ * Same formula as PicoChiptuneOrchestra's chip_scc.c (f = clock /
+ * (32*(freq+1)), 16.16 phase over a 32-entry wave) but computed per
+ * write instead of from its 16KB table: step = K/(freq+1) with
+ * K = 3579545*65536/MSX_AUDIO_RATE (fits in 32 bits). One hardware
+ * divide on the M33; period writes are at most a few hundred per second. */
+#define SCC_STEP_K ((uint32_t)(((uint64_t)MSX_CLOCK_HZ << 16) / MSX_AUDIO_RATE))
+
+static void scc_update_step(msx_state_t *msx, uint8_t ch) {
+    uint32_t freq = msx->scc_reg[ch * 2u] | ((uint32_t)(msx->scc_reg[ch * 2u + 1u] & 0x0F) << 8);
+    msx->scc_step[ch] = (freq <= 8) ? 0 : SCC_STEP_K / (freq + 1u);   /* <=8 halts */
+}
+
+/* One output sample from the SCC shadow, ~±9600 full scale (5 ch x
+ * int8 wave x 4-bit volume) — scaled by scc_gain at the mix. Ported from
+ * chip_scc.c's scc_render(): ch3/ch4 share the 0x60-0x7F wave table;
+ * a keyed-off or halted channel keeps its phase frozen. */
+static inline int32_t scc_render(msx_state_t *msx) {
+    uint8_t keys = msx->scc_reg[0x0F];
+    int32_t mix = 0;
+    for (uint8_t ch = 0; ch < 5; ch++) {
+        if (!(keys & (1u << ch)) || msx->scc_step[ch] == 0) continue;
+        uint32_t ph = msx->scc_phase[ch] += msx->scc_step[ch];
+        uint8_t base = (ch < 4) ? (uint8_t)(ch << 5) : 0x60u;
+        int8_t  smp  = (int8_t)msx->scc_wave[base + ((ph >> 16) & 0x1F)];
+        mix += (int32_t)smp * (msx->scc_reg[0x0A + ch] & 0x0F);
+    }
+    return mix;
+}
+
+void msx_set_scc_internal(msx_state_t *msx, bool enable, uint16_t gain) {
+    msx->scc_internal = enable;
+    msx->scc_gain     = gain;
+}
+
+static void scc_write(msx_state_t *msx, uint16_t addr, uint8_t data) {
+    uint8_t off = (uint8_t)addr;
+    if (off < 0x80) {
+        msx->scc_wave[off] = data;
+        if (scc_out_cb) scc_out_cb(MSX_SCC_OP_WAVEFORM, off, data);
+    } else if (off < 0xA0) {
+        uint8_t r = off & 0x0F;               /* 0x90-0x9F mirror 0x80-0x8F */
+        msx->scc_reg[r] = data;
+        if (r < 0x0A) scc_update_step(msx, (uint8_t)(r >> 1));
+        if (!scc_out_cb) return;
+        if (r < 0x0A)       scc_out_cb(MSX_SCC_OP_FREQ, r, data);
+        else if (r < 0x0F)  scc_out_cb(MSX_SCC_OP_VOLUME, (uint8_t)(r - 0x0A), data & 0x0F);
+        else                scc_out_cb(MSX_SCC_OP_KEYON, 0, data & 0x1F);
+    } else if (off >= 0xE0) {
+        msx->scc_deform = data;               /* stored only; not forwarded */
+    }
+    /* 0xA0-0xDF: no effect on a plain (non-SCC+) SCC. */
+}
+
+void msx_scc_out_mute(msx_state_t *msx, bool mute) {
+    if (!scc_out_cb) return;
+    scc_out_cb(MSX_SCC_OP_KEYON, 0, mute ? 0 : (msx->scc_reg[0x0F] & 0x1F));
+}
+
+void msx_scc_out_resync(msx_state_t *msx) {
+    if (!scc_out_cb) return;
+    for (uint8_t i = 0; i < 0x80; i++) scc_out_cb(MSX_SCC_OP_WAVEFORM, i, msx->scc_wave[i]);
+    for (uint8_t i = 0; i < 0x0A; i++) scc_out_cb(MSX_SCC_OP_FREQ, i, msx->scc_reg[i]);
+    for (uint8_t i = 0; i < 5; i++)    scc_out_cb(MSX_SCC_OP_VOLUME, i, msx->scc_reg[0x0A + i] & 0x0F);
+    scc_out_cb(MSX_SCC_OP_KEYON, 0, msx->scc_reg[0x0F] & 0x1F);
+}
+
+static void scc_reset(msx_state_t *msx) {
+    memset(msx->scc_wave, 0, sizeof(msx->scc_wave));
+    memset(msx->scc_reg, 0, sizeof(msx->scc_reg));
+    memset(msx->scc_step, 0, sizeof(msx->scc_step));
+    memset(msx->scc_phase, 0, sizeof(msx->scc_phase));
+    msx->scc_deform = 0;
+    if (scc_out_cb) scc_out_cb(MSX_SCC_OP_RESET, 0, 0);
+}
+
+void msx_scc_state_save(const msx_state_t *msx, uint8_t *buf) {
+    memcpy(buf, MSX_SCC_STATE_MAGIC, 4);
+    memcpy(buf + 4, msx->scc_wave, 0x80);
+    memcpy(buf + 4 + 0x80, msx->scc_reg, 0x10);
+    buf[4 + 0x80 + 0x10] = msx->scc_deform;
+}
+
+void msx_scc_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len) {
+    scc_reset(msx);   /* also RESETs the external chip */
+    if (!buf || len < MSX_SCC_STATE_SZ || memcmp(buf, MSX_SCC_STATE_MAGIC, 4) != 0) return;
+    memcpy(msx->scc_wave, buf + 4, 0x80);
+    memcpy(msx->scc_reg, buf + 4 + 0x80, 0x10);
+    msx->scc_deform = buf[4 + 0x80 + 0x10];
+    for (uint8_t ch = 0; ch < 5; ch++) scc_update_step(msx, ch);
+    msx_scc_out_resync(msx);
 }
 
 /* Handle writes that update mapper bank registers. */
@@ -356,6 +544,19 @@ static void cart_mapper_write(msx_state_t *msx, uint8_t slot_idx,
             if (paged) cart_page_refill(msx, slot_idx, 3, data);
         }
         break;
+    case MSX_MAPPER_KONAMI_SCC:
+        /* Selectors live in the first 2KB of 0x5000/0x7000/0x9000/0xB000
+         * (addr & 0x1800 == 0x1000 within each 8KB window). */
+        if (addr >= 0x4000 && addr < 0xC000) {
+            if ((addr & 0x1800) == 0x1000) {
+                uint8_t win = (uint8_t)((addr - 0x4000) >> 13);
+                bank[win] = data;
+                if (paged) cart_page_refill(msx, slot_idx, win, data);
+            } else if (scc_window(msx, slot_idx, addr)) {
+                scc_write(msx, addr, data);
+            }
+        }
+        break;
     default:
         break;
     }
@@ -384,16 +585,16 @@ uint8_t msx_mem_read(void *userdata, uint16_t addr) {
          * range; the FDC IC does). Checked before cart_page_ptr() so it
          * takes priority; no-op (falls through to normal ROM/cache reads)
          * when mode=disk isn't active. */
-        if (msx_fdc_addr_in_range(&msx->fdc, addr)) {
+        /* fdc.enabled tested inline first (2026-11-10): only mode=disk
+         * enables it, and every other cart read used to pay a function
+         * call here. */
+        if (msx->fdc.enabled && msx_fdc_addr_in_range(&msx->fdc, addr)) {
             return msx_fdc_read(&msx->fdc, addr);
         }
-        const uint8_t *p = cart_page_ptr(msx, 0, addr);
-        return p ? *p : 0xFF;
+        return cart_read(msx, 0, addr);
     }
-    case 2: /* Cartridge slot 2 */ {
-        const uint8_t *p = cart_page_ptr(msx, 1, addr);
-        return p ? *p : 0xFF;
-    }
+    case 2: /* Cartridge slot 2 */
+        return cart_read(msx, 1, addr);
     case 3: /* RAM */
         return msx->ram[addr];
 
@@ -556,9 +757,21 @@ static void audio_generate_scanline(msx_state_t *msx) {
      * lines. For simplicity we generate 2 samples per scanline and top up
      * at frame end. */
     /* Produce ~2 samples per active scanline */
+    /* 2026-11-09: audio_buf is now SIGNED, centered on 0 (the PWM ISR in
+     * modmsx.c adds the midpoint back). PSG_calc() is unipolar (0..~12240),
+     * so its DC is removed with a one-pole high-pass (~3.4Hz at 22050Hz,
+     * Q8 state) before the bipolar built-in SCC is mixed in. */
     for (int s = 0; s < 2; s++) {
         if (msx->audio_write_pos < MSX_AUDIO_BUF_SIZE) {
-            msx->audio_buf[msx->audio_write_pos++] = PSG_calc(msx->psg);
+            int32_t psg = PSG_calc(msx->psg);
+            msx->psg_dc += ((psg << 8) - msx->psg_dc) >> 10;
+            int32_t mix = psg - (msx->psg_dc >> 8);
+            if (msx->scc_internal && (msx->scc_reg[0x0F] & 0x1F)) {
+                mix += (scc_render(msx) * (int32_t)msx->scc_gain) >> 8;
+            }
+            if (mix > 32767) mix = 32767;
+            if (mix < -32768) mix = -32768;
+            msx->audio_buf[msx->audio_write_pos++] = (int16_t)mix;
         }
     }
 }
@@ -577,6 +790,9 @@ void msx_init(msx_state_t *msx) {
     msx_destroy(msx);
 
     memset(msx, 0, sizeof(*msx));
+
+    msx->scc_internal = true;   /* built-in SCC on by default */
+    msx->scc_gain     = 256;
 
     /* Build RGB565 palette */
     for (int i = 0; i < 16; i++) {
@@ -736,6 +952,7 @@ uint8_t *msx_cart_alloc(msx_state_t *msx, uint8_t slot, uint32_t size) {
     free(msx->cart_cache[slot]);
     msx->cart_cache[slot] = NULL;
     msx->cart_paged[slot] = false;
+    msx->cart_xip[slot] = NULL;
     cart_reset_page_state(msx, slot);
 
     if (!(msx->cart[slot] && msx->cart_alloc_cap[slot] >= size)) {
@@ -822,9 +1039,31 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
 
     cart_reset_page_state(msx, slot);
     for (uint8_t win = 0; win < 4; win++) {
+        msx->cart_win[slot][win] = &msx->cart_cache[slot][(uint32_t)win * MSX_CART_PAGE_SIZE];
         cart_page_refill(msx, slot, win, win);
     }
 
+    return true;
+}
+
+/* -----------------------------------------------------------------------
+ * msx_load_cart_xip — see msx_core.h
+ * ----------------------------------------------------------------------- */
+bool msx_load_cart_xip(msx_state_t *msx, uint8_t slot, const uint8_t *rom,
+                       uint32_t total_size, uint8_t mapper) {
+    if (!msx->initialized || slot > 1 || !rom || total_size == 0) return false;
+    if (mapper == MSX_MAPPER_PLAIN) return false;
+
+    msx_eject_cart(msx, slot);   /* keeps cart_cache[] for a later paged load */
+
+    msx->cart_paged[slot] = true;
+    msx->cart_xip[slot]   = rom;
+    msx->cart_size[slot]  = total_size;
+    msx->cart_type[slot]  = mapper;
+    for (uint8_t win = 0; win < 4; win++) msx->cart_bank[slot][win] = win;
+
+    cart_reset_page_state(msx, slot);
+    for (uint8_t win = 0; win < 4; win++) cart_page_refill(msx, slot, win, win);
     return true;
 }
 
@@ -833,6 +1072,8 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
  * ----------------------------------------------------------------------- */
 void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     if (slot > 1) return;
+    /* Silence an external SCC that was being driven by this cart. */
+    if (msx->cart_type[slot] == MSX_MAPPER_KONAMI_SCC) scc_reset(msx);
     /* Genuinely frees cart[slot] (unlike msx_cart_alloc()'s own internal
      * cleanup, which deliberately keeps reusing this block across swaps —
      * see cart_alloc_cap[]'s comment in msx_core.h). Called here for a
@@ -859,6 +1100,7 @@ void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     msx->cart[slot]         = NULL;
     msx->cart_alloc_cap[slot] = 0;
     msx->cart_paged[slot] = false;
+    msx->cart_xip[slot] = NULL;     /* flash-resident, never free()'d */
     msx->cart_size[slot] = 0;
     msx->cart_type[slot] = MSX_MAPPER_PLAIN;
     memset(msx->cart_bank[slot], 0, sizeof(msx->cart_bank[slot]));
@@ -906,6 +1148,19 @@ void msx_reset(msx_state_t *msx) {
     msx->joy_select   = 0;
 
     msx_fdc_reset(&msx->fdc);
+
+    /* SCC: shadow cleared and the external chip reset (sound off). Mapper
+     * banks back to power-on 0-3 for SCC carts (also disables the SCC
+     * window) — real cartridges reset their selectors on /RESET too. Left
+     * as-is for the other mappers to keep their existing behavior. */
+    for (uint8_t sl = 0; sl < 2; sl++) {
+        if (msx->cart_type[sl] != MSX_MAPPER_KONAMI_SCC) continue;
+        for (uint8_t w = 0; w < 4; w++) {
+            msx->cart_bank[sl][w] = w;
+            if (msx->cart_paged[sl]) cart_page_refill(msx, sl, w, w);
+        }
+    }
+    scc_reset(msx);
 }
 
 /* -----------------------------------------------------------------------

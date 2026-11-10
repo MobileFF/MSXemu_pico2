@@ -83,6 +83,31 @@
 #define MSX_MAPPER_ASCII8   1   /* 8KB pages, selectors at 0x6000/0x6800/0x7000/0x7800 */
 #define MSX_MAPPER_ASCII16  2   /* 16KB pages, selectors at 0x6000/0x7000 */
 #define MSX_MAPPER_KONAMI   3   /* 8KB pages, selectors written to 0x6000/0x8000/0xA000 */
+#define MSX_MAPPER_KONAMI_SCC 4 /* 8KB pages, selectors at 0x5000/0x7000/0x9000/0xB000
+                                 * (each 0x?000-0x?7FF); SCC (K051649) registers appear at
+                                 * 0x9800-0x9FFF while the 0x9000 bank's low 6 bits == 0x3F.
+                                 * See 調査用/PicoChiptuneOrchestra連携_SCC_YM2413外部演奏検討.md */
+
+/* -----------------------------------------------------------------------
+ * SCC (K051649) external output
+ *
+ * The emulator does not synthesize SCC audio itself. Writes to the SCC
+ * register window are kept in a local shadow (msx_state_t.scc_*, so the
+ * Z80 can read the waveform RAM back — some titles detect the SCC that
+ * way) and forwarded, already decoded per region, to an optional output
+ * callback (see msx_set_scc_out_cb()). The opcode values below are
+ * deliberately identical to PicoChiptuneOrchestra's
+ * src/protocol/vgm_spi_protocol.h (VGMSPI_OP_*), so the callback can put
+ * them on the wire unchanged for its slave_scc.uf2 board.
+ * ----------------------------------------------------------------------- */
+#define MSX_SCC_OP_RESET     0x01  /* reg = clock preset (0 = 3.579545MHz) */
+#define MSX_SCC_OP_MUTE      0x04
+#define MSX_SCC_OP_WAVEFORM  0x05  /* reg = 0x00-0x7F, data = signed sample */
+#define MSX_SCC_OP_FREQ      0x06  /* reg = ch*2 + (0=low,1=high nibble)     */
+#define MSX_SCC_OP_VOLUME    0x07  /* reg = ch 0-4, data = 0-15              */
+#define MSX_SCC_OP_KEYON     0x08  /* data = 5-bit channel enable mask       */
+
+typedef void (*msx_scc_out_fn)(uint8_t opcode, uint8_t reg, uint8_t data);
 
 /* -----------------------------------------------------------------------
  * Mega ROM (SD-backed, lazily-paged) cart support
@@ -316,6 +341,23 @@ typedef struct {
                                           * victim slot, -1=none — see cart_page_refill() */
     uint8_t   cart_victim_next[2];       /* round-robin index: which victim slot the next
                                           * eviction writes into */
+    /* SCC register shadow (MSX_MAPPER_KONAMI_SCC carts only — see the
+     * SCC external output block above). One shared copy: a second SCC
+     * cart in the other slot is not a real-world case worth 2x the RAM. */
+    uint8_t   scc_wave[0x80];            /* 0x9800-0x987F (ch3/ch4 share 0x60-0x7F) */
+    uint8_t   scc_reg[0x10];             /* 0x9880-0x988F: freq x10, vol x5, keyon */
+    uint8_t   scc_deform;                /* 0x98E0-0x98FF test/deformation register */
+    /* Built-in SCC synthesis (2026-11-09, 調査用/SCC内蔵音源_実現可能性検討.md) —
+     * rendered from the shadow above in audio_generate_scanline(). */
+    uint32_t  scc_step[5];               /* 16.16 phase advance per output sample */
+    uint32_t  scc_phase[5];              /* 16.16 read position into the 32-pt wave */
+    bool      scc_internal;              /* render SCC into audio_buf (default true) */
+    uint16_t  scc_gain;                  /* SCC level vs PSG, 256 = 1:1 (default) */
+    int32_t   psg_dc;                    /* PSG DC-blocker state, Q8 */
+    /* 2026-11-10: per-window read pointers for paged carts (RAM cache
+     * pages, or XIP flash when cart_xip[] is set) — see cart_page_ptr(). */
+    const uint8_t *cart_win[2][4];
+    const uint8_t *cart_xip[2];          /* whole ROM, memory-mapped flash; NULL = not XIP */
     msx_cart_fetch_fn cart_fetch_cb;     /* set once via msx_set_cart_fetch_cb() */
     void     *cart_fetch_userdata;
 
@@ -526,11 +568,49 @@ void msx_get_cart_fetch_stats(msx_state_t *msx, uint32_t *bankswitch_count,
 bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
                           uint8_t mapper);
 
+/* 2026-11-10: load a Mega ROM that already sits, whole, in memory-mapped
+ * (XIP) flash — see src/cart_xip.c. Bank switches then just repoint the
+ * windows into it: no RAM cache, no fetch callback. rom must stay valid
+ * (and unmodified) until the cart is ejected. mapper as for
+ * msx_load_cart_paged(). */
+bool msx_load_cart_xip(msx_state_t *msx, uint8_t slot, const uint8_t *rom,
+                       uint32_t total_size, uint8_t mapper);
+
 /* Run the same mapper-detection heuristic msx_load_cart() uses
  * internally against a caller-supplied buffer (e.g. just the first 64KB
  * of a large ROM) — lets the caller pick a mapper for
  * msx_load_cart_paged() without needing the whole ROM in RAM. */
 uint8_t msx_detect_mapper(const uint8_t *data, uint32_t size);
+
+/* Register (or, with NULL, clear) the SCC output callback — called once
+ * per decoded SCC register write (MSX_SCC_OP_*), from inside the Z80
+ * memory-write path, so it must be quick. Stored outside msx_state_t, so
+ * msx_init() does not clear it. */
+void msx_set_scc_out_cb(msx_scc_out_fn cb);
+
+/* Silence (mute=true: key-on mask 0) or restore (false: re-send the
+ * shadow's key-on mask) the external SCC — e.g. while the runtime menu
+ * has emulation paused. No-op without a callback. */
+void msx_scc_out_mute(msx_state_t *msx, bool mute);
+
+/* Re-send the whole SCC shadow (waveforms, frequencies, volumes, key-on)
+ * — e.g. right after the output was (re)connected. */
+void msx_scc_out_resync(msx_state_t *msx);
+
+/* Built-in SCC synthesis on/off (default on) and its level relative to
+ * PSG (256 = 1:1, 0 = silent). Independent of the external output: both
+ * can run at once. */
+void msx_set_scc_internal(msx_state_t *msx, bool enable, uint16_t gain);
+
+/* Save-state trailer carrying the SCC shadow, written after the VRAM
+ * image by the save/load code (modmsx_ui.c). Old saves without it still
+ * load — msx_scc_state_load() then just resets the SCC to silence. */
+#define MSX_SCC_STATE_MAGIC "SCC1"
+#define MSX_SCC_STATE_SZ    (4u + 0x80u + 0x10u + 1u)
+void msx_scc_state_save(const msx_state_t *msx, uint8_t *buf);
+/* buf may be NULL / len short (no trailer) -> SCC reset. Re-sends the
+ * restored state to the external output, if any. */
+void msx_scc_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len);
 
 /* Eject cartridge. */
 void msx_eject_cart(msx_state_t *msx, uint8_t slot);

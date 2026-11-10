@@ -59,6 +59,9 @@
 #   hdmi_frame_skip=2
 #   hdmi_baud=8000000
 #   hdmi_scale=2
+#   scc=on
+#   scc_volume=256
+#   scc_out=2,3,6
 #   # omit 'cart' to show the interactive ROM selector at boot (browses from
 #   # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
 #   # a ROM, ESC goes up a level/cancels at the root)
@@ -109,6 +112,17 @@
 #   # (the receiver steps the factor down until the frame fits). Applies to
 #   # game and menu frames alike, costs no extra SPI traffic (the receiver
 #   # does the upscaling). Only matters when display=hdmi.
+#   # scc=on|off: built-in Konami SCC synthesis, mixed into the same PWM
+#   # audio output as the PSG (default on). scc_volume: its level relative
+#   # to the PSG, 256 = 1:1 (default), 0-1024. Independent of scc_out below
+#   # — both can be used at once.
+#   # scc_out=SCK,MOSI,CS[,BAUD] (GPIO numbers) forwards Konami SCC sound
+#   # register writes to an external PicoChiptuneOrchestra slave_scc board
+#   # (write-only SPI, mode 1, bit-banged — see src/msx/scc_out.c and
+#   # 調査用/PicoChiptuneOrchestra連携_SCC_YM2413外部演奏検討.md). The
+#   # emulator itself doesn't synthesize SCC; the board's PWM output must be
+#   # mixed with this board's own audio in analog. Omit to disable. Pick
+#   # pins not used by board_config.py (LCD/SD/USB/joystick/audio).
 #   # ext=off skips loading /sd/msx/ext/ and /ext/ extension modules (see
 #   # mp/msx_ext.py, doc/extension_api.md). Default is to load them.
 #   # Real-hardware finding: once ANY extension registers even one
@@ -624,6 +638,7 @@ def poll_keyboard():
         # investigation, so a clean file is more trustworthy than trusting
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
+        msx.scc_out_mute(True)   # external SCC keeps sounding otherwise
         try:
             display_state, _cart_path, _disk_path, _fdd_mode, _diskrom_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
@@ -675,6 +690,7 @@ def poll_keyboard():
                              'lcd': _lcd_model, 'rotate': _rotate_180,
                              'hdmi_baud': _hdmi_baud,
                              'hdmi_scale': _hdmi_scale}
+        msx.scc_out_mute(False)  # re-send the shadow's key-on mask
         _display_mode    = display_state['display']
         _hdmi_frame_skip = display_state['frame_skip']
         _hdmi_scale      = display_state['hdmi_scale']  # already applied live by the menu
@@ -1192,6 +1208,24 @@ def _init_audio_and_ext(cfg):
     except (ValueError, TypeError) as e:
         print(f"Bad volume/audio_filter in msx.ini: {e}")
 
+    # 8.3 — Built-in SCC (msx.ini scc=on|off, scc_volume=0..1024)
+    try:
+        msx.set_scc_internal(cfg.get('scc', 'on').strip().lower() != 'off',
+                             int(cfg.get('scc_volume', 256)))
+    except (ValueError, TypeError) as e:
+        print(f"Bad scc_volume in msx.ini: {e}")
+
+    # 8.4 — Optional external SCC (msx.ini scc_out=SCK,MOSI,CS[,BAUD])
+    _scc = cfg.get('scc_out', '').strip()
+    if _scc:
+        try:
+            _p = [int(v, 0) for v in _scc.split(',')]
+            if len(_p) not in (3, 4) or not msx.scc_out_init(*_p):
+                raise ValueError(_scc)
+            print(f"SCC OUT: SCK={_p[0]} MOSI={_p[1]} CS={_p[2]}")
+        except ValueError as e:
+            print(f"Bad scc_out in msx.ini: {e}")
+
     # 8.5 — Load /sd/msx/ext/ and /ext/ extension modules (CALL/RST hook
     # plugins — see mp/msx_ext.py and doc/extension_api.md). Runs before
     # reset() so any hooks are already in place when the machine starts.
@@ -1232,6 +1266,7 @@ def _main_loop():
 
     frame = 0
     t0    = time.ticks_ms()
+    _fs_prev = msx.get_cart_fetch_stats()
 
     # 2026-09-05: MSX_TCYCLES_FRAME (msx_core.h) advances exactly 1/60s of
     # MSX-clock time per msx.run_frame() call, regardless of how fast the
@@ -1341,7 +1376,12 @@ def _main_loop():
             elapsed = time.ticks_diff(time.ticks_ms(), t0)
             fps     = 300_000 / elapsed if elapsed > 0 else 0.0
             ring    = msx.get_audio_ring_level()
-            print(f"FPS: {fps:.1f}  ring: {ring}")
+            # 2026-11-09 DIAGNOSTIC: Mega ROM bank switches / cache-miss
+            # fetches during these 300 frames (msx_get_cart_fetch_stats()),
+            # to tell flash-fetch stalls apart from other FPS costs.
+            bs, fe = msx.get_cart_fetch_stats()
+            print(f"FPS: {fps:.1f}  ring: {ring}  bank: +{bs - _fs_prev[0]}  fetch: +{fe - _fs_prev[1]}")
+            _fs_prev = (bs, fe)
             # 2026-10-05 DIAGNOSTIC (re-added): (heartbeat, late_scanline_ctr)
             # — see disp_dvi.c's msx_dvi_debug_info()/msx.dvi_debug() and
             # the dvi.c was_backlogged fix. Checking whether the fix

@@ -72,6 +72,7 @@
 #include "extmod/vfs.h"
 
 #include "msx_core.h"
+#include "cart_xip.h"
 #include "usb_host_core.h"
 #include "extmod/font_petme128_8x8.h"
 
@@ -730,6 +731,11 @@ static mp_obj_t ui_save_state_to(mp_obj_t msx_module_obj, mp_obj_t path_obj) {
         ui_write_chunked_c(f, msx->ram, MSX_RAM_SIZE);
         uint8_t *vram = msx_get_vram_ptr(msx);
         ui_write_chunked_c(f, vram, MSX_VRAM_SIZE);
+        /* 2026-11-09: optional SCC trailer (older firmware ignores it —
+         * it only ever reads header+RAM+VRAM). */
+        uint8_t scc[MSX_SCC_STATE_SZ];
+        msx_scc_state_save(msx, scc);
+        ui_write_chunked_c(f, scc, sizeof(scc));
         nlr_pop();
     } else {
         mp_stream_close(f);
@@ -757,6 +763,13 @@ static mp_obj_t ui_load_state_from(mp_obj_t msx_module_obj, mp_obj_t path_obj) {
             uint8_t *vram = msx_get_vram_ptr(msx);
             mp_uint_t n_vram = ui_readinto_chunked_c(f, vram, MSX_VRAM_SIZE);
             ok = (n_ram == MSX_RAM_SIZE) && (n_vram == MSX_VRAM_SIZE);
+            if (ok) {
+                /* Optional SCC trailer; absent in older saves (short read
+                 * -> msx_scc_state_load() just silences the SCC). */
+                uint8_t scc[MSX_SCC_STATE_SZ];
+                mp_uint_t n_scc = ui_readinto_chunked_c(f, scc, sizeof(scc));
+                msx_scc_state_load(msx, scc, (uint32_t)n_scc);
+            }
         }
         nlr_pop();
     } else {
@@ -1321,6 +1334,55 @@ static void ui_copy_to_flash_cache(mp_obj_t src_path_obj, mp_int_t size) {
     mp_stream_close(mf);
 }
 
+/* 2026-11-10: Mega ROM straight into memory-mapped flash (src/msx/
+ * cart_xip.c) — bank switches become pointer updates instead of 8KB
+ * flash->RAM fetches. Returns true if the cart was loaded this way;
+ * false (nothing changed, caller falls back to the RAM page cache) if
+ * the feature is unavailable on this board or the ROM doesn't fit.
+ * The SD file is copied directly into the flash region (no LittleFS
+ * cache file in between) and skipped entirely when the region already
+ * holds this exact path+size. */
+static bool ui_load_cart_xip(msx_state_t *msx, mp_int_t slot, mp_obj_t path_obj, mp_int_t size) {
+    uint32_t cap = cart_xip_capacity();
+    if (cap == 0 || size <= 0 || (uint32_t)size > cap) return false;
+
+    size_t path_len;
+    const char *path_s = mp_obj_str_get_data(path_obj, &path_len);
+    const uint8_t *rom = cart_xip_lookup(path_s, path_len, (uint32_t)size);
+
+    if (rom == NULL) {
+        uint8_t *buf = msx_get_scratch_buf();   /* 4KB = one flash sector */
+        mp_printf(&mp_plat_print, "XIP: copying %s (%dKB) to flash...\n", path_s, (int)(size / 1024));
+        if (!cart_xip_begin((uint32_t)size)) return false;
+        mp_obj_t f = ui_open_file(path_obj, MP_QSTR_rb);
+        nlr_buf_t nlr;
+        if (nlr_push(&nlr) == 0) {
+            uint32_t sectors = ((uint32_t)size + 4095u) / 4096u;
+            for (uint32_t i = 0; i < sectors; i++) {
+                mp_uint_t n = ui_readinto_chunked_c(f, buf, 4096);
+                if (n < 4096) memset(buf + n, 0xFF, 4096 - n);
+                if (n == 0 || !cart_xip_write_sector(i, buf)) {
+                    mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("XIP copy failed"));
+                }
+            }
+            nlr_pop();
+        } else {
+            mp_stream_close(f);
+            nlr_jump(nlr.ret_val);
+        }
+        mp_stream_close(f);
+        rom = cart_xip_commit(path_s, path_len, (uint32_t)size, buf);
+        if (rom == NULL) return false;
+    }
+
+    /* Same mapper detection as the paged path below (same 4KB prefix,
+     * KONAMI fallback) — just read straight from flash, no buffer. */
+    uint8_t mapper = msx_detect_mapper(rom, (uint32_t)(size < UI_PREFIX_BUF_SIZE ? size : UI_PREFIX_BUF_SIZE));
+    if (mapper == MSX_MAPPER_PLAIN) mapper = MSX_MAPPER_KONAMI;
+    mp_printf(&mp_plat_print, "MAPPER DIAG: %s -> %d (XIP)\n", path_s, (int)mapper);
+    return msx_load_cart_xip(msx, (uint8_t)slot, rom, (uint32_t)size, mapper);
+}
+
 /* load_cart_smart(msx_module, slot, path) -> bool */
 static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, mp_obj_t path_obj) {
     msx_state_t *msx = msx_get_state();
@@ -1366,6 +1428,10 @@ static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, m
         return mp_obj_new_bool(msx_cart_finalize(msx, (uint8_t)slot, MSX_MAPPER_PLAIN));
     }
 
+    if (ui_load_cart_xip(msx, slot, path_obj, size)) {
+        return mp_const_true;
+    }
+
     if (!ui_flash_cache_valid(path_obj, size)) {
         ui_copy_to_flash_cache(path_obj, size);
     }
@@ -1402,6 +1468,7 @@ static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, m
             case MSX_MAPPER_ASCII8:  mapper_name = "ASCII8";  break;
             case MSX_MAPPER_ASCII16: mapper_name = "ASCII16"; break;
             case MSX_MAPPER_KONAMI:  mapper_name = "KONAMI";  break;
+            case MSX_MAPPER_KONAMI_SCC: mapper_name = "KONAMI_SCC"; break;
         }
         mp_printf(&mp_plat_print, "MAPPER DIAG: %s -> %s\n", mp_obj_str_get_str(path_obj), mapper_name);
 
