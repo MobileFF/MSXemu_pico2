@@ -170,6 +170,9 @@ static volatile uint32_t audio_ring_read  = 0; /* written by ISR only */
  * Win+F7 hang's real cause is still open; see MenuCanvas.flush()'s
  * framebuf[ready_idx] race with disp_dvi.c's scanline_callback instead. */
 #define AUDIO_PWM_MID 512
+/* Samples clamped to the PWM range since boot (2026-11-11 diagnostic:
+ * tells digital clipping apart from other distortion). */
+static volatile uint32_t audio_clip_count = 0;
 static repeating_timer_t audio_rep_timer;
 static bool audio_timer_running = false;
 
@@ -204,8 +207,8 @@ static bool audio_timer_cb(repeating_timer_t *t) {
          * swing still spans ~765 counts, now around 512 instead of from 0. */
         int32_t scaled = (filtered * (int32_t)audio_volume) >> 12;
         int32_t val = AUDIO_PWM_MID + scaled;
-        if (val < 0) val = 0;
-        if (val > 1023) val = 1023;
+        if (val < 0)    { val = 0;    audio_clip_count++; }
+        if (val > 1023) { val = 1023; audio_clip_count++; }
         pwm_set_gpio_level(audio_pwm_pin, (uint16_t)val);
     }
     /* Ring underrun: hold last PWM level (no pop) */
@@ -1327,6 +1330,27 @@ static mp_obj_t msx_py_scc_out_deinit(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_scc_out_deinit_obj, msx_py_scc_out_deinit);
 
+/* msx.set_psg_volume(gain: int) — PSG level, 256 = unchanged, 0 = mute. */
+static mp_obj_t msx_py_set_psg_volume(mp_obj_t gain_obj) {
+    mp_int_t gain = mp_obj_get_int(gain_obj);
+    if (gain < 0) gain = 0;
+    if (gain > 1024) gain = 1024;
+    msx_set_psg_gain(&msx_state, (uint16_t)gain);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_set_psg_volume_obj, msx_py_set_psg_volume);
+
+/* msx.get_audio_clip_count() -> int — samples clamped to the PWM range
+ * since boot. */
+static mp_obj_t msx_py_get_audio_clip_count(void) {
+#if HAVE_PICO_SDK
+    return mp_obj_new_int_from_uint(audio_clip_count);
+#else
+    return mp_obj_new_int(0);
+#endif
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_get_audio_clip_count_obj, msx_py_get_audio_clip_count);
+
 /* msx.set_scc_internal(enable: bool, gain: int = 256)
  * Built-in SCC synthesis on/off and its level vs PSG (256 = 1:1). */
 static mp_obj_t msx_py_set_scc_internal(size_t n_args, const mp_obj_t *args) {
@@ -1775,6 +1799,8 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_scc_out_deinit),         MP_ROM_PTR(&msx_py_scc_out_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_scc_out_mute),           MP_ROM_PTR(&msx_py_scc_out_mute_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_scc_internal),       MP_ROM_PTR(&msx_py_set_scc_internal_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_psg_volume),         MP_ROM_PTR(&msx_py_set_psg_volume_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_audio_clip_count),   MP_ROM_PTR(&msx_py_get_audio_clip_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_audio_filter),       MP_ROM_PTR(&msx_py_set_audio_filter_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_volume),       MP_ROM_PTR(&msx_py_get_audio_volume_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_filter),       MP_ROM_PTR(&msx_py_get_audio_filter_obj) },

@@ -57,7 +57,7 @@ MSXシステムそのもの。Pico SDK に依存しないよう設計されて�
 | カテゴリ | 関数例 |
 | :--- | :--- |
 | 初期化 | `msx_init()`, `msx_load_bios()`, `msx_reset()`, `msx_destroy()` |
-| カートリッジ | `msx_load_cart()`, `msx_load_cart_paged()`, `msx_set_cart_fetch_cb()`, `msx_detect_mapper()`, `msx_eject_cart()` |
+| カートリッジ | `msx_load_cart()`, `msx_load_cart_paged()`, `msx_load_cart_xip()`, `msx_set_cart_fetch_cb()`, `msx_detect_mapper()`, `msx_eject_cart()` |
 | 実行 | `msx_run_frame()` |
 | I/O | `msx_mem_read()`/`msx_mem_write()`, `msx_port_read()`/`msx_port_write()`, `msx_set_key_matrix()`, `msx_set_joystick()` |
 | 表示 | `msx_init_display_hardware()`, `msx_render_to_display_1to1()`, `msx_render_to_display()`, `msx_wait_display()` |
@@ -117,7 +117,7 @@ gcc -I. -o test_boot my_test.c msx/msx_core.c msx/z80/z80.c \
 
 1. `msx_core.h` に `MSX_MAPPER_*` の新しい定数を追加する。
 2. `msx_core.c` の `cart_page_ptr()`（読み取り経路）に、そのマッパーのウィンドウ→バンク番号のマッピングロジックを追加する。
-3. `cart_mapper_write()` に、そのマッパーのバンク切替アドレス検知ロジックを追加する。ページング（メガロム）対応も同時に行う場合は `cart_page_refill()` の呼び出しも追加する。
+3. `cart_mapper_write()` に、そのマッパーのバンク切替アドレス検知ロジックを追加する。ページング（メガロム）対応も同時に行う場合は `cart_page_refill()` の呼び出しも追加する（ページング・XIPのどちらでも、読み出しは窓ごとのポインタ `cart_win[]` 経由になるため、`cart_page_refill()` に正しい8KBページ番号を渡せば両方式で動く）。
 4. 必要であれば `detect_mapper()`（`scan_mapper_patterns()`）のヒューリスティックに検出パターンを追加する。
 5. `modmsx.c` の `MP_QSTR_MAPPER_*` 定数登録に新しいマッパーを追加する。
 6. ホストビルドでバンク切替の読み書きが正しいアドレスに反映されることを確認してから実機テストする。

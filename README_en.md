@@ -12,7 +12,8 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - **MicroPython Framework**: Boot flow, UI, and configuration logic are written in MicroPython for easy customization.
 - **Display Support**: Supports ST7796 (480×320) and ILI9341 (320×240) TFT LCDs, switchable via `msx.ini`. 180° screen rotation is also supported.
 - **External Keyboard**: Supports USB HID keyboards in host mode.
-- **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM via a cache on the Pico 2's own onboard flash.
+- **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM by placing the ROM in a free area of the Pico 2's onboard flash and reading it directly (XIP).
+- **SCC Sound**: the KONAMI SCC (K051649) is synthesized inside the emulator and mixed into the same audio output as the PSG. It can also be sent to an external SCC slave board from PicoChiptuneOrchestra (the same author's separate project) (not yet verified on real hardware).
 - **Storage**: Loads the BIOS/cartridge ROM from an SD card, and supports zero-copy save/load state (including RAM and VRAM).
 - **Runtime Menu**: GUI+F7 on a USB keyboard opens an on-screen menu for swapping cartridges, saving/loading state, resetting, adjusting volume/audio filter, and display settings (including switching between LCD/HDMI) — all without stopping gameplay.
 - **Joystick Support**: Supports an Atari/MSX 9-pin joystick (JOY1) — directions and trigger A/B.

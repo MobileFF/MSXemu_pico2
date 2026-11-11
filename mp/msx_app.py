@@ -60,6 +60,7 @@
 #   hdmi_baud=8000000
 #   hdmi_scale=2
 #   scc=on
+#   psg_volume=256
 #   scc_volume=256
 #   scc_out=2,3,6
 #   # omit 'cart' to show the interactive ROM selector at boot (browses from
@@ -115,7 +116,8 @@
 #   # scc=on|off: built-in Konami SCC synthesis, mixed into the same PWM
 #   # audio output as the PSG (default on). scc_volume: its level relative
 #   # to the PSG, 256 = 1:1 (default), 0-1024. Independent of scc_out below
-#   # — both can be used at once.
+#   # — both can be used at once. psg_volume: PSG level, 256 = unchanged
+#   # (default), 0 = mute (e.g. to listen to the SCC alone).
 #   # scc_out=SCK,MOSI,CS[,BAUD] (GPIO numbers) forwards Konami SCC sound
 #   # register writes to an external PicoChiptuneOrchestra slave_scc board
 #   # (write-only SPI, mode 1, bit-banged — see src/msx/scc_out.c and
@@ -1214,6 +1216,10 @@ def _init_audio_and_ext(cfg):
                              int(cfg.get('scc_volume', 256)))
     except (ValueError, TypeError) as e:
         print(f"Bad scc_volume in msx.ini: {e}")
+    try:
+        msx.set_psg_volume(int(cfg.get('psg_volume', 256)))
+    except (ValueError, TypeError) as e:
+        print(f"Bad psg_volume in msx.ini: {e}")
 
     # 8.4 — Optional external SCC (msx.ini scc_out=SCK,MOSI,CS[,BAUD])
     _scc = cfg.get('scc_out', '').strip()
@@ -1266,7 +1272,7 @@ def _main_loop():
 
     frame = 0
     t0    = time.ticks_ms()
-    _fs_prev = msx.get_cart_fetch_stats()
+    _fs_prev = msx.get_cart_fetch_stats() + (msx.get_audio_clip_count(),)
 
     # 2026-09-05: MSX_TCYCLES_FRAME (msx_core.h) advances exactly 1/60s of
     # MSX-clock time per msx.run_frame() call, regardless of how fast the
@@ -1379,9 +1385,11 @@ def _main_loop():
             # 2026-11-09 DIAGNOSTIC: Mega ROM bank switches / cache-miss
             # fetches during these 300 frames (msx_get_cart_fetch_stats()),
             # to tell flash-fetch stalls apart from other FPS costs.
+            # clip: samples clamped to the 10-bit PWM range (2026-11-11).
             bs, fe = msx.get_cart_fetch_stats()
-            print(f"FPS: {fps:.1f}  ring: {ring}  bank: +{bs - _fs_prev[0]}  fetch: +{fe - _fs_prev[1]}")
-            _fs_prev = (bs, fe)
+            cl = msx.get_audio_clip_count()
+            print(f"FPS: {fps:.1f}  ring: {ring}  bank: +{bs - _fs_prev[0]}  fetch: +{fe - _fs_prev[1]}  clip: +{cl - _fs_prev[2]}")
+            _fs_prev = (bs, fe, cl)
             # 2026-10-05 DIAGNOSTIC (re-added): (heartbeat, late_scanline_ctr)
             # — see disp_dvi.c's msx_dvi_debug_info()/msx.dvi_debug() and
             # the dvi.c was_backlogged fix. Checking whether the fix

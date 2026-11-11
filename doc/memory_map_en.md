@@ -33,16 +33,17 @@ Immediately after boot (right after `msx_reset()`), `slot_select = 0x00` — eve
 
 A non-bank-switched cartridge (`MSX_MAPPER_PLAIN`) just maps the ROM linearly starting at 0x4000. A bank-switched mapper instead splits 0x4000-0xBFFF into four 8KB windows, each independently selecting any 8KB page from the ROM.
 
-| Window | Address range | ASCII-8 bank register write | ASCII-16 | KONAMI |
-| :--- | :--- | :--- | :--- | :--- |
-| 0 | 0x4000-0x5FFF | 0x6000-0x67FF | 0x6000-0x67FF (16KB granularity, selects win0+1 together) | Fixed (always ROM page 0) |
-| 1 | 0x6000-0x7FFF | 0x6800-0x6FFF | ditto | 0x6000-0x6FFF |
-| 2 | 0x8000-0x9FFF | 0x7000-0x77FF | 0x7000-0x77FF (16KB granularity, selects win2+3 together) | 0x8000-0x8FFF |
-| 3 | 0xA000-0xBFFF | 0x7800-0x7FFF | ditto | 0xA000-0xAFFF |
+| Window | Address range | ASCII-8 bank register write | ASCII-16 | KONAMI | KONAMI SCC |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 0 | 0x4000-0x5FFF | 0x6000-0x67FF | 0x6000-0x67FF (16KB granularity, selects win0+1 together) | Fixed (always ROM page 0) | 0x5000-0x57FF |
+| 1 | 0x6000-0x7FFF | 0x6800-0x6FFF | ditto | 0x6000-0x6FFF | 0x7000-0x77FF |
+| 2 | 0x8000-0x9FFF | 0x7000-0x77FF | 0x7000-0x77FF (16KB granularity, selects win2+3 together) | 0x8000-0x8FFF | 0x9000-0x97FF |
+| 3 | 0xA000-0xBFFF | 0x7800-0x7FFF | ditto | 0xA000-0xAFFF | 0xB000-0xB7FF |
 
 - **ASCII-8**: each of the 4 windows independently gets an 8KB page number (0-255) written to it.
 - **ASCII-16**: two 16KB registers (the 0x6000-range and 0x7000-range ones) each switch two windows at once (16KB = 8KB × 2).
 - **KONAMI** (no SCC): window 0 is always fixed to ROM page 0 (not switchable). Only windows 1-3 can be switched.
+- **KONAMI SCC**: all 4 windows are switchable. While window 2's bank number has its low 6 bits at `0x3F`, the SCC registers appear at 0x9800-0x9FFF (repeating every 0x100 bytes: 0x00-0x7F waveforms, 0x80-0x89 frequencies, 0x8A-0x8E volumes, 0x8F key-on, 0xE0- deformation register).
 
 See `cart_page_ptr()` (the read path) and `cart_mapper_write()` (bank-switch write detection) in `src/msx/msx_core.c`.
 
@@ -156,7 +157,7 @@ typedef struct {
 | 50 | 8 | `cart_bank[2][4]` | Bank number per slot per window |
 | 58 | 6 | `_pad` | Reserved (padding to 80 bytes, unused) |
 
-Save file format (`save_state_to()` in `msx_menu.py`): a ~80.06KB binary consisting of the 64-byte header + 64KB RAM + 16KB VRAM concatenated. The header and RAM/VRAM are written via separate `f.write()` calls, never allocating a large temporary buffer.
+Save file format (`save_state_to()` in `src/modmsx_ui.c`): a ~80.2KB binary consisting of the 64-byte header + 64KB RAM + 16KB VRAM + a 149-byte SCC state block (since 2026-11-09: `"SCC1"` + 128 waveform bytes + 16 registers + 1 deformation register) concatenated. Older saves without the SCC block still load. The header and RAM/VRAM are written via separate `f.write()` calls, never allocating a large temporary buffer.
 
 ---
 

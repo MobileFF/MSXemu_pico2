@@ -68,7 +68,9 @@ This document lays out the overall structure of the MSX1 emulator running on a R
 1. **Full in-RAM load** (`msx_load_cart()`) — the whole ROM is `malloc()`'d and copied into the heap. For non-bank-switched cartridges up to 32KB.
 2. **Paged mode** (`msx_load_cart_paged()`) — for large bank-switched cartridges (a.k.a. Mega ROM, 128KB-1MB). The whole ROM is never loaded into RAM; only **the 4 currently bank-switched-in 8KB windows (a fixed 32KB)** are cached. A bank-switch write triggers a fetch of the needed 8KB page via a caller-registered callback (`msx_cart_fetch_fn`). The C core itself is agnostic to where the data actually comes from (SD card, onboard flash, etc.).
 
-Supported mappers: `MSX_MAPPER_PLAIN` (no banking), `MSX_MAPPER_ASCII8`, `MSX_MAPPER_ASCII16`, `MSX_MAPPER_KONAMI` (no SCC). A simple heuristic (`detect_mapper()`) scans the ROM for known bank-select write patterns to auto-detect the mapper.
+3. **XIP mode** (`msx_load_cart_xip()`, since 2026-11-10, Pico 2 only) — the whole Mega ROM sits in the free flash between the end of the firmware image and the filesystem (~0.5MB; `src/msx/cart_xip.c` computes it at run time from `__flash_binary_end` and `MICROPY_HW_FLASH_STORAGE_BASE`, no build setting changed) and is read directly through XIP. Each window has a read pointer (`cart_win[]`), so a bank switch is just a pointer update (no fetch, no RAM cache). A 4KB header (path, size, firmware end at write time) lets a matching ROM skip rewriting. ROMs that don't fit, and PiZero, use mode 2.
+
+Supported mappers: `MSX_MAPPER_PLAIN` (no banking), `MSX_MAPPER_ASCII8`, `MSX_MAPPER_ASCII16`, `MSX_MAPPER_KONAMI`, `MSX_MAPPER_KONAMI_SCC` (selectors at 0x5000/0x7000/0x9000/0xB000; SCC at 0x9800- while the 0x9000 bank's low 6 bits are 0x3F). A simple heuristic (`detect_mapper()`) scans the ROM for known bank-select write patterns to auto-detect the mapper.
 
 See `memory_map_en.md` for the full address map.
 
@@ -88,7 +90,7 @@ Exposes `msx_core.c`'s functionality to Python as a C user module named `msx`. I
 
 - Holding the single global `static msx_state_t msx_state` instance (one MSX system per Pico)
 - Marshalling between Python `bytes`/`bytearray`/file objects and C-side buffers (zero-copy is the default policy — see below)
-- PWM audio output (`hardware/pwm.h`; audio samples generated per-frame into a ring buffer are consumed by a 22050Hz timer interrupt that updates the PWM duty cycle)
+- PWM audio output (`hardware/pwm.h`; audio samples (PSG + built-in SCC) generated per-frame into a ring buffer are consumed by a ~22222Hz (45µs) timer interrupt that updates the PWM duty cycle)
 - The Mega ROM paging fetch callback (`cart_fetch_from_pyfile()`) — a Python-opened file object is held as a MicroPython GC root pointer (`MP_REGISTER_ROOT_POINTER`) and read directly via `mp_stream_seek()`/`mp_stream_read_exactly()`
 - A set of debug APIs (`debug_step`/`debug_cpu`/`debug_peek`/`debug_psg`, etc.)
 
@@ -207,4 +209,4 @@ msx_core.c
 
 - Auto-boot deployment as `main.py` (currently run manually via `import main; main.run()` for testing)
 - Real-hardware verification of multi-slot cartridges (cart slot 2) and the ASCII-8/ASCII-16 mappers (only the KONAMI mapper has been verified on real hardware so far)
-- Support for KONAMI SCC (the extra sound chip found in some Konami cartridges) — currently only the SCC-less KONAMI4-equivalent mapper is implemented
+- Real-hardware verification of the external SCC board output (`scc_out=`), SCC+ / deformation register support, YM2413 (MSX-MUSIC) support

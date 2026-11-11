@@ -53,7 +53,7 @@ Loads a 32KB MSX BIOS/BASIC ROM into slot 0. `data`'s size must be within 0x4000
 Loads a cartridge ROM by copying the whole thing into the heap (full in-RAM mode; for small cartridges, up to roughly 32KB).
 
 - `slot`: 0 = cartridge slot 1, 1 = cartridge slot 2
-- `mapper`: `msx.MAPPER_PLAIN` (0, default — auto-detected if the ROM is over 32KB) / `msx.MAPPER_ASCII8` (1) / `msx.MAPPER_ASCII16` (2) / `msx.MAPPER_KONAMI` (3)
+- `mapper`: `msx.MAPPER_PLAIN` (0, default — auto-detected if the ROM is over 32KB) / `msx.MAPPER_ASCII8` (1) / `msx.MAPPER_ASCII16` (2) / `msx.MAPPER_KONAMI` (3) / `msx.MAPPER_KONAMI_SCC` (4)
 
 ### `msx.load_cart_paged(slot: int, file_obj, size: int, mapper: int) -> bool`
 
@@ -246,7 +246,7 @@ Sends one all-black frame to the HDMI bridge, independent of the current framebu
 
 ### `msx.setup_audio_pwm(pin: int) -> bool`
 
-Sets up PWM audio output on the given GPIO pin. 10-bit PWM (wrap=1023), a fixed ~234kHz carrier (derived from `clk_sys`), and a 22050Hz repeating-timer interrupt that consumes samples and updates the PWM duty cycle.
+Sets up PWM audio output on the given GPIO pin. 10-bit PWM (wrap=1023), a fixed ~234kHz carrier (derived from `clk_sys`), and a ~22222Hz (45µs) repeating-timer interrupt that consumes samples and updates the PWM duty cycle.
 
 ### `msx.set_audio_volume(level: int)` / `msx.get_audio_volume() -> int`
 
@@ -254,7 +254,23 @@ Sets/gets the volume. `level` ranges 0-256 (256 = default, the original full-sca
 
 ### `msx.set_audio_filter(shift: int)` / `msx.get_audio_filter() -> int`
 
-Sets/gets the strength of a one-pole IIR low-pass filter applied to PSG samples. `shift`: 0 (default, disabled) to 15 — higher values give heavier, more muffled smoothing (cutoff frequency ≈ `(22050 >> shift) / (2π)` Hz). Intended to reduce a passive buzzer's harsh high-frequency content. Note this cannot remove the PWM carrier itself (~234kHz) — that requires a hardware filter.
+Sets/gets the strength of a one-pole IIR low-pass filter applied to PSG samples. `shift`: 0 (default, disabled) to 15 — higher values give heavier, more muffled smoothing (cutoff frequency ≈ `(22222 >> shift) / (2π)` Hz). Intended to reduce a passive buzzer's harsh high-frequency content. Note this cannot remove the PWM carrier itself (~234kHz) — that requires a hardware filter.
+
+### `msx.set_psg_volume(gain: int)`
+
+Sets the PSG level: 0-1024, 256 = unchanged, 0 = mute. Matches `msx.ini`'s `psg_volume=`.
+
+### `msx.set_scc_internal(enable: bool, gain: int = 256)`
+
+Enables/disables the built-in SCC synthesis and sets its level relative to the PSG (256 = 1:1, 0-1024). Matches `msx.ini`'s `scc=` / `scc_volume=`.
+
+### `msx.scc_out_init(sck: int, mosi: int, cs: int, baud: int = 0) -> bool` / `msx.scc_out_deinit()` / `msx.scc_out_mute(mute: bool)`
+
+Starts/stops/temporarily mutes forwarding to an external SCC slave board (PicoChiptuneOrchestra's `slave_scc.uf2`; not yet verified on real hardware). `baud` 0 = ~3MHz. Starting re-sends the current SCC state. Matches `msx.ini`'s `scc_out=`.
+
+### `msx.get_audio_clip_count() -> int`
+
+Number of samples clamped to the PWM range (0-1023) since boot — for diagnosing distortion.
 
 ### `msx.get_audio_ring_level() -> int`
 
@@ -297,6 +313,8 @@ def load_state_from(path):
 ```
 
 The key design point is that this never allocates a large temporary buffer (see `dev_guide_en.md`).
+
+The runtime menu's actual save (`save_state_to()` in `src/modmsx_ui.c`) also appends the SCC state (149 bytes, starting with `"SCC1"`) after the VRAM image. When loading a save without it (an older save), the SCC starts silent.
 
 ---
 
@@ -362,10 +380,11 @@ Calls `PSG_calc()` directly `n` times (for verifying audio-generation timing).
 | `msx.MAPPER_ASCII8` | 1 | ASCII-8 (8KB pages, 4 windows) |
 | `msx.MAPPER_ASCII16` | 2 | ASCII-16 (16KB pages, 2 windows) |
 | `msx.MAPPER_KONAMI` | 3 | KONAMI (no SCC; 8KB pages, 3 switchable windows) |
+| `msx.MAPPER_KONAMI_SCC` | 4 | KONAMI SCC (8KB pages, 4 switchable windows, with SCC) |
 | `msx.SCREEN_W` | 256 | MSX native screen width |
 | `msx.SCREEN_H` | 192 | MSX native screen height |
 | `msx.KEY_ROWS` | 11 | Number of keyboard matrix rows |
-| `msx.AUDIO_RATE` | 22050 | Audio sample rate (Hz) |
+| `msx.AUDIO_RATE` | 22222 | Audio sample rate (Hz), matched to the playback timer (45µs period) |
 | `msx.RAM_SIZE` | 65536 | RAM size (bytes) |
 | `msx.VRAM_SIZE` | 16384 | VRAM size (bytes) |
 

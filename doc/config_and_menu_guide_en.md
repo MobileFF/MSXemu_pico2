@@ -93,6 +93,10 @@ hdmi_baud=8000000
 | `diskrom` | (none) | Required when `mode=disk`. Path to the Disk ROM loaded into cart slot 1 (not bundled for copyright reasons — dump your own Disk ROM and place it here) |
 | `disk` | (none) | Path to the `.DSK` image (360KB/720KB) to mount at boot. If omitted, or if the file isn't found, an interactive selector listing the SD card's `.DSK` files is shown |
 | `fdc_base` | `0x7FB8` | Z80 address where the Disk ROM's FDC (WD1793/WD2793-compatible) registers are memory-mapped (decimal or `0x`-prefixed hex). This default works for many Disk ROMs, but another one may map its FDC elsewhere |
+| `scc` | `on` | Set to `off` to disable the built-in SCC synthesis (a KONAMI SCC cartridge's SCC part then stays silent) |
+| `scc_volume` | `256` | Built-in SCC level (0-1024). 256 = 1:1 with the PSG |
+| `psg_volume` | `256` | PSG level (0-1024). 256 = unchanged, `0` = mute (e.g. to listen to the SCC alone) |
+| `scc_out` | (none) | `SCK,MOSI,CS[,BAUD]` (GPIO numbers): forwards SCC register writes to an external SCC slave board (see "4.2 Output to an External SCC Board" below; **not yet verified on real hardware**). Can be used together with the built-in SCC |
 | `ext` | (none) | Set to `off` to skip loading `/sd/msx/ext/` and `/ext/` extension modules. Use this to fully avoid the subroutine hook mechanism's small overhead (see below) for a `cart`-mode session that doesn't use any extension. `mode=disk`'s own DSKCHG hook (required for FDD disk-swap detection) is unaffected by this setting |
 
 Under `mode=disk`, the runtime menu shows "Swap Disk" in place of "Swap Cartridge", for hot-swapping the mounted `.DSK` image (the DSKCHG hook in `mp/msx_fdd.py` lets MSX-DOS/Disk BASIC notice the new disk on its own — no reset needed). Verified on real hardware: Disk BASIC SAVE/LOAD, and a full MSX-DOS boot (MSXDOS.SYS/COMMAND.COM load, both disk sides). Single drive, standard 3.5" DD (360KB/720KB) geometry only.
@@ -107,14 +111,29 @@ The formerly-existing `hdmi` (separate HDMI on/off) and `boot_exclusive` keys, a
 
 ## 4. Mega ROM (Bank-Switched Cartridge) Support in Detail
 
-Bank-switched cartridges of 128KB or larger ("Mega ROM") are **copied once to the Pico 2's onboard flash** before being played — never read directly from SD during gameplay (`load_cart_smart()` in `mp/msx_menu.py`).
+Bank-switched cartridges of 128KB or larger ("Mega ROM") are **copied once to the Pico 2's onboard flash** before being played — never read directly from SD during gameplay (`load_cart_smart()` in `src/modmsx_ui.c`).
 
-- Supported mappers: ASCII-8 / ASCII-16 / KONAMI (no SCC). Auto-detected from the ROM's leading content.
-- On first selection, the file is copied from SD to onboard flash (`/megarom_cache.rom`), taking a few seconds (shown as "Loading…" on screen). Re-selecting the same ROM skips the copy.
-- Onboard flash has roughly 3MB free. Only one ROM is cached at a time; switching to a different Mega ROM overwrites it.
-- All in-game bank switches read from onboard flash — the SD card is never touched during gameplay (avoiding contention on the SPI bus shared with the LCD).
+- Supported mappers: ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC. Auto-detected from the ROM's leading content.
+- **XIP mode (Pico 2, since 2026-11-10)**: the ROM is written to the free flash area between the end of the firmware image and the filesystem (~0.5MB), and the Z80 reads it straight from flash. A bank switch just repoints a window, with no copy and no RAM cost, so bank-switch-heavy games run as fast as regular cartridges (real hardware: NEMESIS2.ROM went from ~28-53 FPS to a steady 59.8 FPS).
+  - Only on first selection, the file is copied from SD to flash, taking a few seconds (`XIP: copying ...` on the serial console). Re-selecting the same ROM skips the copy.
+  - Only one ROM is held; switching to a different Mega ROM overwrites it. If a firmware update changes the image size, the ROM is rewritten on the next load, for safety.
+  - ROMs too big for the free area, and the PiZero board, use the older page-cache mode (below).
+- **Page-cache mode (older)**: the ROM is copied to a file in onboard flash (`/megarom_cache.rom`), and only the 4 visible 8KB windows are kept in RAM. Every switch to a page not in its window re-reads 8KB, so bank-switch-heavy games run slower.
+- Either way, the SD card is never touched during gameplay (avoiding contention on the SPI bus shared with the LCD).
 
 **Technical background**: the original design read directly from the SD card on every bank switch, which caused two problems: (1) SD's per-access protocol overhead (several to over ten ms each) tanked FPS to around 6 on bank-switch-heavy games, and (2) it contended with the LCD's display DMA transfer on the shared SPI bus, causing I/O errors. Switching to a cache on the Pico 2's onboard flash (a separate QSPI bus, independent of SPI1) solved both problems, restoring FPS to roughly 52-64 — on par with regular cartridges.
+
+### 4.1 SCC Sound
+
+For KONAMI SCC mapper cartridges (Nemesis 2 etc.), the SCC (K051649) is synthesized inside the emulator and mixed into the same PWM audio output as the PSG (`msx.ini`'s `scc=` / `scc_volume=` / `psg_volume=`).
+
+- The SCC registers appear at 0x9800-0x9FFF while the 0x9000 bank number's low 6 bits are `0x3F` (as on real hardware). The waveform RAM is readable (for software that probes for the SCC that way).
+- Save states include the SCC state (saves from before 2026-11-09 still load; the SCC then starts silent).
+- The deformation register (0x98E0-) and SCC+ (the SNATCHER-style sound cartridge) are not supported.
+
+### 4.2 Output to an External SCC Board (not yet verified on real hardware)
+
+Setting `scc_out=SCK,MOSI,CS` forwards SCC writes to a board (RP2040-Zero etc.) flashed with PicoChiptuneOrchestra's `slave_scc.uf2`, over a write-only SPI link (mode 1, ~3MHz, software-driven GPIOs) on any 3 free GPIOs (pick pins `mp/board_config.py` doesn't use). The slave has its own PWM audio output, so it has to be mixed with this board's audio in analog. It is muted while the runtime menu is open.
 
 ---
 

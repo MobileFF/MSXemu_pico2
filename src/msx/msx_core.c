@@ -430,6 +430,10 @@ static inline int32_t scc_render(msx_state_t *msx) {
     return mix;
 }
 
+void msx_set_psg_gain(msx_state_t *msx, uint16_t gain) {
+    msx->psg_gain = gain;
+}
+
 void msx_set_scc_internal(msx_state_t *msx, bool enable, uint16_t gain) {
     msx->scc_internal = enable;
     msx->scc_gain     = gain;
@@ -752,20 +756,21 @@ static inline bool vdp_int_enabled(msx_state_t *msx) {
  * Called once per scanline during frame execution.
  * ----------------------------------------------------------------------- */
 static void audio_generate_scanline(msx_state_t *msx) {
-    /* samples_per_frame / lines_total rounded; we accumulate a fixed
-     * number per frame (audio_samples_per_frame) spread across 192 active
-     * lines. For simplicity we generate 2 samples per scanline and top up
-     * at frame end. */
-    /* Produce ~2 samples per active scanline */
     /* 2026-11-09: audio_buf is now SIGNED, centered on 0 (the PWM ISR in
      * modmsx.c adds the midpoint back). PSG_calc() is unipolar (0..~12240),
-     * so its DC is removed with a one-pole high-pass (~3.4Hz at 22050Hz,
+     * so its DC is removed with a one-pole high-pass (~3.4Hz at ~22kHz,
      * Q8 state) before the bipolar built-in SCC is mixed in. */
-    for (int s = 0; s < 2; s++) {
+    /* 2026-11-11: exactly MSX_AUDIO_RATE/MSX_FPS samples per frame
+     * (~1.93 per active line, fraction carried across lines/frames) —
+     * was a fixed 2 per line = 384/frame vs the ~370 the ISR consumes. */
+    msx->audio_acc += MSX_AUDIO_RATE;
+    while (msx->audio_acc >= MSX_FPS * MSX_LINES_ACTIVE) {
+        msx->audio_acc -= MSX_FPS * MSX_LINES_ACTIVE;
         if (msx->audio_write_pos < MSX_AUDIO_BUF_SIZE) {
             int32_t psg = PSG_calc(msx->psg);
             msx->psg_dc += ((psg << 8) - msx->psg_dc) >> 10;
             int32_t mix = psg - (msx->psg_dc >> 8);
+            if (msx->psg_gain != 256) mix = (mix * (int32_t)msx->psg_gain) >> 8;
             if (msx->scc_internal && (msx->scc_reg[0x0F] & 0x1F)) {
                 mix += (scc_render(msx) * (int32_t)msx->scc_gain) >> 8;
             }
@@ -793,6 +798,7 @@ void msx_init(msx_state_t *msx) {
 
     msx->scc_internal = true;   /* built-in SCC on by default */
     msx->scc_gain     = 256;
+    msx->psg_gain     = 256;
 
     /* Build RGB565 palette */
     for (int i = 0; i < 16; i++) {

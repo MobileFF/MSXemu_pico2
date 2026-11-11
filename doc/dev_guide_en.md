@@ -57,7 +57,7 @@ Public API, roughly grouped:
 | Category | Example functions |
 | :--- | :--- |
 | Init | `msx_init()`, `msx_load_bios()`, `msx_reset()`, `msx_destroy()` |
-| Cartridge | `msx_load_cart()`, `msx_load_cart_paged()`, `msx_set_cart_fetch_cb()`, `msx_detect_mapper()`, `msx_eject_cart()` |
+| Cartridge | `msx_load_cart()`, `msx_load_cart_paged()`, `msx_load_cart_xip()`, `msx_set_cart_fetch_cb()`, `msx_detect_mapper()`, `msx_eject_cart()` |
 | Execution | `msx_run_frame()` |
 | I/O | `msx_mem_read()`/`msx_mem_write()`, `msx_port_read()`/`msx_port_write()`, `msx_set_key_matrix()`, `msx_set_joystick()` |
 | Display | `msx_init_display_hardware()`, `msx_render_to_display_1to1()`, `msx_render_to_display()`, `msx_wait_display()` |
@@ -117,7 +117,7 @@ A typical test `.c` file drives `msx_init()` -> `msx_load_bios()` -> `msx_reset(
 
 1. Add a new `MSX_MAPPER_*` constant in `msx_core.h`.
 2. Add that mapper's window-to-bank-number mapping logic to `cart_page_ptr()` (the read path) in `msx_core.c`.
-3. Add that mapper's bank-switch address detection to `cart_mapper_write()`. If you also want paged (Mega ROM) support, add the corresponding `cart_page_refill()` calls.
+3. Add that mapper's bank-switch address detection to `cart_mapper_write()`. If you also want paged (Mega ROM) support, add the corresponding `cart_page_refill()` calls (both paged and XIP modes read through the per-window pointers in `cart_win[]`, so passing the right 8KB page number to `cart_page_refill()` makes both work).
 4. If useful, add a detection pattern to `detect_mapper()`'s heuristic (`scan_mapper_patterns()`).
 5. Register the new mapper constant in `modmsx.c`'s `MP_QSTR_MAPPER_*` bindings.
 6. Verify with a host build that reads/writes land at the correct addresses before testing on real hardware.

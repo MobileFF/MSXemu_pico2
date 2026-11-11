@@ -53,7 +53,7 @@ Z80 CPUをリセットする（PC=0から実行開始）。BIOS/カートリッ�
 カートリッジROM全体をヒープにコピーしてロードする（フルRAMロード、32KB程度までの小容量カートリッジ向け）。
 
 - `slot`: 0 = カートリッジスロット1、1 = カートリッジスロット2
-- `mapper`: `msx.MAPPER_PLAIN`（0、デフォルト、32KB超なら自動判定）/ `msx.MAPPER_ASCII8`（1）/ `msx.MAPPER_ASCII16`（2）/ `msx.MAPPER_KONAMI`（3）
+- `mapper`: `msx.MAPPER_PLAIN`（0、デフォルト、32KB超なら自動判定）/ `msx.MAPPER_ASCII8`（1）/ `msx.MAPPER_ASCII16`（2）/ `msx.MAPPER_KONAMI`（3）/ `msx.MAPPER_KONAMI_SCC`（4）
 
 ### `msx.load_cart_paged(slot: int, file_obj, size: int, mapper: int) -> bool`
 
@@ -245,7 +245,7 @@ HDMIブリッジ出力を設定する。`init_display_hardware()`の**後**に�
 
 ### `msx.setup_audio_pwm(pin: int) -> bool`
 
-指定GPIOピンにPWMオーディオ出力をセットアップする。10bit PWM（wrap=1023）、キャリア周波数は約234kHz（`clk_sys`依存）に固定し、22050Hzのリピートタイマー割り込みでサンプルを消費してPWMデューティに反映する。
+指定GPIOピンにPWMオーディオ出力をセットアップする。10bit PWM（wrap=1023）、キャリア周波数は約234kHz（`clk_sys`依存）に固定し、約22222Hz（45µs周期）のリピートタイマー割り込みでサンプルを消費してPWMデューティに反映する。サンプルは符号付きで、PWMの中央値（512）を基準に出力する。
 
 ### `msx.set_audio_volume(level: int)` / `msx.get_audio_volume() -> int`
 
@@ -253,7 +253,23 @@ HDMIブリッジ出力を設定する。`init_display_hardware()`の**後**に�
 
 ### `msx.set_audio_filter(shift: int)` / `msx.get_audio_filter() -> int`
 
-PSGサンプルに適用する1次IIRローパスフィルタの強さを設定/取得する。`shift`: 0（デフォルト、無効）〜15。値が大きいほど強くこもった音になる（カットオフ周波数 ≒ `(22050 >> shift) / (2π)` Hz）。パッシブブザーの耳障りな高周波成分を軽減する目的。搬送波自体（約234kHz）はハードウェアフィルタでしか除去できない点に注意。
+PSGサンプルに適用する1次IIRローパスフィルタの強さを設定/取得する。`shift`: 0（デフォルト、無効）〜15。値が大きいほど強くこもった音になる（カットオフ周波数 ≒ `(22222 >> shift) / (2π)` Hz）。パッシブブザーの耳障りな高周波成分を軽減する目的。搬送波自体（約234kHz）はハードウェアフィルタでしか除去できない点に注意。
+
+### `msx.set_psg_volume(gain: int)`
+
+PSGの音量を設定する。0〜1024、256で従来どおり、0でミュート。`msx.ini` の `psg_volume=` に対応。
+
+### `msx.set_scc_internal(enable: bool, gain: int = 256)`
+
+内蔵SCC音源の有効/無効と、PSGに対する音量（256で1:1、0〜1024）を設定する。`msx.ini` の `scc=` / `scc_volume=` に対応。
+
+### `msx.scc_out_init(sck: int, mosi: int, cs: int, baud: int = 0) -> bool` / `msx.scc_out_deinit()` / `msx.scc_out_mute(mute: bool)`
+
+外部のSCCスレーブ基板（PicoChiptuneOrchestra の `slave_scc.uf2`）への送信を開始/停止/一時消音する（実機未確認）。`baud` 0で約3MHz。開始時に現在のSCCの状態を送り直す。`msx.ini` の `scc_out=` に対応。
+
+### `msx.get_audio_clip_count() -> int`
+
+PWMの範囲（0〜1023）を超えて頭打ちになったサンプル数の起動時からの累計。音割れの切り分け用。
 
 ### `msx.get_audio_ring_level() -> int`
 
@@ -296,6 +312,8 @@ def load_state_from(path):
 ```
 
 大きな一時バッファを一切確保しない設計になっている点が重要（`dev_guide.md` 参照）。
+
+実際のランタイムメニューのセーブ（`src/modmsx_ui.c` の `save_state_to()`）は、VRAMの後ろにSCCの状態（149バイト、先頭 `"SCC1"`）を追加で書く。ロード時にこの追加ブロックが無ければ（古いセーブ）、SCCは無音から始まる。
 
 ---
 
@@ -361,10 +379,11 @@ PPI ポートA相当のスロット選択レジスタを直接読み書きする
 | `msx.MAPPER_ASCII8` | 1 | ASCII-8方式（8KBページ×4ウィンドウ） |
 | `msx.MAPPER_ASCII16` | 2 | ASCII-16方式（16KBページ×2ウィンドウ） |
 | `msx.MAPPER_KONAMI` | 3 | KONAMI方式（SCC無し、8KBページ×3可変ウィンドウ） |
+| `msx.MAPPER_KONAMI_SCC` | 4 | KONAMI SCC方式（8KBページ×4可変ウィンドウ、SCC付き） |
 | `msx.SCREEN_W` | 256 | MSXネイティブ画面幅 |
 | `msx.SCREEN_H` | 192 | MSXネイティブ画面高さ |
 | `msx.KEY_ROWS` | 11 | キーボード行列の行数 |
-| `msx.AUDIO_RATE` | 22050 | オーディオサンプリングレート(Hz) |
+| `msx.AUDIO_RATE` | 22222 | オーディオサンプリングレート(Hz)。再生側のタイマー（45µs周期）に合わせている |
 | `msx.RAM_SIZE` | 65536 | RAM容量（バイト） |
 | `msx.VRAM_SIZE` | 16384 | VRAM容量（バイト） |
 

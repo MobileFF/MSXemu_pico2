@@ -279,8 +279,15 @@ typedef bool (*msx_cart_fetch_fn)(void *userdata, uint8_t slot,
 /* -----------------------------------------------------------------------
  * Audio
  * ----------------------------------------------------------------------- */
-#define MSX_AUDIO_RATE      22050u
-/* samples per frame = 22050 / 60 = 367; buffer with margin */
+/* 2026-11-11: 22222 (was 22050) = the rate the PWM ISR actually consumes
+ * samples at (modmsx.c: add_repeating_timer_us(-45) -> 1e6/45 Hz).
+ * PSG/SCC are synthesized at this rate and audio_generate_scanline()
+ * produces exactly MSX_AUDIO_RATE/MSX_FPS samples per emulated frame, so
+ * at 60 FPS production == consumption: no ring overflow drops (heard as
+ * a 60Hz roughness once Mega ROMs reached 60 FPS) and no pitch offset
+ * from synthesizing at one rate while playing at another. */
+#define MSX_AUDIO_RATE      22222u
+/* samples per frame = 22222 / 60 = ~370.4; buffer with margin */
 #define MSX_AUDIO_BUF_SIZE  512u
 
 /* -----------------------------------------------------------------------
@@ -353,6 +360,8 @@ typedef struct {
     uint32_t  scc_phase[5];              /* 16.16 read position into the 32-pt wave */
     bool      scc_internal;              /* render SCC into audio_buf (default true) */
     uint16_t  scc_gain;                  /* SCC level vs PSG, 256 = 1:1 (default) */
+    uint32_t  audio_acc;                 /* sample-rate accumulator, see audio_generate_scanline() */
+    uint16_t  psg_gain;                  /* PSG level, 256 = unchanged (default), 0 = mute */
     int32_t   psg_dc;                    /* PSG DC-blocker state, Q8 */
     /* 2026-11-10: per-window read pointers for paged carts (RAM cache
      * pages, or XIP flash when cart_xip[] is set) — see cart_page_ptr(). */
@@ -601,6 +610,10 @@ void msx_scc_out_resync(msx_state_t *msx);
  * PSG (256 = 1:1, 0 = silent). Independent of the external output: both
  * can run at once. */
 void msx_set_scc_internal(msx_state_t *msx, bool enable, uint16_t gain);
+
+/* PSG level in the mix (256 = unchanged, 0 = muted) — e.g. to listen to
+ * the SCC alone. */
+void msx_set_psg_gain(msx_state_t *msx, uint16_t gain);
 
 /* Save-state trailer carrying the SCC shadow, written after the VRAM
  * image by the save/load code (modmsx_ui.c). Old saves without it still
