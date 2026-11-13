@@ -229,7 +229,7 @@ All notable changes to this project are documented in this file. Japanese versio
 - **emu2413's per-sample path runs from RAM** on Pico 2: from XIP flash, core1's constant fetches evicted core0's code and the XIP cart ROM from the shared XIP cache (FM-PAC menu with music: busy 147%, 41 FPS). To fit the GC-heap floor (64KB), the two 1024-entry sine tables became one 256-entry quarter wave and the file is built `-Os`: ~3.4KB of RAM in total. Output is sample-identical to upstream.
 - **Z80 direct-read map** (`rmap[]`/`rlim[]` in `z80.h`, `msx_rmap_update()`): plain ROM/RAM bytes are read straight from one pointer per 8KB page instead of calling `msx_mem_read()` for every byte. Cart registers, SRAM, the SCC window, the FDC and empty slots still take the old path. The map is rebuilt on every slot-select write, cart-area write, load/eject/reset/state load, and once per frame. Host check: frame-by-frame RAM/VRAM/PC hashes identical to before on all test ROMs. Real hardware: the FM-PAC menu's logo animation (a ROM-resident division loop) went from busy ~107% / ~56 FPS / slow music to **busy 90% / 59.9 FPS**; R-Type with FM from 92-102% to 90%.
 
-### Fixed (2026-11-12)
+### Fixed (2026-11-12, real-hardware confirmed)
 
 - **SD card stuck after a read timeout**: a data-token timeout inside a multi-block read (CMD18) raised straight out of the loop without sending CMD12, leaving the card in its data state, so every later command (including retries) failed with EIO until power-cycle (seen while copying a Mega ROM to XIP flash). CMD12 is now always sent, the post-stop busy wait is bounded, and the last failure is printed (`SD: read failed blk=... stage=...`).
 - **USB keyboard behind a hub stopping** (PIO-USB builds): SOFs are now exactly 1ms apart (timed from the previous target, not from the end of the frame), which a hub otherwise treats as babble and disables the port. After a Mega ROM copy to flash (interrupts off for long stretches) the root port is force-reconnected so the hub and keyboard re-enumerate. `CFG_TUH_DEVICE_MAX` raised 1 → 4 (hub + keyboard). Both changes are ported from the sibling PB-1000 project.
@@ -237,4 +237,4 @@ All notable changes to this project are documented in this file. Japanese versio
 
 ### Removed (2026-11-12)
 
-- **External SCC board output** (`scc_out=`, `msx.scc_out_init()`/`scc_out_deinit()`/`scc_out_mute()`, `src/msx/scc_out.c`): never verified on real hardware; the built-in SCC stays. An `scc_out=` line left in `msx.ini` is ignored.
+- **External SCC board output** (`scc_out=`, `msx.scc_out_init()`/`scc_out_deinit()`/`scc_out_mute()`, `src/msx/scc_out.c`): dropped because the built-in SCC already plays SCC music without problems, so an external board is no longer needed. The built-in SCC stays. An `scc_out=` line left in `msx.ini` is ignored.
