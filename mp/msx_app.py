@@ -61,8 +61,10 @@
 #   hdmi_scale=2
 #   scc=on
 #   psg_volume=256
+#   fm=on
+#   fm_volume=256
+#   fm_rom=/sd/msx/fmpac.rom
 #   scc_volume=256
-#   scc_out=2,3,6
 #   # omit 'cart' to show the interactive ROM selector at boot (browses from
 #   # the SD root incl. subfolders; UP/DOWN move, ENTER opens a folder/picks
 #   # a ROM, ESC goes up a level/cancels at the root)
@@ -115,16 +117,19 @@
 #   # does the upscaling). Only matters when display=hdmi.
 #   # scc=on|off: built-in Konami SCC synthesis, mixed into the same PWM
 #   # audio output as the PSG (default on). scc_volume: its level relative
-#   # to the PSG, 256 = 1:1 (default), 0-1024. Independent of scc_out below
-#   # — both can be used at once. psg_volume: PSG level, 256 = unchanged
-#   # (default), 0 = mute (e.g. to listen to the SCC alone).
-#   # scc_out=SCK,MOSI,CS[,BAUD] (GPIO numbers) forwards Konami SCC sound
-#   # register writes to an external PicoChiptuneOrchestra slave_scc board
-#   # (write-only SPI, mode 1, bit-banged — see src/msx/scc_out.c and
-#   # 調査用/PicoChiptuneOrchestra連携_SCC_YM2413外部演奏検討.md). The
-#   # emulator itself doesn't synthesize SCC; the board's PWM output must be
-#   # mixed with this board's own audio in analog. Omit to disable. Pick
-#   # pins not used by board_config.py (LCD/SD/USB/joystick/audio).
+#   # to the PSG, 256 = 1:1 (default), 0-1024. psg_volume: PSG level,
+#   # 256 = unchanged (default), 0 = mute (e.g. to listen to the SCC alone).
+#   # fm=on|off: built-in YM2413 (MSX-MUSIC, ports 0x7C/0x7D), default on.
+#   # fm_volume: its level, 256 = default (0-1024).
+#   # Software only switches to FM music once it detects MSX-MUSIC, which
+#   # needs one of (2026-11-12):
+#   #   fm_rom=PATH: an FM-PAC image (fmpac.rom — only its first 16KB, the
+#   #     FM-BIOS, is used) or a 16KB MSX-MUSIC ROM, placed in cart slot 2
+#   #     (16KB of C heap). Works with software that calls the FM-BIOS.
+#   #   fm_id=on: empty slot 2 just answers "APRLOPLL" (no BIOS behind it).
+#   #     Only for software that writes the ports itself — titles that call
+#   #     the BIOS (e.g. R-Type) crash with it, so it's off by default.
+#   # Neither set: software sees no MSX-MUSIC and plays its PSG/SCC music.
 #   # ext=off skips loading /sd/msx/ext/ and /ext/ extension modules (see
 #   # mp/msx_ext.py, doc/extension_api.md). Default is to load them.
 #   # Real-hardware finding: once ANY extension registers even one
@@ -627,6 +632,11 @@ def poll_keyboard():
         # a wait_display() the pipeline was specifically trying to avoid —
         # only on the GUI+F7 path, not every frame.
         msx.wait_display()
+        # Pico 2: core1 may still be rendering the last frame's YM2413 audio
+        # from flash; the menu can write flash (e.g. the Mega ROM copy), and
+        # MicroPython's own flash writes don't pause core1 — let it finish
+        # and park in RAM first.
+        msx.fm_sync()
         # Safety net: show_emulator_menu() already catches OSError around
         # most of its own SD access, but an unhandled OSError from *some*
         # path inside it (still being tracked down — see 2026-08-29
@@ -640,7 +650,6 @@ def poll_keyboard():
         # investigation, so a clean file is more trustworthy than trusting
         # what scrolled by on the terminal). Retrieve with:
         #   mpremote cp :crashlog.txt .
-        msx.scc_out_mute(True)   # external SCC keeps sounding otherwise
         try:
             display_state, _cart_path, _disk_path, _fdd_mode, _diskrom_path = show_emulator_menu(
                 msx, usb_host, ROM_DIR, {_bios_name}, SAVE_BASE, CONFIG_PATH,
@@ -692,7 +701,6 @@ def poll_keyboard():
                              'lcd': _lcd_model, 'rotate': _rotate_180,
                              'hdmi_baud': _hdmi_baud,
                              'hdmi_scale': _hdmi_scale}
-        msx.scc_out_mute(False)  # re-send the shadow's key-on mask
         _display_mode    = display_state['display']
         _hdmi_frame_skip = display_state['frame_skip']
         _hdmi_scale      = display_state['hdmi_scale']  # already applied live by the menu
@@ -1220,17 +1228,19 @@ def _init_audio_and_ext(cfg):
         msx.set_psg_volume(int(cfg.get('psg_volume', 256)))
     except (ValueError, TypeError) as e:
         print(f"Bad psg_volume in msx.ini: {e}")
-
-    # 8.4 — Optional external SCC (msx.ini scc_out=SCK,MOSI,CS[,BAUD])
-    _scc = cfg.get('scc_out', '').strip()
-    if _scc:
+    try:
+        msx.set_fm(cfg.get('fm', 'on').strip().lower() != 'off',
+                   int(cfg.get('fm_volume', 256)))
+    except (ValueError, TypeError) as e:
+        print(f"Bad fm_volume in msx.ini: {e}")
+    msx.set_fm_id(cfg.get('fm_id', 'off').strip().lower() == 'on')
+    _fm_rom = cfg.get('fm_rom', '').strip()
+    if _fm_rom:
         try:
-            _p = [int(v, 0) for v in _scc.split(',')]
-            if len(_p) not in (3, 4) or not msx.scc_out_init(*_p):
-                raise ValueError(_scc)
-            print(f"SCC OUT: SCK={_p[0]} MOSI={_p[1]} CS={_p[2]}")
-        except ValueError as e:
-            print(f"Bad scc_out in msx.ini: {e}")
+            import msx_ui
+            print(f"FM ROM: {_fm_rom} -> slot 2 ({msx_ui.load_fm_rom(_fm_rom)})")
+        except Exception as e:
+            print(f"FM ROM load failed ({_fm_rom}): {e}")
 
     # 8.5 — Load /sd/msx/ext/ and /ext/ extension modules (CALL/RST hook
     # plugins — see mp/msx_ext.py and doc/extension_api.md). Runs before
@@ -1273,6 +1283,8 @@ def _main_loop():
     frame = 0
     t0    = time.ticks_ms()
     _fs_prev = msx.get_cart_fetch_stats() + (msx.get_audio_clip_count(),)
+    _busy_us = 0   # sum of per-frame work time (before the budget sleep)
+    _fm_prev = msx.fm_stats()
 
     # 2026-09-05: MSX_TCYCLES_FRAME (msx_core.h) advances exactly 1/60s of
     # MSX-clock time per msx.run_frame() call, regardless of how fast the
@@ -1375,6 +1387,7 @@ def _main_loop():
         # FRAME_BUDGET_US comment above. A no-op once elapsed already
         # exceeds the budget (slower carts, etc.).
         elapsed_us = time.ticks_diff(time.ticks_us(), iter_start)
+        _busy_us += elapsed_us
         if elapsed_us < FRAME_BUDGET_US:
             time.sleep_us(FRAME_BUDGET_US - elapsed_us)
 
@@ -1388,8 +1401,18 @@ def _main_loop():
             # clip: samples clamped to the 10-bit PWM range (2026-11-11).
             bs, fe = msx.get_cart_fetch_stats()
             cl = msx.get_audio_clip_count()
-            print(f"FPS: {fps:.1f}  ring: {ring}  bank: +{bs - _fs_prev[0]}  fetch: +{fe - _fs_prev[1]}  clip: +{cl - _fs_prev[2]}")
+            # busy: average share of the 60fps frame budget actually spent
+            # working (2026-11-12) — headroom indicator while FPS is capped.
+            busy = _busy_us * 100 // (300 * FRAME_BUDGET_US)
+            # fmwait/fmcalc (2026-11-12): core0 waiting for core1's YM2413
+            # render / core1's render time, as % of the 300-frame budget.
+            fm = msx.fm_stats()
+            fmw = (fm[0] - _fm_prev[0]) * 100 // (300 * FRAME_BUDGET_US)
+            fmr = (fm[1] - _fm_prev[1]) * 100 // (300 * FRAME_BUDGET_US)
+            _fm_prev = fm
+            print(f"FPS: {fps:.1f}  ring: {ring}  bank: +{bs - _fs_prev[0]}  fetch: +{fe - _fs_prev[1]}  clip: +{cl - _fs_prev[2]}  busy: {busy}%  fmwait: {fmw}%  fmcalc: {fmr}%  fmovf: {fm[2]}")
             _fs_prev = (bs, fe, cl)
+            _busy_us = 0
             # 2026-10-05 DIAGNOSTIC (re-added): (heartbeat, late_scanline_ctr)
             # — see disp_dvi.c's msx_dvi_debug_info()/msx.dvi_debug() and
             # the dvi.c was_backlogged fix. Checking whether the fix

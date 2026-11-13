@@ -50,6 +50,16 @@ struct z80 {
   // Python API.
   bool (*call_hook)(void*, uint16_t);
   void* userdata;
+
+  // MSX_emu_pico2 (2026-11-13): direct-read map, one entry per 8KB page.
+  // rb() reads rmap[p][addr & 0x1FFF] without calling read_byte when
+  // rmap[p] != NULL and (addr & 0x1FFF) < rlim[p]; anything else (I/O-
+  // like cart registers, SRAM, empty slots) still goes through
+  // read_byte. The owner (msx_core.c's msx_rmap_update()) must rebuild
+  // it whenever what read_byte would return for a page can change.
+  // z80_init() clears it (= every read via read_byte, as upstream).
+  const uint8_t* rmap[8];
+  uint16_t rlim[8];
   bool hook_suppress_active; // see call_hook's comment above (point 4)
 
   // 2026-09-20: real-hardware finding — a small, fixed set of always-on

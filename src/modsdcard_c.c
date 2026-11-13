@@ -244,8 +244,10 @@ static int sdcard_cmd(sdcard_c_obj_t *self, uint8_t cmd, uint32_t arg, uint8_t c
 }
 
 // Read one data block (512 bytes) after a CMD17/18 that already got R1==0.
-// Raises OSError on data-start-token timeout.
-static void sdcard_readinto(sdcard_c_obj_t *self, uint8_t *buf, size_t len) {
+// Returns false on data-start-token timeout (CS left asserted so a
+// multi-block caller can still send CMD12 — see sdcard_readblocks_once()).
+// *tok_out receives the last byte seen while waiting (diagnostics).
+static bool sdcard_readinto(sdcard_c_obj_t *self, uint8_t *buf, size_t len, uint8_t *tok_out) {
     cs_select(self);
 
     uint8_t token = 0;
@@ -259,9 +261,9 @@ static void sdcard_readinto(sdcard_c_obj_t *self, uint8_t *buf, size_t len) {
             sleep_ms(1);
         }
     }
+    *tok_out = token;
     if (i == SD_CMD_TIMEOUT) {
-        gpio_put(self->cs_pin, 1);
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("timeout waiting for response"));
+        return false;
     }
 
     sdcard_spi_transfer(self, len, NULL, buf);
@@ -270,7 +272,30 @@ static void sdcard_readinto(sdcard_c_obj_t *self, uint8_t *buf, size_t len) {
     spi_read_blocking(self->spi, 0xFF, csum, 2);
 
     cs_deselect_release(self);
+    return true;
 }
+
+// Waits (bounded) for the card to stop signalling busy (0x00) after a
+// stop/write. Returns false if it never did.
+static bool sdcard_wait_not_busy(sdcard_c_obj_t *self) {
+    uint8_t busy;
+    for (int i = 0; i < 200000; i++) {
+        spi_read_blocking(self->spi, 0xFF, &busy, 1);
+        if (busy != 0x00) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 2026-11-12: last read failure, printed by sdcard_readblocks() when all
+// retries fail (diagnostics for the EIO seen while copying Mega ROMs to
+// XIP flash).
+static struct {
+    uint32_t block;
+    uint8_t  stage;   // 1 = CMD17/18 R1, 2 = data token, 3 = CMD12 R1
+    int      value;   // R1 (or -1 = no response), or last token byte
+} sd_last_err;
 
 // Write one data block with the given start token; returns false if the
 // card's data-response token indicates failure (caller raises OSError —
@@ -379,7 +404,11 @@ static void sdcard_init_card(sdcard_c_obj_t *self) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no response from SD card"));
     }
     uint8_t csd[16];
-    sdcard_readinto(self, csd, 16);
+    uint8_t csd_tok;
+    if (!sdcard_readinto(self, csd, 16, &csd_tok)) {
+        gpio_put(self->cs_pin, 1);
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("timeout waiting for response"));
+    }
     if ((csd[0] & 0xC0) == 0x40) {
         // CSD version 2.0
         self->sectors = ((((uint32_t)csd[8] << 8) | csd[9]) + 1) * 1024;
@@ -422,38 +451,49 @@ static void sdcard_readblocks_once(sdcard_c_obj_t *self, uint32_t block_num, uin
         mp_raise_ValueError(MP_ERROR_TEXT("Buffer length is invalid"));
     }
 
+    uint8_t tok = 0;
     if (nblocks == 1) {
         int r = sdcard_cmd(self, 17, block_num * self->cdv, 0, 0, false, false);
         if (r != 0) {
             gpio_put(self->cs_pin, 1);
+            sd_last_err.block = block_num; sd_last_err.stage = 1; sd_last_err.value = r;
             ok = false;
-        } else {
-            sdcard_readinto(self, buf, 512);
+        } else if (!sdcard_readinto(self, buf, 512, &tok)) {
+            cs_deselect_release(self);
+            sd_last_err.block = block_num; sd_last_err.stage = 2; sd_last_err.value = tok;
+            ok = false;
         }
     } else {
         int r = sdcard_cmd(self, 18, block_num * self->cdv, 0, 0, false, false);
         if (r != 0) {
             gpio_put(self->cs_pin, 1);
+            sd_last_err.block = block_num; sd_last_err.stage = 1; sd_last_err.value = r;
             ok = false;
         } else {
             for (size_t i = 0; i < nblocks; i++) {
-                sdcard_readinto(self, buf + i * 512, 512);
+                if (!sdcard_readinto(self, buf + i * 512, 512, &tok)) {
+                    sd_last_err.block = block_num + i; sd_last_err.stage = 2; sd_last_err.value = tok;
+                    ok = false;
+                    break;
+                }
             }
+            // 2026-11-12: CMD12 is now sent even when a block's data token
+            // timed out. Previously the timeout raised straight out of the
+            // block loop, leaving the card mid-CMD18 (still in its data
+            // state) — every later command, including all retries and
+            // re-opening the file, then failed with EIO until power-cycle
+            // (real hardware: XIP copy of NEMESIS2.ROM, retry at once EIO).
             r = sdcard_cmd(self, 12, 0, 0xFF, 0, false, true);
-            if (r != 0) {
-                gpio_put(self->cs_pin, 1);
+            if (r != 0 && ok) {
+                sd_last_err.block = block_num; sd_last_err.stage = 3; sd_last_err.value = r;
                 ok = false;
-            } else {
-                // CMD12 stop-transmission: wait for the card's post-stop
-                // busy signal to clear before releasing CS (see
-                // mp/sdcard.py's 2026-09-30 comment on this exact point —
-                // skipping this wait reliably broke the very next command).
-                uint8_t busy;
-                do {
-                    spi_read_blocking(self->spi, 0xFF, &busy, 1);
-                } while (busy == 0x00);
-                cs_deselect_release(self);
             }
+            // Wait out the post-stop busy before releasing CS (see
+            // mp/sdcard.py's 2026-09-30 comment — skipping it reliably
+            // broke the very next command), bounded so a dead card can't
+            // hang here.
+            sdcard_wait_not_busy(self);
+            cs_deselect_release(self);
         }
     }
 
@@ -521,6 +561,11 @@ static void sdcard_readblocks(sdcard_c_obj_t *self, uint32_t block_num, uint8_t 
             return;
         } else {
             if (attempt == SD_RETRY_COUNT - 1) {
+                mp_printf(&mp_plat_print,
+                          "SD: read failed blk=%u stage=%s value=0x%02x\n",
+                          (unsigned)sd_last_err.block,
+                          sd_last_err.stage == 1 ? "R1" : sd_last_err.stage == 2 ? "token" : "CMD12",
+                          (unsigned)(sd_last_err.value & 0xFF));
                 nlr_jump(nlr.ret_val);
             }
         }

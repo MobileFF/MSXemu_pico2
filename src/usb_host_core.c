@@ -173,11 +173,38 @@ const uint8_t *usb_host_core_get_hid_report(void) {
  * keyboard responsiveness. */
 static volatile uint32_t pio_usb_sof_tick_count = 0;
 static int pio_usb_sof_alarm_num = -1;
+static absolute_time_t pio_usb_sof_next;
 
-static void pio_usb_sof_alarm_handler(uint alarm_num) {
+/* 2026-11-12 (ported from the sibling PB-1000 project's real-hardware
+ * fix): the next frame is timed from the previous target, not from the
+ * end of this one, so SOFs stay exactly 1ms apart however long the
+ * frame's transactions took. Previously the interval was always >1ms and
+ * jittered by the interrupt latency; a USB hub treats that drift as
+ * end-of-frame traffic (babble) and disables the port, so a keyboard
+ * behind a hub stopped responding partway through. Devices without a
+ * crystal also trim their clock to the SOF interval. The alarm fires
+ * PIO_USB_SOF_LEAD_US early and the handler waits for the exact
+ * microsecond, absorbing interrupt latency. */
+#define PIO_USB_SOF_LEAD_US 20
+
+static void pio_usb_sof_arm(uint alarm_num) {
+  hardware_alarm_set_target(alarm_num,
+      from_us_since_boot(to_us_since_boot(pio_usb_sof_next) - PIO_USB_SOF_LEAD_US));
+}
+
+static void __not_in_flash_func(pio_usb_sof_alarm_handler)(uint alarm_num) {
+  while (!time_reached(pio_usb_sof_next)) {
+    tight_loop_contents();
+  }
   pio_usb_sof_tick_count++;
   pio_usb_host_frame();
-  hardware_alarm_set_target(alarm_num, delayed_by_us(get_absolute_time(), 1000));
+  pio_usb_sof_next = delayed_by_us(pio_usb_sof_next, 1000);
+  if (hardware_alarm_set_target(alarm_num,
+          from_us_since_boot(to_us_since_boot(pio_usb_sof_next) - PIO_USB_SOF_LEAD_US))) {
+    /* Target already passed: restart the cadence from now. */
+    pio_usb_sof_next = delayed_by_us(get_absolute_time(), 1000);
+    pio_usb_sof_arm(alarm_num);
+  }
 }
 
 #ifdef MSX_BOARD_PIZERO
@@ -280,7 +307,8 @@ static void usb_host_core_init_pizero(void) {
 
   pio_usb_sof_alarm_num = hardware_alarm_claim_unused(true);
   hardware_alarm_set_callback(pio_usb_sof_alarm_num, pio_usb_sof_alarm_handler);
-  hardware_alarm_set_target(pio_usb_sof_alarm_num, delayed_by_us(get_absolute_time(), 1000));
+  pio_usb_sof_next = delayed_by_us(get_absolute_time(), 1000);
+  pio_usb_sof_arm((uint)pio_usb_sof_alarm_num);
 }
 #endif /* MSX_BOARD_PIZERO */
 
@@ -346,7 +374,8 @@ static void usb_host_core_init_pico2_piousb(void) {
 
   pio_usb_sof_alarm_num = hardware_alarm_claim_unused(true);
   hardware_alarm_set_callback(pio_usb_sof_alarm_num, pio_usb_sof_alarm_handler);
-  hardware_alarm_set_target(pio_usb_sof_alarm_num, delayed_by_us(get_absolute_time(), 1000));
+  pio_usb_sof_next = delayed_by_us(get_absolute_time(), 1000);
+  pio_usb_sof_arm((uint)pio_usb_sof_alarm_num);
 }
 #endif /* MSX_USE_PIO_USB_HOST */
 
@@ -418,4 +447,29 @@ void usb_host_core_stop_bg_timer(void) {
   if (!usb_bg_timer_active) return;
   cancel_repeating_timer(&usb_bg_timer);
   usb_bg_timer_active = false;
+}
+
+/* 2026-11-12: see usb_host_core.h. Two steps, because pio_usb_host_frame()
+ * checks for a new connection *before* dispatching ints, and the HCD glue
+ * handles ATTACH before REMOVE within one dispatch: first only raise
+ * DISCONNECT (root stays "connected", so the next frame posts just
+ * HCD_EVENT_DEVICE_REMOVE), then, a few frames later, mark the root
+ * disconnected so the following frame sees the idle line again and posts
+ * HCD_EVENT_DEVICE_ATTACH — TinyUSB then bus-resets and enumerates the
+ * hub/keyboard from scratch (events are consumed by tuh_task(), which the
+ * menu/game loops already poll). Real hardware: a keyboard behind a hub
+ * died after every Mega ROM copy to flash. */
+void usb_host_core_force_reconnect(void) {
+#if defined(MSX_BOARD_PIZERO) || defined(MSX_USE_PIO_USB_HOST)
+  root_port_t *root = PIO_USB_ROOT_PORT(0);
+  if (!root->initialized || !root->connected) return;
+  uint32_t s = save_and_disable_interrupts();
+  root->ints |= PIO_USB_INTS_DISCONNECT_BITS;
+  restore_interrupts(s);
+  sleep_ms(3);
+  s = save_and_disable_interrupts();
+  root->connected = false;
+  root->suspended = true;
+  restore_interrupts(s);
+#endif
 }

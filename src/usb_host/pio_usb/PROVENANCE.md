@@ -5,8 +5,13 @@ Vendored 2026-09-27 (Phase 4 of the RP2350-PiZero port, see
 
 - **Upstream**: [sekigon-gonnoc/Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB),
   MIT License (see `LICENSE` in this directory).
-- **Exact version vendored**: tag `0.7.2`, commit
-  `3c1eec341a5232640e4c00628b889b641af34b28`.
+- **Exact version vendored**: tag `0.7.3`, commit
+  `b186e36bea0f3bcc2ee94ca1fa81e7f71281443a` (originally `0.7.2`,
+  `3c1eec341a5232640e4c00628b889b641af34b28`; `pio_usb.c`,
+  `pio_usb_device.c`, `pio_usb_host.c`, `pio_usb_ll.h` and `usb_crc.c`
+  updated to `0.7.3` on 2026-11-12, following the sibling PB-1000 project's
+  same update — the other files are identical in both tags; each updated
+  file's checksum was verified against the upstream tag).
 
 Files copied verbatim (unmodified) from the tag's `src/`: `pio_usb.c/h`,
 `pio_usb_device.c`, `pio_usb_host.c`, `pio_usb_ll.h`,

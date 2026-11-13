@@ -23,10 +23,22 @@
 #include "hardware/clocks.h"
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/time.h"
+#include "pico/multicore.h"
 #define HAVE_PICO_SDK 1
 #else
 #define HAVE_PICO_SDK 0
 #endif
+
+/* 2026-11-12: YM2413 synthesis runs on core1 on boards where core1 is
+ * free (Pico 2). PiZero's core1 drives DVI, so there it stays inline on
+ * core0 (audio_generate_scanline()). See the "YM2413 on core1" block. */
+#if HAVE_PICO_SDK && !(defined(MSX_BOARD_PIZERO) && MSX_BOARD_PIZERO)
+#define MSX_FM_ON_CORE1 1
+#else
+#define MSX_FM_ON_CORE1 0
+#endif
+static void fm_log_drop_pending(void);
+static void fm_write_data(msx_state_t *msx, uint8_t data);
 
 /* -----------------------------------------------------------------------
  * TMS9918 color palette → RGB565 (big-endian for ILI9341)
@@ -88,6 +100,12 @@ static uint8_t scan_mapper_patterns(const uint8_t *data, uint32_t size) {
      * other supported mapper uses) must be non-zero at all, or an ASCII
      * cart that happens to write 0x7000 a lot would be misread as SCC. */
     uint32_t scc_hits = 0, scc_excl = 0;
+    /* FM-PAC (2026-11-12): its own ID string. Its bank register 0x7FF7
+     * would otherwise count as ASCII8 hits below — and as ASCII8 a write
+     * there switches 0xA000-0xBFFF instead of 0x4000-0x7FFF, so _FMPAC
+     * (code in bank 1) fell through to Syntax Error. */
+    if (size >= 0x20 && memcmp(data + 0x18, "PAC2OPLL", 8) == 0)
+        return MSX_MAPPER_FMPAC;
     for (uint32_t i = 0; i + 3 < size; i++) {
         /* LD (nn),A  opcode = 0x32 followed by 16-bit address */
         if (data[i] == 0x32) {
@@ -138,6 +156,16 @@ static uint8_t detect_mapper(const uint8_t *data, uint32_t size) {
  * evidence the ROM itself is unbanked. */
 uint8_t msx_detect_mapper(const uint8_t *data, uint32_t size) {
     return scan_mapper_patterns(data, size);
+}
+
+uint8_t msx_detect_mapper_full(const uint8_t *rom, uint32_t size, uint32_t prefix_len) {
+    const uint32_t rtype_boot = 0x17u * 0x4000u;
+    if (size >= rtype_boot + 0x4000u &&
+        !(rom[0] == 'A' && rom[1] == 'B') &&
+        rom[rtype_boot] == 'A' && rom[rtype_boot + 1] == 'B') {
+        return MSX_MAPPER_RTYPE;
+    }
+    return scan_mapper_patterns(rom, prefix_len < size ? prefix_len : size);
 }
 
 /* Instrumentation for measuring megarom bank-switch/cache-miss frequency
@@ -331,6 +359,17 @@ static const uint8_t *cart_page_ptr(msx_state_t *msx, uint8_t slot_idx,
         if (offset >= size) return NULL;
         return rom + offset;
     }
+    case MSX_MAPPER_FMPAC: {
+        /* One 16KB window at 0x4000-0x7FFF (bank[0]); nothing elsewhere.
+         * SRAM/registers are handled in fmpac_read() before this. */
+        if (addr < 0x4000 || addr >= 0x8000) return NULL;
+        uint32_t banks  = size / 0x4000u;
+        if (banks == 0) return NULL;
+        uint32_t offset = ((uint32_t)bank[0] % banks) * 0x4000u + (addr & 0x3FFF);
+        if (offset >= size) return NULL;
+        return rom + offset;
+    }
+    case MSX_MAPPER_RTYPE:      /* bank[] holds 8KB page numbers, see cart_default_banks() */
     case MSX_MAPPER_KONAMI_SCC: {
         /* Four switchable 8KB windows (incl. 0x4000, unlike KONAMI).
          * Bank numbers wrap at the ROM size like the real mapper's
@@ -353,12 +392,6 @@ static const uint8_t *cart_page_ptr(msx_state_t *msx, uint8_t slot_idx,
 /* -----------------------------------------------------------------------
  * SCC (K051649) register window — see msx_core.h's SCC block
  * ----------------------------------------------------------------------- */
-static msx_scc_out_fn scc_out_cb = NULL;
-
-void msx_set_scc_out_cb(msx_scc_out_fn cb) {
-    scc_out_cb = cb;
-}
-
 static uint8_t scc_read(const msx_state_t *msx, uint16_t addr);
 
 /* True when addr is inside an enabled SCC register window of this slot. */
@@ -373,8 +406,28 @@ static inline bool scc_window(const msx_state_t *msx, uint8_t slot_idx,
  * hot one, every Z80 fetch from such a cart — is inlined here as a
  * single window-pointer lookup instead of a call into cart_page_ptr()'s
  * mapper switch. */
+static uint8_t fmpac_read(msx_state_t *msx, uint8_t slot_idx, uint16_t addr);
+
 static inline __attribute__((always_inline))
 uint8_t cart_read(msx_state_t *msx, uint8_t slot_idx, uint16_t addr) {
+    if (msx->cart_type[slot_idx] == MSX_MAPPER_FMPAC) {
+        /* Hot path (2026-11-12): plain ROM fetch from a paged FM-PAC —
+         * the FM-PAC menu and its music driver run from here. Registers
+         * (0x7FF6/0x7FF7) and SRAM go through fmpac_read(). Real hardware:
+         * with every access via fmpac_read(), busy rose 90% -> 113%
+         * while the menu played music. */
+        uint16_t rel = (uint16_t)(addr - 0x4000u);
+        const uint8_t *b = msx->cart_bank[slot_idx];
+        if (rel < 0x3FF6u && b[2] != 0x4D) {
+            if (msx->cart_paged[slot_idx]) {
+                const uint8_t *w = msx->cart_win[slot_idx][rel >> 13];
+                if (w) return w[addr & 0x1FFF];
+            } else if (msx->cart_size[slot_idx] == 0x4000u) {
+                return msx->cart[slot_idx][rel];   /* fm_rom= FM-BIOS copy */
+            }
+        }
+        return fmpac_read(msx, slot_idx, addr);
+    }
     if (msx->cart_paged[slot_idx]) {
         uint16_t rel = (uint16_t)(addr - 0x4000u);
         if (rel < 0x8000u) {
@@ -398,6 +451,119 @@ static uint8_t scc_read(const msx_state_t *msx, uint16_t addr) {
     if (off < 0x80) return msx->scc_wave[off];
     if (off >= 0xA0 && off < 0xC0) return msx->scc_wave[0x60u + (off & 0x1F)];
     return 0xFF;
+}
+
+/* -----------------------------------------------------------------------
+ * FM-PAC (MSX_MAPPER_FMPAC) — see msx_core.h. cart_bank[slot] holds
+ * {bank, enable, reg 0x5FFE, reg 0x5FFF}, so save states carry it.
+ * ----------------------------------------------------------------------- */
+static inline bool fmpac_sram_on(const uint8_t *b) {
+    return b[2] == 0x4D && b[3] == 0x69;
+}
+
+static uint8_t fmpac_read(msx_state_t *msx, uint8_t slot_idx, uint16_t addr) {
+    if (addr < 0x4000 || addr >= 0x8000) return 0xFF;
+    const uint8_t *b = msx->cart_bank[slot_idx];
+    uint16_t rel = addr & 0x3FFF;
+    if (rel == 0x3FF6) return b[1];
+    if (rel == 0x3FF7) return b[0];
+    if (fmpac_sram_on(b)) {
+        if (rel < 0x1FFE) return msx->fmpac_sram ? msx->fmpac_sram[rel] : 0xFF;
+        if (rel == 0x1FFE) return b[2];
+        if (rel == 0x1FFF) return b[3];
+        return 0xFF;
+    }
+    if (msx->cart_paged[slot_idx]) {
+        const uint8_t *w = msx->cart_win[slot_idx][rel >> 13];
+        return w ? w[addr & 0x1FFF] : 0xFF;
+    }
+    const uint8_t *p = cart_page_ptr(msx, slot_idx, addr);
+    return p ? *p : 0xFF;
+}
+
+/* Called whenever a slot's cart_type has just been set: a full FM-PAC
+ * image gets its SRAM (blank = 0xFF, as openMSX's); once no slot holds
+ * one it is released. The 16KB FM-BIOS-only copy (msx.ini fm_rom=)
+ * gets none — the BIOS doesn't use it. */
+static void fmpac_prepare(msx_state_t *msx, uint8_t slot) {
+    (void)slot;
+    bool need = false;
+    for (uint8_t s = 0; s < 2; s++)
+        if (msx->cart_type[s] == MSX_MAPPER_FMPAC && msx->cart_size[s] > 0x4000u) need = true;
+    if (need && !msx->fmpac_sram) {
+        msx->fmpac_sram = (uint8_t *)malloc(0x2000);
+        if (msx->fmpac_sram) memset(msx->fmpac_sram, 0xFF, 0x2000);
+    } else if (!need && msx->fmpac_sram) {
+        free(msx->fmpac_sram);
+        msx->fmpac_sram = NULL;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Direct-read map (2026-11-13) — see z80.h's rmap[]. The Z80 core reads
+ * plain ROM/RAM bytes straight from these pointers instead of calling
+ * msx_mem_read() for every opcode/operand byte. Real hardware: the
+ * FM-PAC menu's logo animation keeps the Z80 busy in a ROM-resident
+ * division loop (~40% more instructions per frame than BASIC's idle
+ * loop) and pushed core0 past the frame budget (busy ~107%, FPS ~56,
+ * FM music audibly slow).
+ *
+ * Mirrors msx_mem_read()/cart_read() exactly: any page whose bytes
+ * aren't a plain array (FDC registers, FM-PAC 0x7FF6/7 + SRAM, the SCC
+ * window, empty slots) is left NULL or cut short by rlim so those
+ * addresses still take read_byte. Rebuilt on every slot-select write,
+ * every cart-area write (mapper registers), every cart load/eject/reset
+ * and once per frame as a safety net.
+ * ----------------------------------------------------------------------- */
+static void rmap_cart(msx_state_t *msx, uint8_t idx, uint8_t p,
+                      const uint8_t **ptr, uint16_t *lim) {
+    *ptr = NULL; *lim = 0;
+    if (p < 2 || p > 5 || msx->cart_size[idx] == 0) return;
+    uint16_t base = (uint16_t)(p * 0x2000u);
+    uint16_t l = 0x2000;
+    uint8_t type = msx->cart_type[idx];
+    if (type == MSX_MAPPER_FMPAC) {
+        if (p > 3 || fmpac_sram_on(msx->cart_bank[idx])) return;
+        if (p == 3) l = 0x1FF6;              /* 0x7FF6/0x7FF7: registers */
+    } else if (scc_window(msx, idx, 0x9800)) {
+        if (p == 4) l = 0x1800;              /* 0x9800-0x9FFF: SCC */
+    }
+    const uint8_t *b;
+    if (msx->cart_paged[idx]) {
+        b = msx->cart_win[idx][p - 2];
+    } else {
+        b = cart_page_ptr(msx, idx, base);
+        /* Only when the whole 8KB maps contiguously (a short PLAIN ROM
+         * or an odd-sized image falls back to read_byte). */
+        if (b && cart_page_ptr(msx, idx, (uint16_t)(base + 0x1FFFu)) != b + 0x1FFF) b = NULL;
+    }
+    if (!b) return;
+    *ptr = b; *lim = l;
+}
+
+void msx_rmap_update(msx_state_t *msx) {
+    z80 *z = &msx->cpu;
+    for (uint8_t p = 0; p < 8; p++) {
+        uint8_t slot = (msx->slot_select >> ((p >> 1) * 2)) & 0x03;
+        const uint8_t *ptr = NULL;
+        uint16_t lim = 0;
+        switch (slot) {
+        case 0:
+            if (p < MSX_BIOS_SIZE / 0x2000u) { ptr = msx->bios + p * 0x2000u; lim = 0x2000; }
+            break;
+        case 1:
+            if (!msx->fdc.enabled) rmap_cart(msx, 0, p, &ptr, &lim);
+            break;
+        case 2:
+            rmap_cart(msx, 1, p, &ptr, &lim);
+            break;
+        default:
+            ptr = msx->ram + p * 0x2000u; lim = 0x2000;
+            break;
+        }
+        z->rmap[p] = ptr;
+        z->rlim[p] = lim;
+    }
 }
 
 /* Built-in synthesis: per-channel phase step for the current period.
@@ -430,6 +596,44 @@ static inline int32_t scc_render(msx_state_t *msx) {
     return mix;
 }
 
+void msx_set_fm(msx_state_t *msx, bool enable, uint16_t gain) {
+    msx->fm_enabled = enable;
+    msx->fm_gain    = gain;
+    if (!enable) msx->fm_active = false;
+}
+
+void msx_set_fm_id(msx_state_t *msx, bool enable) {
+    msx->fm_id = enable;
+}
+
+void msx_fm_state_save(const msx_state_t *msx, uint8_t *buf) {
+    msx_fm_sync();
+    memcpy(buf, MSX_FM_STATE_MAGIC, 4);
+    buf[4] = msx->fm_addr;
+    if (msx->opll) memcpy(buf + 5, msx->opll->reg, 0x40);
+    else memset(buf + 5, 0, 0x40);
+}
+
+/* Replays the saved registers through OPLL_writeReg() — restores pitch,
+ * instruments, volumes and key-on state (envelopes restart, which is
+ * inaudible next to the save/load pause). Missing block (older save) ->
+ * FM silent until the game writes to it again. */
+void msx_fm_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len) {
+    if (!msx->opll) return;
+    msx_fm_sync();
+    fm_log_drop_pending();
+    OPLL_reset(msx->opll);
+    msx->fm_active = false;
+    if (!buf || len < MSX_FM_STATE_SZ || memcmp(buf, MSX_FM_STATE_MAGIC, 4) != 0) return;
+    msx->fm_addr = buf[4];
+    bool any = false;
+    for (uint32_t r = 0; r < 0x40; r++) {
+        OPLL_writeReg(msx->opll, r, buf[5 + r]);
+        if (buf[5 + r]) any = true;
+    }
+    msx->fm_active = any && msx->fm_enabled;
+}
+
 void msx_set_psg_gain(msx_state_t *msx, uint16_t gain) {
     msx->psg_gain = gain;
 }
@@ -443,32 +647,14 @@ static void scc_write(msx_state_t *msx, uint16_t addr, uint8_t data) {
     uint8_t off = (uint8_t)addr;
     if (off < 0x80) {
         msx->scc_wave[off] = data;
-        if (scc_out_cb) scc_out_cb(MSX_SCC_OP_WAVEFORM, off, data);
     } else if (off < 0xA0) {
         uint8_t r = off & 0x0F;               /* 0x90-0x9F mirror 0x80-0x8F */
         msx->scc_reg[r] = data;
         if (r < 0x0A) scc_update_step(msx, (uint8_t)(r >> 1));
-        if (!scc_out_cb) return;
-        if (r < 0x0A)       scc_out_cb(MSX_SCC_OP_FREQ, r, data);
-        else if (r < 0x0F)  scc_out_cb(MSX_SCC_OP_VOLUME, (uint8_t)(r - 0x0A), data & 0x0F);
-        else                scc_out_cb(MSX_SCC_OP_KEYON, 0, data & 0x1F);
     } else if (off >= 0xE0) {
-        msx->scc_deform = data;               /* stored only; not forwarded */
+        msx->scc_deform = data;               /* stored only (not emulated) */
     }
     /* 0xA0-0xDF: no effect on a plain (non-SCC+) SCC. */
-}
-
-void msx_scc_out_mute(msx_state_t *msx, bool mute) {
-    if (!scc_out_cb) return;
-    scc_out_cb(MSX_SCC_OP_KEYON, 0, mute ? 0 : (msx->scc_reg[0x0F] & 0x1F));
-}
-
-void msx_scc_out_resync(msx_state_t *msx) {
-    if (!scc_out_cb) return;
-    for (uint8_t i = 0; i < 0x80; i++) scc_out_cb(MSX_SCC_OP_WAVEFORM, i, msx->scc_wave[i]);
-    for (uint8_t i = 0; i < 0x0A; i++) scc_out_cb(MSX_SCC_OP_FREQ, i, msx->scc_reg[i]);
-    for (uint8_t i = 0; i < 5; i++)    scc_out_cb(MSX_SCC_OP_VOLUME, i, msx->scc_reg[0x0A + i] & 0x0F);
-    scc_out_cb(MSX_SCC_OP_KEYON, 0, msx->scc_reg[0x0F] & 0x1F);
 }
 
 static void scc_reset(msx_state_t *msx) {
@@ -477,7 +663,6 @@ static void scc_reset(msx_state_t *msx) {
     memset(msx->scc_step, 0, sizeof(msx->scc_step));
     memset(msx->scc_phase, 0, sizeof(msx->scc_phase));
     msx->scc_deform = 0;
-    if (scc_out_cb) scc_out_cb(MSX_SCC_OP_RESET, 0, 0);
 }
 
 void msx_scc_state_save(const msx_state_t *msx, uint8_t *buf) {
@@ -488,13 +673,52 @@ void msx_scc_state_save(const msx_state_t *msx, uint8_t *buf) {
 }
 
 void msx_scc_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len) {
-    scc_reset(msx);   /* also RESETs the external chip */
+    scc_reset(msx);
     if (!buf || len < MSX_SCC_STATE_SZ || memcmp(buf, MSX_SCC_STATE_MAGIC, 4) != 0) return;
     memcpy(msx->scc_wave, buf + 4, 0x80);
     memcpy(msx->scc_reg, buf + 4 + 0x80, 0x10);
     msx->scc_deform = buf[4 + 0x80 + 0x10];
     for (uint8_t ch = 0; ch < 5; ch++) scc_update_step(msx, ch);
-    msx_scc_out_resync(msx);
+}
+
+/* Power-on bank registers for a mapper (2026-11-12). Most start at
+ * pages 0-3; R-Type's fixed 0x4000 window is 16KB block 0x17 (8KB pages
+ * 0x2E/0x2F) with block 0 at 0x8000. */
+static void cart_default_banks(msx_state_t *msx, uint8_t slot) {
+    uint8_t *b = msx->cart_bank[slot];
+    if (msx->cart_type[slot] == MSX_MAPPER_RTYPE) {
+        b[0] = 0x2E; b[1] = 0x2F; b[2] = 0; b[3] = 1;
+    } else if (msx->cart_type[slot] == MSX_MAPPER_FMPAC) {
+        b[0] = 0; b[1] = 0; b[2] = 0; b[3] = 0;   /* bank 0, ports off, SRAM off */
+    } else {
+        b[0] = 0; b[1] = 1; b[2] = 2; b[3] = 3;
+    }
+}
+
+/* Points all 4 windows of a paged (cache or XIP) cart at what its bank
+ * registers currently select — after load, reset, or a save-state load
+ * (2026-11-12: save-state loads used to restore cart_bank[] without
+ * refilling the windows, leaving paged carts showing stale pages). */
+static void cart_refill_all(msx_state_t *msx, uint8_t slot) {
+    if (!msx->cart_paged[slot]) return;
+    const uint8_t *b = msx->cart_bank[slot];
+    uint32_t pg[4];
+    switch (msx->cart_type[slot]) {
+    case MSX_MAPPER_ASCII16:
+        pg[0] = b[0] * 2u; pg[1] = b[0] * 2u + 1u;
+        pg[2] = b[1] * 2u; pg[3] = b[1] * 2u + 1u;
+        break;
+    case MSX_MAPPER_KONAMI:
+        pg[0] = 0; pg[1] = b[1]; pg[2] = b[2]; pg[3] = b[3];
+        break;
+    case MSX_MAPPER_FMPAC:     /* windows 2/3 are never read (fmpac_read()) */
+        pg[0] = b[0] * 2u; pg[1] = b[0] * 2u + 1u; pg[2] = 0; pg[3] = 1;
+        break;
+    default:   /* ASCII8, KONAMI_SCC, RTYPE: one 8KB page per window */
+        for (int w = 0; w < 4; w++) pg[w] = b[w];
+        break;
+    }
+    for (uint8_t w = 0; w < 4; w++) cart_page_refill(msx, slot, w, pg[w]);
 }
 
 /* Handle writes that update mapper bank registers. */
@@ -561,6 +785,53 @@ static void cart_mapper_write(msx_state_t *msx, uint8_t slot_idx,
             }
         }
         break;
+    case MSX_MAPPER_FMPAC: {
+        if (addr < 0x4000 || addr >= 0x8000) break;
+        uint16_t rel = addr & 0x3FFF;
+        switch (rel) {
+        case 0x1FFE:
+        case 0x1FFF:
+            if (!(bank[1] & 0x10)) bank[2 + (rel & 1)] = data;
+            break;
+        case 0x3FF4:                    /* YM2413, memory-mapped (always on) */
+            msx->fm_addr = data;
+            break;
+        case 0x3FF5:
+            fm_write_data(msx, data);
+            break;
+        case 0x3FF6:
+            bank[1] = data & 0x11;
+            if (data & 0x10) { bank[2] = 0; bank[3] = 0; }   /* SRAM locked off */
+            break;
+        case 0x3FF7: {
+            uint8_t nb = data & 0x03;
+            if (nb != bank[0]) {
+                bank[0] = nb;
+                if (paged) {
+                    cart_page_refill(msx, slot_idx, 0, nb * 2u);
+                    cart_page_refill(msx, slot_idx, 1, nb * 2u + 1u);
+                }
+            }
+            break;
+        }
+        default:
+            if (rel < 0x1FFE && fmpac_sram_on(bank) && msx->fmpac_sram)
+                msx->fmpac_sram[rel] = data;
+            break;
+        }
+        break;
+    }
+    case MSX_MAPPER_RTYPE:
+        if (addr >= 0x4000 && addr < 0x8000) {
+            uint8_t blk = data & ((data & 0x10) ? 0x17 : 0x1F);
+            bank[2] = (uint8_t)(blk * 2u);
+            bank[3] = (uint8_t)(blk * 2u + 1u);
+            if (paged) {
+                cart_page_refill(msx, slot_idx, 2, bank[2]);
+                cart_page_refill(msx, slot_idx, 3, bank[3]);
+            }
+        }
+        break;
     default:
         break;
     }
@@ -598,6 +869,18 @@ uint8_t msx_mem_read(void *userdata, uint16_t addr) {
         return cart_read(msx, 0, addr);
     }
     case 2: /* Cartridge slot 2 */
+        if (msx->cart_size[1] == 0) {
+            /* Empty slot 2: answer like an MSX-MUSIC ROM's ID string
+             * ("APRLOPLL" at 0x4018 — 0x401C "OPLL" is what most titles
+             * check) when the built-in YM2413 is on; no "AB" header, so
+             * the BIOS doesn't try to boot it. */
+            /* Hidden when slot 1 holds a real FM-PAC: its ROM looks for
+             * an "APRLOPLL" elsewhere and would defer to it. */
+            if (msx->fm_id && msx->fm_enabled && msx->opll && (uint16_t)(addr - 0x4018u) < 8u &&
+                msx->cart_type[0] != MSX_MAPPER_FMPAC)
+                return (uint8_t)"APRLOPLL"[addr - 0x4018u];
+            return 0xFF;
+        }
         return cart_read(msx, 1, addr);
     case 3: /* RAM */
         return msx->ram[addr];
@@ -625,10 +908,12 @@ void msx_mem_write(void *userdata, uint16_t addr, uint8_t data) {
             break;
         }
         cart_mapper_write(msx, 0, addr, data);
+        msx_rmap_update(msx);   /* bank / SRAM / SCC enable may have changed */
         break;
 
     case 2:
         cart_mapper_write(msx, 1, addr, data);
+        msx_rmap_update(msx);
         break;
 
     case 3:
@@ -683,6 +968,166 @@ uint8_t msx_port_read(z80 *cpu, uint8_t port) {
     }
 }
 
+/* -----------------------------------------------------------------------
+ * YM2413 on core1 (Pico 2) — 2026-11-12
+ *
+ * Inline on core0, emu2413 cost ~30% of a frame (real hardware: busy
+ * 90% -> 121%, 60 -> 49 FPS, and the audio underran — heard as crackle).
+ * Core0 now only logs each register write with its sample position in
+ * the frame; at frame end the log is handed to core1, which renders that
+ * frame's FM samples while core0 emulates the next frame. Core0 mixes
+ * them in one frame later, so the whole audio output (PSG/SCC too) is
+ * delayed by one frame (~17ms) to stay in step.
+ *
+ * Flash safety: MicroPython's own flash writes only lock out core1 when
+ * it runs a _thread (rp2_flash.c use_multicore_lockout()), so core1 idles
+ * in a RAM-resident loop and leaves it only for a job; msx_fm_sync()
+ * (called before the runtime menu, reset, save/load) waits for the
+ * current job to finish. cart_xip.c's own flash writes lock core1 out
+ * explicitly (it registers as a lockout victim).
+ * ----------------------------------------------------------------------- */
+#if MSX_FM_ON_CORE1
+typedef struct { uint16_t pos; uint8_t reg; uint8_t val; } fm_wr_t;
+#define FM_LOG_MAX 256
+static fm_wr_t  fm_log[2][FM_LOG_MAX];
+static uint16_t fm_log_n[2];
+static uint8_t  fm_log_cur;                 /* core0 appends to fm_log[fm_log_cur] */
+static int16_t  fm_out[MSX_AUDIO_BUF_SIZE]; /* core1 output, then core0 mix target */
+static int16_t  audio_prev[MSX_AUDIO_BUF_SIZE];
+static uint32_t audio_prev_n;
+static volatile uint32_t fm_job_seq, fm_done_seq;
+static uint32_t fm_job_n;
+static uint8_t  fm_job_log;
+static bool     fm_job_render, fm_prev_rendered;
+static OPLL    *fm_job_opll;
+static volatile uint32_t fm_log_overflow;
+static bool     fm_core1_running;
+/* 2026-11-12 diagnostics (msx.fm_stats()): cumulative core0 wait for core1
+ * at frame end, and core1 render time, in microseconds. */
+static uint32_t fm_wait_us_total;
+static volatile uint32_t fm_render_us_total;
+
+static void fm_core1_render(void) {
+    OPLL *o = fm_job_opll;
+    const fm_wr_t *log = fm_log[fm_job_log];
+    uint32_t n = fm_log_n[fm_job_log], k = 0;
+    for (uint32_t i = 0; i < fm_job_n; i++) {
+        while (k < n && log[k].pos <= i) { OPLL_writeReg(o, log[k].reg, log[k].val); k++; }
+        fm_out[i] = fm_job_render ? OPLL_calc(o) : 0;
+    }
+    while (k < n) { OPLL_writeReg(o, log[k].reg, log[k].val); k++; }
+}
+
+static void __not_in_flash_func(fm_core1_main)(void) {
+    multicore_lockout_victim_init();
+    for (;;) {
+        while (fm_job_seq == fm_done_seq) __wfe();   /* RAM-resident idle */
+        uint32_t t0 = time_us_32();
+        fm_core1_render();
+        fm_render_us_total += time_us_32() - t0;
+        __dmb();
+        fm_done_seq = fm_job_seq;
+        __sev();
+    }
+}
+
+void msx_fm_sync(void) {
+    if (!fm_core1_running) return;
+    /* A job takes well under one frame; 200ms means core1 is gone (e.g.
+     * reset by MicroPython's soft-reboot thread teardown) — stop using it
+     * rather than hang. */
+    uint32_t t0 = time_us_32();
+    while (fm_done_seq != fm_job_seq) {
+        if (time_us_32() - t0 > 200000u) { fm_core1_running = false; return; }
+        tight_loop_contents();
+    }
+}
+
+static void fm_core1_start(void) {
+    multicore_reset_core1();          /* also after a MicroPython soft reset */
+    fm_job_seq = fm_done_seq = 0;
+    fm_log_n[0] = fm_log_n[1] = 0;
+    fm_log_cur = 0;
+    audio_prev_n = 0;
+    fm_prev_rendered = false;
+    /* Own stack, NOT multicore_launch_core1()'s default: this port's
+     * linker script gives SCRATCH_X (the SDK's core1 stack) 0 bytes and
+     * runs core0's stack across 0x2007F000-0x20082000, so the default
+     * core1 SP (end of SCRATCH_X = 0x20080000) lands in the middle of
+     * core0's stack — real hardware hung inside msx.init(). The render
+     * path is shallow (emu2413, no recursion); 1.5KB is ample. */
+    static uint32_t fm_core1_stack[384];
+    multicore_launch_core1_with_stack(fm_core1_main, fm_core1_stack, sizeof(fm_core1_stack));
+    fm_core1_running = true;
+}
+
+/* End of msx_run_frame(): finish the previous frame's audio (its PSG/SCC
+ * samples + core1's FM render of it) into msx->audio_buf, keep this
+ * frame's PSG/SCC for next time, and dispatch this frame's FM job. */
+static void fm_core1_frame_end(msx_state_t *msx) {
+    uint32_t n_cur = msx->audio_write_pos;
+    uint32_t tw = time_us_32();
+    msx_fm_sync();
+    fm_wait_us_total += time_us_32() - tw;
+    uint32_t n_prev = audio_prev_n;
+    int32_t gain = msx->fm_gain;
+    for (uint32_t i = 0; i < n_prev; i++) {
+        int32_t v = audio_prev[i];
+        if (fm_prev_rendered) v += ((int32_t)fm_out[i] * gain) >> 9;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        fm_out[i] = (int16_t)v;
+    }
+    memcpy(audio_prev, msx->audio_buf, n_cur * sizeof(int16_t));
+    audio_prev_n = n_cur;
+    memcpy(msx->audio_buf, fm_out, n_prev * sizeof(int16_t));
+    msx->audio_write_pos = n_prev;
+
+    fm_job_opll   = msx->opll;
+    fm_job_log    = fm_log_cur;
+    fm_job_n      = n_cur;
+    fm_job_render = msx->fm_active;
+    fm_prev_rendered = fm_job_render;
+    fm_log_cur ^= 1;
+    fm_log_n[fm_log_cur] = 0;
+    __dmb();
+    fm_job_seq++;
+    __sev();
+}
+
+uint32_t msx_fm_log_overflow(void) { return fm_log_overflow; }
+void msx_fm_stats(uint32_t *wait_us, uint32_t *render_us) {
+    *wait_us = fm_wait_us_total; *render_us = fm_render_us_total;
+}
+static void fm_log_drop_pending(void) { fm_log_n[fm_log_cur] = 0; }
+#else
+static void fm_log_drop_pending(void) {}
+void msx_fm_sync(void) {}
+uint32_t msx_fm_log_overflow(void) { return 0; }
+void msx_fm_stats(uint32_t *wait_us, uint32_t *render_us) { *wait_us = 0; *render_us = 0; }
+#endif
+
+/* YM2413 data write to register fm_addr — I/O port 0x7D, or an FM-PAC's
+ * memory-mapped 0x7FF5. */
+static void fm_write_data(msx_state_t *msx, uint8_t data) {
+    if (msx->fm_enabled && msx->opll && msx->fm_addr < 0x40) {
+#if MSX_FM_ON_CORE1
+        if (fm_core1_running) {
+            uint16_t n = fm_log_n[fm_log_cur];
+            if (n < FM_LOG_MAX) {
+                fm_log[fm_log_cur][n] = (fm_wr_t){ (uint16_t)msx->audio_write_pos,
+                                                    msx->fm_addr, data };
+                fm_log_n[fm_log_cur] = (uint16_t)(n + 1);
+            } else {
+                fm_log_overflow++;
+            }
+        } else
+#endif
+        OPLL_writeReg(msx->opll, msx->fm_addr, data);
+        msx->fm_active = true;
+    }
+}
+
 void msx_port_write(z80 *cpu, uint8_t port, uint8_t data) {
     msx_state_t *msx = (msx_state_t *)cpu;
 
@@ -713,9 +1158,18 @@ void msx_port_write(z80 *cpu, uint8_t port, uint8_t data) {
         PSG_writeIO(msx->psg, 1, data);
         break;
 
+    /* YM2413 (MSX-MUSIC) address / data */
+    case 0x7C:
+        msx->fm_addr = data;
+        break;
+    case 0x7D:
+        fm_write_data(msx, data);
+        break;
+
     /* PPI port A: slot select (2 bits per page) */
     case 0xA8:
         msx->slot_select = data;
+        msx_rmap_update(msx);
         break;
 
     /* PPI port C: keyboard row select (bits 3:0) + misc */
@@ -774,6 +1228,15 @@ static void audio_generate_scanline(msx_state_t *msx) {
             if (msx->scc_internal && (msx->scc_reg[0x0F] & 0x1F)) {
                 mix += (scc_render(msx) * (int32_t)msx->scc_gain) >> 8;
             }
+#if !MSX_FM_ON_CORE1
+            if (msx->fm_active) {
+                /* emu2413: one loud melody channel swings ~+-4000, about
+                 * twice a PSG channel (+-2040 after DC removal), so the
+                 * default gain (256) halves it. (Pico 2: same mix, done on
+                 * core1's output in fm_core1_frame_end().) */
+                mix += ((int32_t)OPLL_calc(msx->opll) * (int32_t)msx->fm_gain) >> 9;
+            }
+#endif
             if (mix > 32767) mix = 32767;
             if (mix < -32768) mix = -32768;
             msx->audio_buf[msx->audio_write_pos++] = (int16_t)mix;
@@ -821,6 +1284,21 @@ void msx_init(msx_state_t *msx) {
      * roughly an octave too high. */
     msx->psg = PSG_new(MSX_CLOCK_HZ / 2, MSX_AUDIO_RATE);
     PSG_setVolumeMode(msx->psg, 1);  /* YM2149 volume table */
+
+    /* YM2413 (~3.4KB). Static storage, NOT the C heap: a first try with
+     * OPLL_new() at boot left the 64KB C heap without the contiguous 32KB
+     * msx_cart_alloc() needs for small carts (real hardware: "cart_alloc
+     * failed" swapping to ANTADV.ROM). Runs internally at clk/72
+     * (~49.7kHz), sampled at MSX_AUDIO_RATE (no rate converter — see
+     * emu2413.c's local-changes note). */
+    static OPLL s_opll;
+#if MSX_FM_ON_CORE1
+    fm_core1_start();                 /* resets core1 first: it may hold s_opll */
+#endif
+    OPLL_init(&s_opll, MSX_CLOCK_HZ, MSX_AUDIO_RATE);
+    msx->opll = &s_opll;
+    msx->fm_enabled = true;
+    msx->fm_gain    = 256;
     /* quality=1 (emu2149's oversampling rate converter) was tried to
      * reduce aliasing, but its ~20 update_output() calls per PSG_calc()
      * (vs 1 at quality=0) measurably slowed msx_run_frame(), which — since
@@ -919,10 +1397,9 @@ bool msx_load_cart(msx_state_t *msx, uint8_t slot, const uint8_t *data,
                             : mapper;
 
     /* Initialize bank registers: page 0 maps to ROM page 0, etc. */
-    msx->cart_bank[slot][0] = 0;
-    msx->cart_bank[slot][1] = 1;
-    msx->cart_bank[slot][2] = 2;
-    msx->cart_bank[slot][3] = 3;
+    cart_default_banks(msx, slot);
+    fmpac_prepare(msx, slot);
+    msx_rmap_update(msx);
 
     return true;
 }
@@ -979,6 +1456,18 @@ uint8_t *msx_cart_alloc(msx_state_t *msx, uint8_t slot, uint32_t size) {
     return msx->cart[slot];
 }
 
+uint8_t *msx_cart_alloc_exact(msx_state_t *msx, uint8_t slot, uint32_t size) {
+    if (!msx->initialized || slot > 1 || size == 0 || size > MSX_CART_INRAM_MAX) return NULL;
+    msx_eject_cart(msx, slot);
+    free(msx->cart_cache[slot]);
+    msx->cart_cache[slot] = NULL;
+    msx->cart[slot] = (uint8_t *)malloc(size);
+    if (!msx->cart[slot]) return NULL;
+    msx->cart_alloc_cap[slot] = size;
+    msx->cart_size[slot] = size;
+    return msx->cart[slot];
+}
+
 bool msx_cart_finalize(msx_state_t *msx, uint8_t slot, uint8_t mapper) {
     if (!msx->initialized || slot > 1 || !msx->cart[slot]) return false;
     uint32_t size = msx->cart_size[slot];
@@ -987,10 +1476,9 @@ bool msx_cart_finalize(msx_state_t *msx, uint8_t slot, uint8_t mapper) {
                             ? detect_mapper(msx->cart[slot], size)
                             : mapper;
 
-    msx->cart_bank[slot][0] = 0;
-    msx->cart_bank[slot][1] = 1;
-    msx->cart_bank[slot][2] = 2;
-    msx->cart_bank[slot][3] = 3;
+    cart_default_banks(msx, slot);
+    fmpac_prepare(msx, slot);
+    msx_rmap_update(msx);
 
     return true;
 }
@@ -1038,16 +1526,15 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
     /* Same initial bank state as msx_load_cart(): page N maps to ROM
      * page N. Force an initial synchronous fetch for all 4 windows so
      * the cache holds valid data before the CPU executes anything. */
-    msx->cart_bank[slot][0] = 0;
-    msx->cart_bank[slot][1] = 1;
-    msx->cart_bank[slot][2] = 2;
-    msx->cart_bank[slot][3] = 3;
+    cart_default_banks(msx, slot);
+    fmpac_prepare(msx, slot);
 
     cart_reset_page_state(msx, slot);
     for (uint8_t win = 0; win < 4; win++) {
         msx->cart_win[slot][win] = &msx->cart_cache[slot][(uint32_t)win * MSX_CART_PAGE_SIZE];
-        cart_page_refill(msx, slot, win, win);
     }
+    cart_refill_all(msx, slot);
+    msx_rmap_update(msx);
 
     return true;
 }
@@ -1066,10 +1553,12 @@ bool msx_load_cart_xip(msx_state_t *msx, uint8_t slot, const uint8_t *rom,
     msx->cart_xip[slot]   = rom;
     msx->cart_size[slot]  = total_size;
     msx->cart_type[slot]  = mapper;
-    for (uint8_t win = 0; win < 4; win++) msx->cart_bank[slot][win] = win;
+    cart_default_banks(msx, slot);
+    fmpac_prepare(msx, slot);
 
     cart_reset_page_state(msx, slot);
-    for (uint8_t win = 0; win < 4; win++) cart_page_refill(msx, slot, win, win);
+    cart_refill_all(msx, slot);
+    msx_rmap_update(msx);
     return true;
 }
 
@@ -1109,8 +1598,10 @@ void msx_eject_cart(msx_state_t *msx, uint8_t slot) {
     msx->cart_xip[slot] = NULL;     /* flash-resident, never free()'d */
     msx->cart_size[slot] = 0;
     msx->cart_type[slot] = MSX_MAPPER_PLAIN;
+    fmpac_prepare(msx, slot);           /* frees the FM-PAC SRAM if unused now */
     memset(msx->cart_bank[slot], 0, sizeof(msx->cart_bank[slot]));
     cart_reset_page_state(msx, slot);
+    msx_rmap_update(msx);
     // 2026-10-05 TRIED AND REVERTED: briefly force-freed cart_cache[slot]
     // here too, to test whether a real-hardware core1 (DVI) crash on
     // paged Mega ROM loads was specific to the reuse path (vs. a fresh
@@ -1160,13 +1651,20 @@ void msx_reset(msx_state_t *msx) {
      * window) — real cartridges reset their selectors on /RESET too. Left
      * as-is for the other mappers to keep their existing behavior. */
     for (uint8_t sl = 0; sl < 2; sl++) {
-        if (msx->cart_type[sl] != MSX_MAPPER_KONAMI_SCC) continue;
-        for (uint8_t w = 0; w < 4; w++) {
-            msx->cart_bank[sl][w] = w;
-            if (msx->cart_paged[sl]) cart_page_refill(msx, sl, w, w);
-        }
+        if (msx->cart_type[sl] != MSX_MAPPER_KONAMI_SCC &&
+            msx->cart_type[sl] != MSX_MAPPER_RTYPE &&
+            msx->cart_type[sl] != MSX_MAPPER_FMPAC) continue;
+        cart_default_banks(msx, sl);
+        cart_refill_all(msx, sl);
     }
     scc_reset(msx);
+
+    msx_fm_sync();
+    fm_log_drop_pending();            /* drop writes logged before the reset */
+    if (msx->opll) OPLL_reset(msx->opll);
+    msx->fm_active = false;
+    msx->fm_addr   = 0;
+    msx_rmap_update(msx);
 }
 
 /* -----------------------------------------------------------------------
@@ -1189,6 +1687,9 @@ uint32_t msx_run_frame(msx_state_t *msx) {
     if (!msx->initialized || !msx->bios_loaded) return 0;
 
     msx->audio_write_pos = 0;  /* reset per-frame audio buffer */
+    /* Safety net for state changed from Python between frames (cart
+     * load/eject, msx.slot_select poke, FDC enable, state load). */
+    msx_rmap_update(msx);
 
     /* Render into the buffer NOT currently exposed to the display/render
      * functions, so a concurrent DMA transfer of the previous frame can't
@@ -1221,6 +1722,9 @@ uint32_t msx_run_frame(msx_state_t *msx) {
 
     msx->frame_tcycles = (uint32_t)msx->cpu.cyc;
     msx->framebuf_ready_idx = 1 - msx->framebuf_ready_idx;  /* publish this frame */
+#if MSX_FM_ON_CORE1
+    if (fm_core1_running) fm_core1_frame_end(msx);
+#endif
     return msx->audio_write_pos;
 }
 
@@ -2236,6 +2740,7 @@ void msx_destroy(msx_state_t *msx) {
     }
     if (msx->vdp) { vrEmuTms9918Destroy(msx->vdp); msx->vdp = NULL; }
     if (msx->psg) { PSG_delete(msx->psg); msx->psg = NULL; }
+    msx->opll = NULL;   /* static storage (see msx_init()), nothing to free */
     msx->initialized = false;
 }
 
@@ -2367,6 +2872,8 @@ bool msx_load_state_header(msx_state_t *msx, const void *buf, size_t buf_size) {
 
     /* Mapper banks */
     memcpy(msx->cart_bank, s->cart_bank, sizeof(msx->cart_bank));
+    for (uint8_t sl = 0; sl < 2; sl++) cart_refill_all(msx, sl);
+    msx_rmap_update(msx);
 
     /* VDP — soft-reset, then restore R0-R7 via the hardware protocol:
      * send value byte first, then (0x80 | reg_num) to commit.

@@ -736,6 +736,10 @@ static mp_obj_t ui_save_state_to(mp_obj_t msx_module_obj, mp_obj_t path_obj) {
         uint8_t scc[MSX_SCC_STATE_SZ];
         msx_scc_state_save(msx, scc);
         ui_write_chunked_c(f, scc, sizeof(scc));
+        /* 2026-11-12: YM2413 trailer, after the SCC one. */
+        uint8_t fm[MSX_FM_STATE_SZ];
+        msx_fm_state_save(msx, fm);
+        ui_write_chunked_c(f, fm, sizeof(fm));
         nlr_pop();
     } else {
         mp_stream_close(f);
@@ -769,6 +773,9 @@ static mp_obj_t ui_load_state_from(mp_obj_t msx_module_obj, mp_obj_t path_obj) {
                 uint8_t scc[MSX_SCC_STATE_SZ];
                 mp_uint_t n_scc = ui_readinto_chunked_c(f, scc, sizeof(scc));
                 msx_scc_state_load(msx, scc, (uint32_t)n_scc);
+                uint8_t fm[MSX_FM_STATE_SZ];
+                mp_uint_t n_fm = ui_readinto_chunked_c(f, fm, sizeof(fm));
+                msx_fm_state_load(msx, fm, (uint32_t)n_fm);
             }
         }
         nlr_pop();
@@ -1342,6 +1349,46 @@ static void ui_copy_to_flash_cache(mp_obj_t src_path_obj, mp_int_t size) {
  * The SD file is copied directly into the flash region (no LittleFS
  * cache file in between) and skipped entirely when the region already
  * holds this exact path+size. */
+static const char *ui_mapper_name(uint8_t mapper) {
+    switch (mapper) {
+        case MSX_MAPPER_PLAIN:      return "PLAIN";
+        case MSX_MAPPER_ASCII8:     return "ASCII8";
+        case MSX_MAPPER_ASCII16:    return "ASCII16";
+        case MSX_MAPPER_KONAMI:     return "KONAMI";
+        case MSX_MAPPER_KONAMI_SCC: return "KONAMI_SCC";
+        case MSX_MAPPER_RTYPE:      return "RTYPE";
+        case MSX_MAPPER_FMPAC:      return "FMPAC";
+        default:                    return "?";
+    }
+}
+
+/* Reads ROM sector `index` (4KB) of path_obj into buf. 2026-11-12: on an
+ * OSError (the SD driver has already retried the block read 3 times
+ * itself), reopens the file and seeks back to the sector, up to 3 more
+ * times, logging the offset — real hardware hit a persistent EIO midway
+ * through copying R-Type.rom. Re-raises if every attempt fails. Returns
+ * the byte count read (< 4096 only at end of file). *fp is replaced when
+ * the file had to be reopened. */
+static mp_uint_t ui_xip_read_sector(mp_obj_t *fp, mp_obj_t path_obj, uint32_t index, uint8_t *buf) {
+    for (int attempt = 0; ; attempt++) {
+        nlr_buf_t nlr;
+        if (nlr_push(&nlr) == 0) {
+            mp_uint_t n = ui_readinto_chunked_c(*fp, buf, 4096);
+            nlr_pop();
+            return n;
+        }
+        mp_printf(&mp_plat_print, "XIP: read error at offset 0x%x (attempt %d)\n",
+                  (unsigned)(index * 4096u), attempt + 1);
+        if (attempt >= 3) nlr_jump(nlr.ret_val);
+        mp_hal_delay_ms(50);
+        mp_stream_close(*fp);
+        *fp = ui_open_file(path_obj, MP_QSTR_rb);
+        int err = 0;
+        mp_stream_seek(*fp, (mp_off_t)index * 4096, MP_SEEK_SET, &err);
+        if (err) mp_raise_OSError(err);
+    }
+}
+
 static bool ui_load_cart_xip(msx_state_t *msx, mp_int_t slot, mp_obj_t path_obj, mp_int_t size) {
     uint32_t cap = cart_xip_capacity();
     if (cap == 0 || size <= 0 || (uint32_t)size > cap) return false;
@@ -1359,7 +1406,7 @@ static bool ui_load_cart_xip(msx_state_t *msx, mp_int_t slot, mp_obj_t path_obj,
         if (nlr_push(&nlr) == 0) {
             uint32_t sectors = ((uint32_t)size + 4095u) / 4096u;
             for (uint32_t i = 0; i < sectors; i++) {
-                mp_uint_t n = ui_readinto_chunked_c(f, buf, 4096);
+                mp_uint_t n = ui_xip_read_sector(&f, path_obj, i, buf);
                 if (n < 4096) memset(buf + n, 0xFF, 4096 - n);
                 if (n == 0 || !cart_xip_write_sector(i, buf)) {
                     mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("XIP copy failed"));
@@ -1368,18 +1415,33 @@ static bool ui_load_cart_xip(msx_state_t *msx, mp_int_t slot, mp_obj_t path_obj,
             nlr_pop();
         } else {
             mp_stream_close(f);
+            usb_host_core_force_reconnect();   /* see below */
             nlr_jump(nlr.ret_val);
         }
         mp_stream_close(f);
         rom = cart_xip_commit(path_s, path_len, (uint32_t)size, buf);
+        /* The copy kept interrupts off ~45ms per sector — revive a
+         * PIO-USB keyboard (esp. behind a hub) that suspended meanwhile. */
+        usb_host_core_force_reconnect();
         if (rom == NULL) return false;
     }
 
     /* Same mapper detection as the paged path below (same 4KB prefix,
      * KONAMI fallback) — just read straight from flash, no buffer. */
-    uint8_t mapper = msx_detect_mapper(rom, (uint32_t)(size < UI_PREFIX_BUF_SIZE ? size : UI_PREFIX_BUF_SIZE));
+    uint8_t mapper = msx_detect_mapper_full(rom, (uint32_t)size, UI_PREFIX_BUF_SIZE);
     if (mapper == MSX_MAPPER_PLAIN) mapper = MSX_MAPPER_KONAMI;
-    mp_printf(&mp_plat_print, "MAPPER DIAG: %s -> %d (XIP)\n", path_s, (int)mapper);
+    mp_printf(&mp_plat_print, "MAPPER DIAG: %s -> %s (XIP)\n", path_s, ui_mapper_name(mapper));
+    {
+        /* 2026-11-12 diagnostic: CRC32 of the flash-resident image, to
+         * compare against the file on a PC (a bad copy would otherwise be
+         * reused silently on every later load). ~10ms for 512KB. */
+        uint32_t crc = 0xFFFFFFFFu;
+        for (mp_int_t i = 0; i < size; i++) {
+            crc ^= rom[i];
+            for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+        mp_printf(&mp_plat_print, "XIP: crc32=%08x size=%d\n", (unsigned)~crc, (int)size);
+    }
     return msx_load_cart_xip(msx, (uint8_t)slot, rom, (uint32_t)size, mapper);
 }
 
@@ -1434,6 +1496,7 @@ static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, m
 
     if (!ui_flash_cache_valid(path_obj, size)) {
         ui_copy_to_flash_cache(path_obj, size);
+        usb_host_core_force_reconnect();   /* see ui_load_cart_xip() */
     }
 
     mp_obj_t f = ui_open_file(ui_str(UI_FLASH_CACHE_PATH), MP_QSTR_rb);
@@ -1462,14 +1525,7 @@ static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, m
             }
         }
 
-        const char *mapper_name = "?";
-        switch (mapper) {
-            case MSX_MAPPER_PLAIN:   mapper_name = "PLAIN";   break;
-            case MSX_MAPPER_ASCII8:  mapper_name = "ASCII8";  break;
-            case MSX_MAPPER_ASCII16: mapper_name = "ASCII16"; break;
-            case MSX_MAPPER_KONAMI:  mapper_name = "KONAMI";  break;
-            case MSX_MAPPER_KONAMI_SCC: mapper_name = "KONAMI_SCC"; break;
-        }
+        const char *mapper_name = ui_mapper_name(mapper);
         mp_printf(&mp_plat_print, "MAPPER DIAG: %s -> %s\n", mp_obj_str_get_str(path_obj), mapper_name);
 
         mp_obj_t call_args[4] = { slot_obj, f, mp_obj_new_int(size), mp_obj_new_int(mapper) };
@@ -1490,6 +1546,44 @@ static mp_obj_t ui_load_cart_smart(mp_obj_t msx_module_obj, mp_obj_t slot_obj, m
     return mp_obj_new_bool(ok);
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(ui_load_cart_smart_obj, ui_load_cart_smart);
+
+/* load_fm_rom(path) -> str — 2026-11-12, msx.ini fm_rom=. Puts the FM-BIOS
+ * (first 16KB of the file) into cart slot 2, so MSX-MUSIC software that
+ * calls the BIOS (e.g. R-Type: INIOPL at 0x4113) finds real code. Accepts
+ * an FM-PAC image ("PAC2OPLL" at 0x18 — its bank 0 holds the whole
+ * FM-BIOS; the other banks are only the _FMPAC menu) or a 16KB MSX-MUSIC
+ * ROM ("APRLOPLL"). Returns the mapper name; raises on a bad file or a
+ * failed 16KB C-heap allocation (slot 2 is then left empty). */
+static mp_obj_t ui_load_fm_rom(mp_obj_t path_obj) {
+    msx_state_t *msx = msx_get_state();
+    const uint32_t size = 0x4000;
+    uint8_t *buf = msx_cart_alloc_exact(msx, 1, size);
+    if (!buf) mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("fm_rom: 16KB C heap alloc failed"));
+    mp_obj_t f = ui_open_file(path_obj, MP_QSTR_rb);
+    mp_uint_t n = 0;
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        n = ui_readinto_chunked_c(f, buf, size);
+        nlr_pop();
+    } else {
+        mp_stream_close(f);
+        msx_eject_cart(msx, 1);
+        nlr_jump(nlr.ret_val);
+    }
+    mp_stream_close(f);
+    uint8_t mapper;
+    if (n == size && memcmp(buf + 0x18, "PAC2OPLL", 8) == 0) {
+        mapper = MSX_MAPPER_FMPAC;
+    } else if (n == size && memcmp(buf + 0x18, "APRLOPLL", 8) == 0) {
+        mapper = MSX_MAPPER_PLAIN;
+    } else {
+        msx_eject_cart(msx, 1);
+        mp_raise_ValueError(MP_ERROR_TEXT("fm_rom: not an FM-PAC / MSX-MUSIC ROM"));
+    }
+    msx_cart_finalize(msx, 1, mapper);
+    return MP_OBJ_NEW_QSTR(qstr_from_str(ui_mapper_name(mapper)));
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(ui_load_fm_rom_obj, ui_load_fm_rom);
 
 /* ---------------------------------------------------------------------
  * Module table
@@ -1543,6 +1637,7 @@ static const mp_rom_map_elem_t msx_ui_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_save_config),        MP_ROM_PTR(&ui_save_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_rom_load_buf),   MP_ROM_PTR(&ui_get_rom_load_buf_obj) },
     { MP_ROM_QSTR(MP_QSTR_load_cart_smart),    MP_ROM_PTR(&ui_load_cart_smart_obj) },
+    { MP_ROM_QSTR(MP_QSTR_load_fm_rom),        MP_ROM_PTR(&ui_load_fm_rom_obj) },
 };
 static MP_DEFINE_CONST_DICT(msx_ui_module_globals, msx_ui_module_globals_table);
 

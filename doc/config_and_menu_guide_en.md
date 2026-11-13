@@ -96,7 +96,10 @@ hdmi_baud=8000000
 | `scc` | `on` | Set to `off` to disable the built-in SCC synthesis (a KONAMI SCC cartridge's SCC part then stays silent) |
 | `scc_volume` | `256` | Built-in SCC level (0-1024). 256 = 1:1 with the PSG |
 | `psg_volume` | `256` | PSG level (0-1024). 256 = unchanged, `0` = mute (e.g. to listen to the SCC alone) |
-| `scc_out` | (none) | `SCK,MOSI,CS[,BAUD]` (GPIO numbers): forwards SCC register writes to an external SCC slave board (see "4.2 Output to an External SCC Board" below; **not yet verified on real hardware**). Can be used together with the built-in SCC |
+| `fm` | `on` | Set to `off` to disable the built-in FM sound (YM2413, MSX-MUSIC) |
+| `fm_volume` | `256` | FM level (0-1024) |
+| `fm_rom` | (none) | Path to an FM-BIOS: an FM-PAC image (`fmpac.rom`, only its first 16KB is used) or a 16KB MSX-MUSIC ROM, placed in cart slot 2 (uses 16KB of C heap). See "4.2 FM Sound" below |
+| `fm_id` | `off` | `on` makes an empty slot 2 answer just the `"APRLOPLL"` ID (no BIOS behind it). Software that calls the FM-BIOS (R-Type etc.) hangs with it, so it's off by default |
 | `ext` | (none) | Set to `off` to skip loading `/sd/msx/ext/` and `/ext/` extension modules. Use this to fully avoid the subroutine hook mechanism's small overhead (see below) for a `cart`-mode session that doesn't use any extension. `mode=disk`'s own DSKCHG hook (required for FDD disk-swap detection) is unaffected by this setting |
 
 Under `mode=disk`, the runtime menu shows "Swap Disk" in place of "Swap Cartridge", for hot-swapping the mounted `.DSK` image (the DSKCHG hook in `mp/msx_fdd.py` lets MSX-DOS/Disk BASIC notice the new disk on its own — no reset needed). Verified on real hardware: Disk BASIC SAVE/LOAD, and a full MSX-DOS boot (MSXDOS.SYS/COMMAND.COM load, both disk sides). Single drive, standard 3.5" DD (360KB/720KB) geometry only.
@@ -113,7 +116,7 @@ The formerly-existing `hdmi` (separate HDMI on/off) and `boot_exclusive` keys, a
 
 Bank-switched cartridges of 128KB or larger ("Mega ROM") are **copied once to the Pico 2's onboard flash** before being played — never read directly from SD during gameplay (`load_cart_smart()` in `src/modmsx_ui.c`).
 
-- Supported mappers: ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC. Auto-detected from the ROM's leading content.
+- Supported mappers: ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC / R-Type / FM-PAC. Auto-detected from the ROM's content (R-Type only when loaded via XIP; FM-PAC from `"PAC2OPLL"` at 0x18).
 - **XIP mode (Pico 2, since 2026-11-10)**: the ROM is written to the free flash area between the end of the firmware image and the filesystem (~0.5MB), and the Z80 reads it straight from flash. A bank switch just repoints a window, with no copy and no RAM cost, so bank-switch-heavy games run as fast as regular cartridges (real hardware: NEMESIS2.ROM went from ~28-53 FPS to a steady 59.8 FPS).
   - Only on first selection, the file is copied from SD to flash, taking a few seconds (`XIP: copying ...` on the serial console). Re-selecting the same ROM skips the copy.
   - Only one ROM is held; switching to a different Mega ROM overwrites it. If a firmware update changes the image size, the ROM is rewritten on the next load, for safety.
@@ -131,9 +134,21 @@ For KONAMI SCC mapper cartridges (Nemesis 2 etc.), the SCC (K051649) is synthesi
 - Save states include the SCC state (saves from before 2026-11-09 still load; the SCC then starts silent).
 - The deformation register (0x98E0-) and SCC+ (the SNATCHER-style sound cartridge) are not supported.
 
-### 4.2 Output to an External SCC Board (not yet verified on real hardware)
+### 4.2 FM Sound (YM2413, MSX-MUSIC)
 
-Setting `scc_out=SCK,MOSI,CS` forwards SCC writes to a board (RP2040-Zero etc.) flashed with PicoChiptuneOrchestra's `slave_scc.uf2`, over a write-only SPI link (mode 1, ~3MHz, software-driven GPIOs) on any 3 free GPIOs (pick pins `mp/board_config.py` doesn't use). The slave has its own PWM audio output, so it has to be mixed with this board's audio in analog. It is muted while the runtime menu is open.
+The YM2413 is synthesized inside the emulator (emu2413) and mixed into the same PWM audio output as the PSG and SCC (`msx.ini`'s `fm=` / `fm_volume=`). It is driven by writes to ports 0x7C/0x7D and to the FM-PAC's memory-mapped 0x7FF4/0x7FF5. On Pico 2 it renders on core1, so it adds almost nothing to core0's load.
+
+Most software only plays FM music once it detects MSX-MUSIC. That needs one of:
+
+- **`fm_rom=/sd/msx/fmpac.rom` (recommended)**: puts the FM-BIOS in slot 2. Software that calls the FM-BIOS (R-Type etc.) plays FM too.
+- **`fm_id=on`**: an empty slot 2 answers just the ID. For software that writes the ports itself; software that calls the BIOS hangs.
+
+With neither set, software sees no MSX-MUSIC and plays its PSG/SCC music.
+
+**FM-PAC cartridge**: selecting an FM-PAC image (64KB) as the cartridge makes BASIC's `_FMPAC` open the FM-PAC menu. Its 8KB SRAM lives in RAM only; saving it to the SD card isn't supported yet.
+
+- Save states include the FM registers (saves from before 2026-11-12 still load; FM then starts silent).
+- Output to an external SCC board (`scc_out=`) was removed on 2026-11-12.
 
 ---
 

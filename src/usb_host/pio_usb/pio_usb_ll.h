@@ -134,15 +134,19 @@ void pio_usb_bus_prepare_receive(const pio_port_t *pp);
 int pio_usb_bus_receive_packet_and_handshake(pio_port_t *pp, uint8_t handshake);
 void pio_usb_bus_usb_transfer(pio_port_t *pp, uint8_t *data,
                               uint16_t len);
+// Transmit the last packet before an expected reply and release the receiver,
+// parked by the caller, at its EOP
+void pio_usb_bus_usb_transfer_arm_rx(pio_port_t *pp, uint8_t *data,
+                                     uint16_t len);
 
 uint8_t pio_usb_bus_wait_handshake(pio_port_t *pp);
-void pio_usb_bus_send_handshake(pio_port_t *pp, uint8_t pid);
+// An IN token is sent armed, like pio_usb_bus_usb_transfer_arm_rx()
 void pio_usb_bus_send_token(pio_port_t *pp, uint8_t token, uint8_t addr,
                             uint8_t ep_num);
 
 static __always_inline port_pin_status_t
 pio_usb_bus_get_line_state(root_port_t *root) {
-#ifdef PICO_RP2350
+#if defined(PICO_RP2350) && PICO_RP2350
   // RP2350-E9 Errata affect up to rev A2/B0
   // workaround: disable input enable (to drain leaked current), then enable it immediately before reading
   // Avoid rp2350_chip_version()/gpio_set_input_enabled() to make sure this is in SRAM

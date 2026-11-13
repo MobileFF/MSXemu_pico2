@@ -53,7 +53,7 @@ Z80 CPUをリセットする（PC=0から実行開始）。BIOS/カートリッ�
 カートリッジROM全体をヒープにコピーしてロードする（フルRAMロード、32KB程度までの小容量カートリッジ向け）。
 
 - `slot`: 0 = カートリッジスロット1、1 = カートリッジスロット2
-- `mapper`: `msx.MAPPER_PLAIN`（0、デフォルト、32KB超なら自動判定）/ `msx.MAPPER_ASCII8`（1）/ `msx.MAPPER_ASCII16`（2）/ `msx.MAPPER_KONAMI`（3）/ `msx.MAPPER_KONAMI_SCC`（4）
+- `mapper`: `msx.MAPPER_PLAIN`（0、デフォルト、32KB超なら自動判定）/ `msx.MAPPER_ASCII8`（1）/ `msx.MAPPER_ASCII16`（2）/ `msx.MAPPER_KONAMI`（3）/ `msx.MAPPER_KONAMI_SCC`（4）/ `msx.MAPPER_RTYPE`（5）/ `msx.MAPPER_FMPAC`（6）
 
 ### `msx.load_cart_paged(slot: int, file_obj, size: int, mapper: int) -> bool`
 
@@ -263,9 +263,17 @@ PSGの音量を設定する。0〜1024、256で従来どおり、0でミュー�
 
 内蔵SCC音源の有効/無効と、PSGに対する音量（256で1:1、0〜1024）を設定する。`msx.ini` の `scc=` / `scc_volume=` に対応。
 
-### `msx.scc_out_init(sck: int, mosi: int, cs: int, baud: int = 0) -> bool` / `msx.scc_out_deinit()` / `msx.scc_out_mute(mute: bool)`
+### `msx.set_fm(enable: bool, gain: int = 256)`
 
-外部のSCCスレーブ基板（PicoChiptuneOrchestra の `slave_scc.uf2`）への送信を開始/停止/一時消音する（実機未確認）。`baud` 0で約3MHz。開始時に現在のSCCの状態を送り直す。`msx.ini` の `scc_out=` に対応。
+内蔵FM音源（YM2413）の有効/無効と音量（256が既定、0〜1024）を設定する。`msx.ini` の `fm=` / `fm_volume=` に対応。
+
+### `msx.set_fm_id(enable: bool)`
+
+空のスロット2が `"APRLOPLL"` のIDを返すかどうか（既定 False）。`msx.ini` の `fm_id=` に対応。BIOSは無いので、FM-BIOSを呼ぶソフトには `msx_ui.load_fm_rom(path)`（`fm_rom=`、FM-BIOSの16KBをスロット2に読み込み、マッパー名を返す）を使う。
+
+### `msx.fm_sync()` / `msx.fm_stats() -> (wait_us, render_us, log_overflow)`
+
+Pico 2でcore1が合成中のFM音源の処理が終わるまで待つ（フラッシュに書き込む前などに呼ぶ）。`fm_stats()` はcore0がcore1を待った時間・core1の合成時間（いずれも累計µs）と、書き込み記録のあふれ回数を返す（PiZeroでは0）。
 
 ### `msx.get_audio_clip_count() -> int`
 
@@ -313,7 +321,7 @@ def load_state_from(path):
 
 大きな一時バッファを一切確保しない設計になっている点が重要（`dev_guide.md` 参照）。
 
-実際のランタイムメニューのセーブ（`src/modmsx_ui.c` の `save_state_to()`）は、VRAMの後ろにSCCの状態（149バイト、先頭 `"SCC1"`）を追加で書く。ロード時にこの追加ブロックが無ければ（古いセーブ）、SCCは無音から始まる。
+実際のランタイムメニューのセーブ（`src/modmsx_ui.c` の `save_state_to()`）は、VRAMの後ろにSCCの状態（149バイト、先頭 `"SCC1"`）とFM音源のレジスタ（69バイト、先頭 `"OPL1"`）を追加で書く。ロード時にこれらの追加ブロックが無ければ（古いセーブ）、SCC/FMは無音から始まる。
 
 ---
 
@@ -380,6 +388,8 @@ PPI ポートA相当のスロット選択レジスタを直接読み書きする
 | `msx.MAPPER_ASCII16` | 2 | ASCII-16方式（16KBページ×2ウィンドウ） |
 | `msx.MAPPER_KONAMI` | 3 | KONAMI方式（SCC無し、8KBページ×3可変ウィンドウ） |
 | `msx.MAPPER_KONAMI_SCC` | 4 | KONAMI SCC方式（8KBページ×4可変ウィンドウ、SCC付き） |
+| `msx.MAPPER_RTYPE` | 5 | R-Type方式（0x4000〜は16KBブロック0x17固定、0x8000〜を切替） |
+| `msx.MAPPER_FMPAC` | 6 | FM-PAC（16KBバンク、OPLL、8KB SRAM） |
 | `msx.SCREEN_W` | 256 | MSXネイティブ画面幅 |
 | `msx.SCREEN_H` | 192 | MSXネイティブ画面高さ |
 | `msx.KEY_ROWS` | 11 | キーボード行列の行数 |

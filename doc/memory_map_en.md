@@ -45,7 +45,12 @@ A non-bank-switched cartridge (`MSX_MAPPER_PLAIN`) just maps the ROM linearly st
 - **KONAMI** (no SCC): window 0 is always fixed to ROM page 0 (not switchable). Only windows 1-3 can be switched.
 - **KONAMI SCC**: all 4 windows are switchable. While window 2's bank number has its low 6 bits at `0x3F`, the SCC registers appear at 0x9800-0x9FFF (repeating every 0x100 bytes: 0x00-0x7F waveforms, 0x80-0x89 frequencies, 0x8A-0x8E volumes, 0x8F key-on, 0xE0- deformation register).
 
+- **R-Type**: 0x4000-0x7FFF is fixed to 16KB block 0x17. Writes to 0x4000-0x7FFF select the 16KB block at 0x8000-0xBFFF.
+- **FM-PAC**: one 16KB bank at 0x4000-0x7FFF (0x7FF7, low 2 bits). 0x7FF4/0x7FF5 are the YM2413 address/data, 0x7FF6 enables the OPLL. Writing 0x4D/0x69 to 0x5FFE/0x5FFF turns 0x4000-0x5FFD into 8KB of SRAM.
+
 See `cart_page_ptr()` (the read path) and `cart_mapper_write()` (bank-switch write detection) in `src/msx/msx_core.c`.
+
+**Z80 direct-read map (since 2026-11-13)**: the Z80 core (`rmap[8]`/`rlim[8]` in `z80.h`) holds one read pointer per 8KB page and reads plain ROM/RAM directly, without going through `msx_mem_read()`. Cart registers, SRAM, the SCC window, the FDC and empty slots have no pointer (or are cut short by `rlim`), so they still go through `msx_mem_read()`. `msx_rmap_update()` rebuilds the map on every slot-select write, cart-area write, load/eject/reset and state load, and at the start of every frame. Call it too after changing the memory map from outside.
 
 ### Caching in Paged (Mega ROM) Mode
 
@@ -157,7 +162,7 @@ typedef struct {
 | 50 | 8 | `cart_bank[2][4]` | Bank number per slot per window |
 | 58 | 6 | `_pad` | Reserved (padding to 80 bytes, unused) |
 
-Save file format (`save_state_to()` in `src/modmsx_ui.c`): a ~80.2KB binary consisting of the 64-byte header + 64KB RAM + 16KB VRAM + a 149-byte SCC state block (since 2026-11-09: `"SCC1"` + 128 waveform bytes + 16 registers + 1 deformation register) concatenated. Older saves without the SCC block still load. The header and RAM/VRAM are written via separate `f.write()` calls, never allocating a large temporary buffer.
+Save file format (`save_state_to()` in `src/modmsx_ui.c`): a ~80.2KB binary consisting of the 64-byte header + 64KB RAM + 16KB VRAM + a 149-byte SCC state block (since 2026-11-09: `"SCC1"` + 128 waveform bytes + 16 registers + 1 deformation register) + a 69-byte FM state block (since 2026-11-12: `"OPL1"` + address register + 64 registers) concatenated. Older saves without the SCC/FM blocks still load. The header and RAM/VRAM are written via separate `f.write()` calls, never allocating a large temporary buffer.
 
 ---
 

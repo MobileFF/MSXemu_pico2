@@ -10,6 +10,13 @@ void usb_host_core_task(void);
 void usb_host_core_start_bg_timer(int interval_ms);
 void usb_host_core_stop_bg_timer(void);
 
+/* PIO-USB builds only (no-op otherwise): make TinyUSB drop and re-enumerate
+ * whatever is on the root port. Call after a long run of flash erase/
+ * program (interrupts off ~45ms per 4KB sector): the missing SOFs put the
+ * bus into suspend, and a hub then keeps its downstream port disabled, so
+ * a keyboard behind it stays dead. Blocks ~3ms. */
+void usb_host_core_force_reconnect(void);
+
 /* Returns pointer to the last received 8-byte HID keyboard report.
  * Layout: [modifier, reserved, keycode×6]  (USB HID boot protocol) */
 const uint8_t *usb_host_core_get_hid_report(void);

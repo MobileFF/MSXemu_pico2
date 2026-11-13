@@ -150,8 +150,11 @@ target_sources(msx_lib INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/msx_core.c
     ${CMAKE_CURRENT_LIST_DIR}/modmsx.c
     ${CMAKE_CURRENT_LIST_DIR}/wd179x.c
-    ${CMAKE_CURRENT_LIST_DIR}/scc_out.c
     ${CMAKE_CURRENT_LIST_DIR}/cart_xip.c
+
+    # YM2413 / MSX-MUSIC (digital-sound-antiques/emu2413, MIT — locally
+    # trimmed, see the note at the top of emu2413.c)
+    ${CMAKE_CURRENT_LIST_DIR}/emu2413/emu2413.c
 
     # Z80 CPU core (superzazu/z80, MIT)
     ${CMAKE_CURRENT_LIST_DIR}/z80/z80.c
@@ -274,6 +277,26 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/tms9918/vrEmuTms9918.c
     ${CMAKE_CURRENT_LIST_DIR}/emu2149/emu2149.c
     PROPERTIES COMPILE_OPTIONS "-O3"
+)
+
+# emu2413 (2026-11-12): on Pico 2 -Os, not -O3 — its per-sample path runs
+# from RAM there (see the note at the top of emu2413.c), and at -O3 that
+# path alone was ~4.6KB, more than the GC heap's 64KB floor leaves room
+# for. PiZero runs it from flash on core0, so it keeps -O3.
+if(MSX_IS_PIZERO)
+    set(MSX_EMU2413_OPT "-O3")
+else()
+    set(MSX_EMU2413_OPT "-Os;-finline-functions;-finline-limit=200")
+endif()
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/emu2413/emu2413.c
+    PROPERTIES COMPILE_OPTIONS "${MSX_EMU2413_OPT}"
+)
+
+# emu2413: no sinc rate converter (see the note at the top of emu2413.c).
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/emu2413/emu2413.c
+    PROPERTIES COMPILE_DEFINITIONS EMU2413_NO_RATECONV=1
 )
 
 # ============================================================

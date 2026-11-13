@@ -53,7 +53,7 @@ Loads a 32KB MSX BIOS/BASIC ROM into slot 0. `data`'s size must be within 0x4000
 Loads a cartridge ROM by copying the whole thing into the heap (full in-RAM mode; for small cartridges, up to roughly 32KB).
 
 - `slot`: 0 = cartridge slot 1, 1 = cartridge slot 2
-- `mapper`: `msx.MAPPER_PLAIN` (0, default — auto-detected if the ROM is over 32KB) / `msx.MAPPER_ASCII8` (1) / `msx.MAPPER_ASCII16` (2) / `msx.MAPPER_KONAMI` (3) / `msx.MAPPER_KONAMI_SCC` (4)
+- `mapper`: `msx.MAPPER_PLAIN` (0, default — auto-detected if the ROM is over 32KB) / `msx.MAPPER_ASCII8` (1) / `msx.MAPPER_ASCII16` (2) / `msx.MAPPER_KONAMI` (3) / `msx.MAPPER_KONAMI_SCC` (4) / `msx.MAPPER_RTYPE` (5) / `msx.MAPPER_FMPAC` (6)
 
 ### `msx.load_cart_paged(slot: int, file_obj, size: int, mapper: int) -> bool`
 
@@ -264,9 +264,17 @@ Sets the PSG level: 0-1024, 256 = unchanged, 0 = mute. Matches `msx.ini`'s `psg_
 
 Enables/disables the built-in SCC synthesis and sets its level relative to the PSG (256 = 1:1, 0-1024). Matches `msx.ini`'s `scc=` / `scc_volume=`.
 
-### `msx.scc_out_init(sck: int, mosi: int, cs: int, baud: int = 0) -> bool` / `msx.scc_out_deinit()` / `msx.scc_out_mute(mute: bool)`
+### `msx.set_fm(enable: bool, gain: int = 256)`
 
-Starts/stops/temporarily mutes forwarding to an external SCC slave board (PicoChiptuneOrchestra's `slave_scc.uf2`; not yet verified on real hardware). `baud` 0 = ~3MHz. Starting re-sends the current SCC state. Matches `msx.ini`'s `scc_out=`.
+Enables/disables the built-in FM sound (YM2413) and sets its level (256 = default, 0-1024). Matches `msx.ini`'s `fm=` / `fm_volume=`.
+
+### `msx.set_fm_id(enable: bool)`
+
+Whether an empty slot 2 answers the `"APRLOPLL"` ID (default False). Matches `msx.ini`'s `fm_id=`. There is no BIOS behind it; for software that calls the FM-BIOS use `msx_ui.load_fm_rom(path)` (`fm_rom=`: loads the 16KB FM-BIOS into slot 2 and returns the mapper name).
+
+### `msx.fm_sync()` / `msx.fm_stats() -> (wait_us, render_us, log_overflow)`
+
+On Pico 2, waits until core1 has finished rendering FM audio (call it before writing flash, for example). `fm_stats()` returns the time core0 waited for core1 and core1's render time (both cumulative µs), plus the register-write log overflow count (all 0 on PiZero).
 
 ### `msx.get_audio_clip_count() -> int`
 
@@ -314,7 +322,7 @@ def load_state_from(path):
 
 The key design point is that this never allocates a large temporary buffer (see `dev_guide_en.md`).
 
-The runtime menu's actual save (`save_state_to()` in `src/modmsx_ui.c`) also appends the SCC state (149 bytes, starting with `"SCC1"`) after the VRAM image. When loading a save without it (an older save), the SCC starts silent.
+The runtime menu's actual save (`save_state_to()` in `src/modmsx_ui.c`) also appends the SCC state (149 bytes, starting with `"SCC1"`) and the FM registers (69 bytes, starting with `"OPL1"`) after the VRAM image. When loading a save without them (an older save), the SCC/FM start silent.
 
 ---
 
@@ -381,6 +389,8 @@ Calls `PSG_calc()` directly `n` times (for verifying audio-generation timing).
 | `msx.MAPPER_ASCII16` | 2 | ASCII-16 (16KB pages, 2 windows) |
 | `msx.MAPPER_KONAMI` | 3 | KONAMI (no SCC; 8KB pages, 3 switchable windows) |
 | `msx.MAPPER_KONAMI_SCC` | 4 | KONAMI SCC (8KB pages, 4 switchable windows, with SCC) |
+| `msx.MAPPER_RTYPE` | 5 | R-Type (0x4000- fixed to 16KB block 0x17, 0x8000- switchable) |
+| `msx.MAPPER_FMPAC` | 6 | FM-PAC (16KB bank, OPLL, 8KB SRAM) |
 | `msx.SCREEN_W` | 256 | MSX native screen width |
 | `msx.SCREEN_H` | 192 | MSX native screen height |
 | `msx.KEY_ROWS` | 11 | Number of keyboard matrix rows |

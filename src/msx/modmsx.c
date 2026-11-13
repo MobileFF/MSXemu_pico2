@@ -25,7 +25,6 @@
 #include "py/stream.h"
 
 #include "msx_core.h"
-#include "scc_out.h"
 #include <stdlib.h>
 
 #ifdef __arm__
@@ -570,6 +569,7 @@ static mp_obj_t msx_py_fdc_mount(size_t n_args, const mp_obj_t *args) {
 
     MP_STATE_VM(msx_fdc_file) = has_disk ? file_obj : mp_const_none;
     msx_fdc_enable(&msx_state.fdc, base_addr, sectors_per_track, num_sides);
+    msx_rmap_update(&msx_state);
     msx_fdc_set_io_cb(&msx_state.fdc,
                        has_disk ? fdc_sector_io_from_pyfile : NULL, NULL);
     return mp_const_none;
@@ -583,6 +583,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_fdc_mount_obj, 4, 4, msx_py_fd
  * ----------------------------------------------------------------------- */
 static mp_obj_t msx_py_fdc_unmount(void) {
     msx_fdc_disable(&msx_state.fdc);
+    msx_rmap_update(&msx_state);
     mp_obj_t file_obj = MP_STATE_VM(msx_fdc_file);
     if (file_obj != MP_OBJ_NULL && file_obj != mp_const_none) {
         mp_stream_close(file_obj);
@@ -1302,33 +1303,44 @@ static mp_obj_t msx_py_setup_audio_pwm(mp_obj_t pin_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_setup_audio_pwm_obj,
                                    msx_py_setup_audio_pwm);
 
-/* -----------------------------------------------------------------------
- * SCC external output (PicoChiptuneOrchestra slave_scc board) — see
- * src/msx/scc_out.c.
- *
- * msx.scc_out_init(sck: int, mosi: int, cs: int, baud: int = 0) -> bool
- *   Start forwarding SCC register writes over a bit-banged SPI link on
- *   these GPIOs (baud 0 = default ~3MHz). Re-sends the current SCC shadow
- *   so a slave connected mid-game picks up the playing state.
- * msx.scc_out_deinit()        — mute the slave and release the pins.
- * msx.scc_out_mute(mute: bool) — key everything off / restore (menu pause).
- * ----------------------------------------------------------------------- */
-static mp_obj_t msx_py_scc_out_init(size_t n_args, const mp_obj_t *args) {
-    uint32_t baud = (n_args >= 4) ? (uint32_t)mp_obj_get_int(args[3]) : 0;
-    bool ok = scc_out_init((uint)mp_obj_get_int(args[0]),
-                           (uint)mp_obj_get_int(args[1]),
-                           (uint)mp_obj_get_int(args[2]), baud);
-    if (ok) msx_scc_out_resync(&msx_state);
-    return mp_obj_new_bool(ok);
-}
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_scc_out_init_obj, 3, 4,
-                                           msx_py_scc_out_init);
-
-static mp_obj_t msx_py_scc_out_deinit(void) {
-    scc_out_deinit();
+/* msx.set_fm(enable: bool, gain: int = 256) — built-in YM2413 (MSX-MUSIC)
+ * on/off and level (256 = default, 0-1024). */
+static mp_obj_t msx_py_set_fm(size_t n_args, const mp_obj_t *args) {
+    mp_int_t gain = (n_args >= 2) ? mp_obj_get_int(args[1]) : 256;
+    if (gain < 0) gain = 0;
+    if (gain > 1024) gain = 1024;
+    msx_set_fm(&msx_state, mp_obj_is_true(args[0]), (uint16_t)gain);
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_scc_out_deinit_obj, msx_py_scc_out_deinit);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_set_fm_obj, 1, 2, msx_py_set_fm);
+
+/* msx.set_fm_id(enable: bool) — empty slot 2 answers "APRLOPLL" so
+ * software detects MSX-MUSIC (default off: there is no FM-BIOS behind it;
+ * msx.ini fm_rom= provides a real one instead). */
+static mp_obj_t msx_py_set_fm_id(mp_obj_t en_obj) {
+    msx_set_fm_id(&msx_state, mp_obj_is_true(en_obj));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_set_fm_id_obj, msx_py_set_fm_id);
+
+/* msx.fm_sync() — Pico 2: wait for core1's YM2413 render of the last
+ * frame to finish (core1 then idles in RAM). Call before anything that
+ * may write flash from Python. No-op on other boards. */
+static mp_obj_t msx_py_fm_sync(void) {
+    msx_fm_sync();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_fm_sync_obj, msx_py_fm_sync);
+
+/* msx.fm_stats() -> (wait_us, render_us, log_overflow), cumulative. */
+static mp_obj_t msx_py_fm_stats(void) {
+    uint32_t w, r;
+    msx_fm_stats(&w, &r);
+    mp_obj_t t[3] = { mp_obj_new_int_from_uint(w), mp_obj_new_int_from_uint(r),
+                      mp_obj_new_int_from_uint(msx_fm_log_overflow()) };
+    return mp_obj_new_tuple(3, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_fm_stats_obj, msx_py_fm_stats);
 
 /* msx.set_psg_volume(gain: int) — PSG level, 256 = unchanged, 0 = mute. */
 static mp_obj_t msx_py_set_psg_volume(mp_obj_t gain_obj) {
@@ -1362,12 +1374,6 @@ static mp_obj_t msx_py_set_scc_internal(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(msx_py_set_scc_internal_obj, 1, 2,
                                            msx_py_set_scc_internal);
-
-static mp_obj_t msx_py_scc_out_mute(mp_obj_t mute_obj) {
-    msx_scc_out_mute(&msx_state, mp_obj_is_true(mute_obj));
-    return mp_const_none;
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_scc_out_mute_obj, msx_py_scc_out_mute);
 
 /* -----------------------------------------------------------------------
  * msx.set_audio_volume(level: int)
@@ -1644,6 +1650,7 @@ static MP_DEFINE_CONST_FUN_OBJ_0(msx_py_debug_get_slot_obj, msx_py_debug_get_slo
 
 static mp_obj_t msx_py_debug_set_slot(mp_obj_t value_obj) {
     msx_state.slot_select = (uint8_t)mp_obj_get_int(value_obj);
+    msx_rmap_update(&msx_state);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(msx_py_debug_set_slot_obj, msx_py_debug_set_slot);
@@ -1795,11 +1802,12 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     /* Audio — ring buffer + timer (no Python involvement needed) */
     { MP_ROM_QSTR(MP_QSTR_setup_audio_pwm),        MP_ROM_PTR(&msx_py_setup_audio_pwm_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_audio_volume),       MP_ROM_PTR(&msx_py_set_audio_volume_obj) },
-    { MP_ROM_QSTR(MP_QSTR_scc_out_init),           MP_ROM_PTR(&msx_py_scc_out_init_obj) },
-    { MP_ROM_QSTR(MP_QSTR_scc_out_deinit),         MP_ROM_PTR(&msx_py_scc_out_deinit_obj) },
-    { MP_ROM_QSTR(MP_QSTR_scc_out_mute),           MP_ROM_PTR(&msx_py_scc_out_mute_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_scc_internal),       MP_ROM_PTR(&msx_py_set_scc_internal_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_psg_volume),         MP_ROM_PTR(&msx_py_set_psg_volume_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_fm),                 MP_ROM_PTR(&msx_py_set_fm_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_fm_id),              MP_ROM_PTR(&msx_py_set_fm_id_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fm_sync),                MP_ROM_PTR(&msx_py_fm_sync_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fm_stats),               MP_ROM_PTR(&msx_py_fm_stats_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_clip_count),   MP_ROM_PTR(&msx_py_get_audio_clip_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_audio_filter),       MP_ROM_PTR(&msx_py_set_audio_filter_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_audio_volume),       MP_ROM_PTR(&msx_py_get_audio_volume_obj) },
@@ -1832,6 +1840,8 @@ static const mp_rom_map_elem_t msx_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_MAPPER_ASCII16),         MP_ROM_INT(MSX_MAPPER_ASCII16) },
     { MP_ROM_QSTR(MP_QSTR_MAPPER_KONAMI),          MP_ROM_INT(MSX_MAPPER_KONAMI) },
     { MP_ROM_QSTR(MP_QSTR_MAPPER_KONAMI_SCC),      MP_ROM_INT(MSX_MAPPER_KONAMI_SCC) },
+    { MP_ROM_QSTR(MP_QSTR_MAPPER_RTYPE),           MP_ROM_INT(MSX_MAPPER_RTYPE) },
+    { MP_ROM_QSTR(MP_QSTR_MAPPER_FMPAC),           MP_ROM_INT(MSX_MAPPER_FMPAC) },
     { MP_ROM_QSTR(MP_QSTR_SCREEN_W),               MP_ROM_INT(MSX_SCREEN_W) },
     { MP_ROM_QSTR(MP_QSTR_SCREEN_H),               MP_ROM_INT(MSX_SCREEN_H) },
     { MP_ROM_QSTR(MP_QSTR_KEY_ROWS),               MP_ROM_INT(MSX_KEY_ROWS) },

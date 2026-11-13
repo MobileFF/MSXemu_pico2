@@ -12,8 +12,9 @@ This project emulates an MSX1 computer, equipped with a Z80 CPU, TMS9918A VDP, a
 - **MicroPython Framework**: Boot flow, UI, and configuration logic are written in MicroPython for easy customization.
 - **Display Support**: Supports ST7796 (480×320) and ILI9341 (320×240) TFT LCDs, switchable via `msx.ini`. 180° screen rotation is also supported.
 - **External Keyboard**: Supports USB HID keyboards in host mode.
-- **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM by placing the ROM in a free area of the Pico 2's onboard flash and reading it directly (XIP).
-- **SCC Sound**: the KONAMI SCC (K051649) is synthesized inside the emulator and mixed into the same audio output as the PSG. It can also be sent to an external SCC slave board from PicoChiptuneOrchestra (the same author's separate project) (not yet verified on real hardware).
+- **Cartridge Support**: PLAIN / ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC / R-Type / FM-PAC mappers (with auto-detection). Bank-switched "Mega ROM" cartridges (128KB+) are supported beyond available RAM by placing the ROM in a free area of the Pico 2's onboard flash and reading it directly (XIP).
+- **SCC Sound**: the KONAMI SCC (K051649) is synthesized inside the emulator and mixed into the same audio output as the PSG.
+- **FM Sound (MSX-MUSIC)**: built-in YM2413 ([emu2413](https://github.com/digital-sound-antiques/emu2413)), rendered on core1 on Pico 2. Load the FM-BIOS with `fm_rom=` and MSX-MUSIC software plays FM music. FM-PAC cartridge images (the `_FMPAC` menu) are supported too.
 - **Storage**: Loads the BIOS/cartridge ROM from an SD card, and supports zero-copy save/load state (including RAM and VRAM).
 - **Runtime Menu**: GUI+F7 on a USB keyboard opens an on-screen menu for swapping cartridges, saving/loading state, resetting, adjusting volume/audio filter, and display settings (including switching between LCD/HDMI) — all without stopping gameplay.
 - **Joystick Support**: Supports an Atari/MSX 9-pin joystick (JOY1) — directions and trigger A/B.
@@ -65,7 +66,7 @@ MSX_emu_pico2/
 
 MIT License. See [LICENSE](LICENSE) for details.
 
-Bundled third-party components (`src/msx/z80/`, `src/msx/tms9918/`, `src/msx/emu2149/`) are each under their own license (all MIT) — see the LICENSE file in each component's directory.
+Bundled third-party components (`src/msx/z80/`, `src/msx/tms9918/`, `src/msx/emu2149/`, `src/msx/emu2413/`) are each under their own license (all MIT) — see the LICENSE file in each component's directory.
 
 Copyrighted files such as the MSX BIOS ROM are NOT included in this repository. Please obtain your own.
 
@@ -75,6 +76,7 @@ Copyrighted files such as the MSX BIOS ROM are NOT included in this repository. 
   - [superzazu/z80](https://github.com/superzazu/z80) — Z80 CPU core (MIT License)
   - [visrealm/vrEmuTms9918](https://github.com/visrealm/vrEmuTms9918) — TMS9918A VDP core (MIT License)
   - [digital-sound-antiques/emu2149](https://github.com/digital-sound-antiques/emu2149) — AY-3-8910 PSG core (MIT License)
+  - [digital-sound-antiques/emu2413](https://github.com/digital-sound-antiques/emu2413) — YM2413 FM core (MIT License)
 - This project builds on the same author's Casio PB-1000 emulator (the C + MicroPython two-layer architecture, USB host stack, etc.) as its design and implementation foundation.
 - Thanks to everyone who has shared information about the MSX.
 - The source code was primarily developed using the following AI agent tools:

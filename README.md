@@ -12,8 +12,9 @@ Z80 CPU・TMS9918A VDP・AY-3-8910 PSGを搭載した MSX1 をエミュレート
 - **MicroPython フレームワーク**: 起動フロー・UI・設定ロジックを MicroPython で記述しており、カスタマイズが容易。
 - **表示サポート**: ST7796 (480×320) / ILI9341 (320×240) のTFT LCDに対応、`msx.ini`で切替可能。画面180度回転にも対応。
 - **外部キーボード対応**: USB HIDキーボード(Hostモード)による入力をサポート。
-- **カートリッジ対応**: PLAIN / ASCII-8 / ASCII-16 / KONAMI / KONAMI SCCマッパーに対応(自動判定あり)。128KB以上のバンク切替カートリッジ(メガロム)は、Pico 2内蔵フラッシュの空き領域に置いて直接読み出す方式(XIP)で、RAM容量を超えるサイズにも対応。
-- **SCC音源**: KONAMI SCC(K051649)をエミュレータ内で合成し、PSGと同じ音声出力にミックス。外部のPicoChiptuneOrchestra(同作者の別プロジェクト)のSCCスレーブ基板へ送って鳴らすこともできる(実機未確認)。
+- **カートリッジ対応**: PLAIN / ASCII-8 / ASCII-16 / KONAMI / KONAMI SCC / R-Type / FM-PACマッパーに対応(自動判定あり)。128KB以上のバンク切替カートリッジ(メガロム)は、Pico 2内蔵フラッシュの空き領域に置いて直接読み出す方式(XIP)で、RAM容量を超えるサイズにも対応。
+- **SCC音源**: KONAMI SCC(K051649)をエミュレータ内で合成し、PSGと同じ音声出力にミックス。
+- **FM音源(MSX-MUSIC)**: YM2413を内蔵([emu2413](https://github.com/digital-sound-antiques/emu2413))。Pico 2ではcore1で合成。`fm_rom=`でFM-BIOSを読み込むと、MSX-MUSIC対応ソフトがFMで鳴る。FM-PACのカートリッジイメージ(`_FMPAC`のメニュー)にも対応。
 - **ストレージ**: SDカードからのBIOS/カートリッジROM読み込み、ゼロコピー設計によるステートセーブ/ロード(RAM・VRAM込み)をサポート。
 - **実行時メニュー**: USBキーボードの GUI+F7 でオンスクリーンメニューを起動。カートリッジ交換、セーブ/ロード、リセット、音量/音質調整、表示設定(LCD/HDMI切替含む)をゲームを止めずに操作可能。
 - **ジョイスティック対応**: ATARI/MSX 9ピンジョイスティック(JOY1)の方向キー・トリガーA/Bに対応。
@@ -66,7 +67,7 @@ MSX_emu_pico2/
 
 MITライセンス。詳細は [LICENSE](LICENSE) を参照してください。
 
-同梱のサードパーティコンポーネント(`src/msx/z80/`・`src/msx/tms9918/`・`src/msx/emu2149/`)は、それぞれ自身のディレクトリ内のLICENSEファイルに記載された各ライセンス(いずれもMIT)に従います。
+同梱のサードパーティコンポーネント(`src/msx/z80/`・`src/msx/tms9918/`・`src/msx/emu2149/`・`src/msx/emu2413/`)は、それぞれ自身のディレクトリ内のLICENSEファイルに記載された各ライセンス(いずれもMIT)に従います。
 
 MSX BIOS ROM等の著作権保護されたファイルは本リポジトリに含まれていません。各自でご用意ください。
 
@@ -76,6 +77,7 @@ MSX BIOS ROM等の著作権保護されたファイルは本リポジトリに�
   - [superzazu/z80](https://github.com/superzazu/z80) — Z80 CPUコア (MIT License)
   - [visrealm/vrEmuTms9918](https://github.com/visrealm/vrEmuTms9918) — TMS9918A VDPコア (MIT License)
   - [digital-sound-antiques/emu2149](https://github.com/digital-sound-antiques/emu2149) — AY-3-8910 PSGコア (MIT License)
+  - [digital-sound-antiques/emu2413](https://github.com/digital-sound-antiques/emu2413) — YM2413 FM音源コア (MIT License)
 - 本プロジェクトは、同著者によるCASIO PB-1000エミュレータ(C+MicroPythonの二層構造、USBホストスタック等)の設計・実装基盤を踏襲しています。
 - MSXに関する情報を発信されているすべての皆様に感謝いたします。
 - ソースコードの作成には主に以下のAIエージェントツールを利用しています。

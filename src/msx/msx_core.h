@@ -17,6 +17,7 @@
 #include "z80/z80.h"
 #include "tms9918/vrEmuTms9918.h"
 #include "emu2149/emu2149.h"
+#include "emu2413/emu2413.h"
 #include "wd179x.h"
 
 /* -----------------------------------------------------------------------
@@ -87,27 +88,27 @@
                                  * (each 0x?000-0x?7FF); SCC (K051649) registers appear at
                                  * 0x9800-0x9FFF while the 0x9000 bank's low 6 bits == 0x3F.
                                  * See 調査用/PicoChiptuneOrchestra連携_SCC_YM2413外部演奏検討.md */
+#define MSX_MAPPER_RTYPE    5   /* Irem R-Type: 0x4000-0x7FFF fixed to 16KB block 0x17;
+                                 * any write to 0x4000-0x7FFF selects the 16KB block at
+                                 * 0x8000-0xBFFF (value & (value&0x10 ? 0x17 : 0x1F)).
+                                 * Same scheme as openMSX's RomRType. */
+#define MSX_MAPPER_FMPAC    6   /* Panasonic FM-PAC (64KB, "PAC2OPLL" at 0x18): 16KB bank
+                                 * at 0x4000-0x7FFF selected by 0x7FF7 (& 3, readable);
+                                 * 0x7FF4/0x7FF5 = memory-mapped YM2413 address/data;
+                                 * 0x7FF6 = enable (& 0x11, readable); 8KB SRAM at
+                                 * 0x4000-0x5FFD while 0x5FFE==0x4D && 0x5FFF==0x69.
+                                 * cart_bank[] = {bank, enable, [0x5FFE], [0x5FFF]}.
+                                 * Same behavior as openMSX's MSXFmPac. */
 
 /* -----------------------------------------------------------------------
- * SCC (K051649) external output
+ * SCC (K051649)
  *
- * The emulator does not synthesize SCC audio itself. Writes to the SCC
- * register window are kept in a local shadow (msx_state_t.scc_*, so the
+ * Writes to the SCC register window are kept in msx_state_t.scc_* (the
  * Z80 can read the waveform RAM back — some titles detect the SCC that
- * way) and forwarded, already decoded per region, to an optional output
- * callback (see msx_set_scc_out_cb()). The opcode values below are
- * deliberately identical to PicoChiptuneOrchestra's
- * src/protocol/vgm_spi_protocol.h (VGMSPI_OP_*), so the callback can put
- * them on the wire unchanged for its slave_scc.uf2 board.
+ * way) and synthesized from there in audio_generate_scanline().
+ * (2026-11-12: the external PicoChiptuneOrchestra slave output that used
+ * to hang off this was removed.)
  * ----------------------------------------------------------------------- */
-#define MSX_SCC_OP_RESET     0x01  /* reg = clock preset (0 = 3.579545MHz) */
-#define MSX_SCC_OP_MUTE      0x04
-#define MSX_SCC_OP_WAVEFORM  0x05  /* reg = 0x00-0x7F, data = signed sample */
-#define MSX_SCC_OP_FREQ      0x06  /* reg = ch*2 + (0=low,1=high nibble)     */
-#define MSX_SCC_OP_VOLUME    0x07  /* reg = ch 0-4, data = 0-15              */
-#define MSX_SCC_OP_KEYON     0x08  /* data = 5-bit channel enable mask       */
-
-typedef void (*msx_scc_out_fn)(uint8_t opcode, uint8_t reg, uint8_t data);
 
 /* -----------------------------------------------------------------------
  * Mega ROM (SD-backed, lazily-paged) cart support
@@ -361,6 +362,23 @@ typedef struct {
     bool      scc_internal;              /* render SCC into audio_buf (default true) */
     uint16_t  scc_gain;                  /* SCC level vs PSG, 256 = 1:1 (default) */
     uint32_t  audio_acc;                 /* sample-rate accumulator, see audio_generate_scanline() */
+    /* Built-in YM2413 / MSX-MUSIC (2026-11-12, emu2413). I/O ports 0x7C
+     * (address) / 0x7D (data); "APRLOPLL" at 0x4018 of an otherwise empty
+     * cart slot 2 so software detects it. Rendered only once the Z80 has
+     * written to it (fm_active), so non-FM titles pay nothing. */
+    OPLL     *opll;                      /* NULL if the C-heap allocation failed */
+    bool      fm_enabled;                /* msx.ini fm=on|off (default on) */
+    bool      fm_active;                 /* set by the first 0x7D write after reset */
+    bool      fm_id;                     /* msx.ini fm_id=on: empty slot 2 answers
+                                          * "APRLOPLL" (default off, 2026-11-12 — it has
+                                          * no FM-BIOS behind it, and titles that then call
+                                          * the BIOS, e.g. R-Type at 0x4113, crash) */
+    uint8_t   fm_addr;                   /* last 0x7C value */
+    uint16_t  fm_gain;                   /* 256 = default level */
+    uint8_t  *fmpac_sram;                /* FM-PAC 8KB SRAM (C heap, allocated while an
+                                          * MSX_MAPPER_FMPAC cart is loaded; NULL otherwise
+                                          * or if malloc failed -> reads 0xFF). RAM only,
+                                          * not persisted to SD (2026-11-12). */
     uint16_t  psg_gain;                  /* PSG level, 256 = unchanged (default), 0 = mute */
     int32_t   psg_dc;                    /* PSG DC-blocker state, Q8 */
     /* 2026-11-10: per-window read pointers for paged carts (RAM cache
@@ -549,6 +567,10 @@ bool msx_load_cart(msx_state_t *msx, uint8_t slot, const uint8_t *data,
  * the mapper-detect/bank-init work msx_load_cart() normally does right
  * after its memcpy. */
 uint8_t *msx_cart_alloc(msx_state_t *msx, uint8_t slot, uint32_t size);
+/* Like msx_cart_alloc(), but mallocs exactly `size` (no rounding up to
+ * MSX_CART_INRAM_MAX, no reuse) — for the 16KB FM-BIOS ROM kept in slot 2
+ * (msx.ini fm_rom=). Follow with msx_cart_finalize(). */
+uint8_t *msx_cart_alloc_exact(msx_state_t *msx, uint8_t slot, uint32_t size);
 bool msx_cart_finalize(msx_state_t *msx, uint8_t slot, uint8_t mapper);
 
 /* Register the callback used to fetch an 8KB page from backing storage
@@ -585,35 +607,55 @@ bool msx_load_cart_paged(msx_state_t *msx, uint8_t slot, uint32_t total_size,
 bool msx_load_cart_xip(msx_state_t *msx, uint8_t slot, const uint8_t *rom,
                        uint32_t total_size, uint8_t mapper);
 
+/* 2026-11-12: mapper detection for a ROM whose whole image is readable
+ * (e.g. XIP flash): recognizes layouts the 4KB-prefix write-pattern scan
+ * can't (R-Type: no "AB" header in block 0, one at 16KB block 0x17),
+ * then falls back to msx_detect_mapper() on the first prefix_len bytes.
+ * Returns MSX_MAPPER_PLAIN if nothing matched. */
+uint8_t msx_detect_mapper_full(const uint8_t *rom, uint32_t size, uint32_t prefix_len);
+
 /* Run the same mapper-detection heuristic msx_load_cart() uses
  * internally against a caller-supplied buffer (e.g. just the first 64KB
  * of a large ROM) — lets the caller pick a mapper for
  * msx_load_cart_paged() without needing the whole ROM in RAM. */
 uint8_t msx_detect_mapper(const uint8_t *data, uint32_t size);
 
-/* Register (or, with NULL, clear) the SCC output callback — called once
- * per decoded SCC register write (MSX_SCC_OP_*), from inside the Z80
- * memory-write path, so it must be quick. Stored outside msx_state_t, so
- * msx_init() does not clear it. */
-void msx_set_scc_out_cb(msx_scc_out_fn cb);
-
-/* Silence (mute=true: key-on mask 0) or restore (false: re-send the
- * shadow's key-on mask) the external SCC — e.g. while the runtime menu
- * has emulation paused. No-op without a callback. */
-void msx_scc_out_mute(msx_state_t *msx, bool mute);
-
-/* Re-send the whole SCC shadow (waveforms, frequencies, volumes, key-on)
- * — e.g. right after the output was (re)connected. */
-void msx_scc_out_resync(msx_state_t *msx);
-
 /* Built-in SCC synthesis on/off (default on) and its level relative to
- * PSG (256 = 1:1, 0 = silent). Independent of the external output: both
- * can run at once. */
+ * PSG (256 = 1:1, 0 = silent). */
 void msx_set_scc_internal(msx_state_t *msx, bool enable, uint16_t gain);
 
 /* PSG level in the mix (256 = unchanged, 0 = muted) — e.g. to listen to
  * the SCC alone. */
 void msx_set_psg_gain(msx_state_t *msx, uint16_t gain);
+
+/* Built-in YM2413 on/off (default on) and level (256 = default, 0-1024).
+ * Off = ports ignored and no "APRLOPLL" signature, so software falls
+ * back to PSG/SCC music. */
+void msx_set_fm(msx_state_t *msx, bool enable, uint16_t gain);
+void msx_set_fm_id(msx_state_t *msx, bool enable);
+
+/* Rebuild the Z80 direct-read map (z80.h rmap[]) from the current slot
+ * select / cart state. Called internally on every change; also call it
+ * after poking slot_select or other memory-map state from outside. */
+void msx_rmap_update(msx_state_t *msx);
+
+/* Pico 2 (YM2413 rendered on core1): wait until core1 has finished the
+ * frame it is rendering and is idling in RAM. Call before anything that
+ * may write flash from Python (e.g. the runtime menu). No-op elsewhere. */
+void msx_fm_sync(void);
+/* Register writes dropped because one frame logged more than the
+ * per-frame limit (diagnostic; 0 on boards without the core1 path). */
+uint32_t msx_fm_log_overflow(void);
+/* Cumulative microseconds: core0 waiting for core1 at frame end, and
+ * core1 rendering FM (diagnostics; both 0 without the core1 path). */
+void msx_fm_stats(uint32_t *wait_us, uint32_t *render_us);
+
+/* Save-state trailer for the YM2413 (written after the SCC one): magic +
+ * address latch + the 64 registers, replayed on load. */
+#define MSX_FM_STATE_MAGIC "OPL1"
+#define MSX_FM_STATE_SZ    (4u + 1u + 0x40u)
+void msx_fm_state_save(const msx_state_t *msx, uint8_t *buf);
+void msx_fm_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len);
 
 /* Save-state trailer carrying the SCC shadow, written after the VRAM
  * image by the save/load code (modmsx_ui.c). Old saves without it still
@@ -621,8 +663,7 @@ void msx_set_psg_gain(msx_state_t *msx, uint16_t gain);
 #define MSX_SCC_STATE_MAGIC "SCC1"
 #define MSX_SCC_STATE_SZ    (4u + 0x80u + 0x10u + 1u)
 void msx_scc_state_save(const msx_state_t *msx, uint8_t *buf);
-/* buf may be NULL / len short (no trailer) -> SCC reset. Re-sends the
- * restored state to the external output, if any. */
+/* buf may be NULL / len short (no trailer) -> SCC reset. */
 void msx_scc_state_load(msx_state_t *msx, const uint8_t *buf, uint32_t len);
 
 /* Eject cartridge. */

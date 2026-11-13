@@ -44,6 +44,7 @@
 │  src/msx/z80/          Z80 CPUコア (superzazu/z80) │
 │  src/msx/tms9918/      VDPコア (vrEmuTms9918)     │
 │  src/msx/emu2149/      PSGコア (emu2149)          │
+│  src/msx/emu2413/      FM音源コア (emu2413)       │
 └─────────────────────────────────────────────┘
 ```
 
@@ -58,6 +59,7 @@
 | CPU | Z80 @ 3.579545MHz | [superzazu/z80](https://github.com/superzazu/z80)（MIT）を使用 |
 | VDP | TMS9918A | [vrEmuTms9918](https://github.com/visrealm/vrEmuTms9918)（MIT）を使用。256×192描画、パレット16色 |
 | PSG | AY-3-8910 相当 | [emu2149](https://github.com/digital-sound-antiques/emu2149)（MIT）を使用。クロックは実機同様 Z80クロックの半分（1.789772MHz） |
+| FM音源 | YM2413（MSX-MUSIC） | [emu2413](https://github.com/digital-sound-antiques/emu2413)（MIT）を使用。Pico 2ではcore1で合成（core0がレジスタ書き込みを記録し、1フレーム遅れで混ぜる）。1サンプルごとの処理とその表はRAMに置く（XIPキャッシュの取り合いを避けるため） |
 | PPI | i8255 簡易実装 | スロット選択・キーボード行列読み取り |
 | メモリ | 4スロット×4ページ(16KB) | スロット0=BIOS, 1/2=カートリッジ, 3=RAM |
 
@@ -70,7 +72,7 @@
 
 3. **XIP方式** (`msx_load_cart_xip()`、2026-11-10〜、Pico 2のみ) — メガロム全体を、ファームウェア末尾とファイルシステムの間の空きフラッシュ（約0.5MB、`src/msx/cart_xip.c` が `__flash_binary_end` と `MICROPY_HW_FLASH_STORAGE_BASE` から実行時に算出。ビルド設定は変更しない）に置き、XIP経由で直接読む。窓ごとの読み出しポインタ（`cart_win[]`）を持ち、バンク切替はポインタの付け替えだけになる（フェッチ・RAMキャッシュなし）。先頭4KBの見出し（パス・サイズ・書き込み時のファームウェア終端）が一致すれば再書き込みを省く。空きに入らないROM・PiZeroは2.のページング方式になる。
 
-対応マッパー: `MSX_MAPPER_PLAIN`（非バンク切替）/ `MSX_MAPPER_ASCII8` / `MSX_MAPPER_ASCII16` / `MSX_MAPPER_KONAMI` / `MSX_MAPPER_KONAMI_SCC`（0x5000/0x7000/0x9000/0xB000切替、0x9000側バンク下位6bitが0x3Fのとき0x9800〜にSCC）。ROMの内容をスキャンしてバンク切替パターンを検出する簡易ヒューリスティック（`detect_mapper()`）による自動判定にも対応。
+対応マッパー: `MSX_MAPPER_PLAIN`（非バンク切替）/ `MSX_MAPPER_ASCII8` / `MSX_MAPPER_ASCII16` / `MSX_MAPPER_KONAMI` / `MSX_MAPPER_KONAMI_SCC`（0x5000/0x7000/0x9000/0xB000切替、0x9000側バンク下位6bitが0x3Fのとき0x9800〜にSCC）/ `MSX_MAPPER_RTYPE` / `MSX_MAPPER_FMPAC`（0x18の `"PAC2OPLL"` で判定）。Z80は8KBごとの直接読み出し表（`msx_rmap_update()`、`memory_map.md` 参照）で通常のROM/RAMを読む。ROMの内容をスキャンしてバンク切替パターンを検出する簡易ヒューリスティック（`detect_mapper()`）による自動判定にも対応。
 
 詳細なアドレスマップは `memory_map.md` を参照。
 
@@ -96,7 +98,7 @@
 
 - グローバルな `static msx_state_t msx_state` インスタンスの保持（Pico1台につきMSXシステム1台）
 - Python の `bytes`/`bytearray`/ファイルオブジェクトと C 側バッファの受け渡し（ゼロコピー実装が基本方針、下記参照）
-- PWM オーディオ出力（`hardware/pwm.h`、リングバッファ経由でフレーム生成した音声サンプル（PSG＋内蔵SCC）を約22222Hz（45µs周期）のタイマ割り込みでPWMデューティに反映）
+- PWM オーディオ出力（`hardware/pwm.h`、リングバッファ経由でフレーム生成した音声サンプル（PSG＋内蔵SCC＋FM音源）を約22222Hz（45µs周期）のタイマ割り込みでPWMデューティに反映）
 - メガロムのページング fetch コールバック（`cart_fetch_from_pyfile()`）— Python 側で開いたファイルオブジェクトを MicroPython の GC ルートポインタ（`MP_REGISTER_ROOT_POINTER`）として保持し、`mp_stream_seek()`/`mp_stream_read_exactly()` で直接読み込む
 - デバッグ用API群（`debug_step`/`debug_cpu`/`debug_peek`/`debug_psg`等）
 
@@ -190,6 +192,7 @@ msx_core.c
   -> z80/z80.c   (Z80コア)
   -> tms9918/vrEmuTms9918.c  (VDPコア)
   -> emu2149/emu2149.c       (PSGコア)
+  -> emu2413/emu2413.c       (FM音源コア)
 ```
 
 ---
@@ -215,4 +218,4 @@ msx_core.c
 
 - `main.py` としての自動起動デプロイ（現状は手動 `import main; main.run()` でのテスト運用）
 - マルチスロットカートリッジ（スロット2）・ASCII-8/ASCII-16マッパーの実機動作検証（現状 KONAMI マッパーのみ実機確認済み）
-- 外部SCC基板（`scc_out=`）への出力の実機確認、SCC+・変形レジスタへの対応、YM2413（MSX-MUSIC）への対応
+- SCC+・変形レジスタへの対応、FM-PACのSRAMのSDカードへの保存

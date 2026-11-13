@@ -214,3 +214,27 @@ All notable changes to this project are documented in this file. Japanese versio
 
 - **Audio production vs. playback rate mismatch**: 384 samples were generated per frame (2 per active scanline) while the playback timer (45µs period) only consumed ~370, and the PSG was synthesized for 22050Hz. Once emulation reached 60 FPS, the surplus was dropped every frame, breaking up the waveform (heard as distortion/roughness), and pitch ran ~0.8% sharp. The sample rate is now 22222Hz to match playback, and the per-frame sample count matches it exactly (fraction carried over).
 - Audio samples are now signed: the PSG's DC component is removed and output is centered on the PWM midpoint (512), so the SCC can be mixed in. The PSG's swing at volume 256 is unchanged.
+
+### Added (2026-11-12 to 13, real-hardware confirmed on pico2)
+
+- **Built-in YM2413 (MSX-MUSIC)**: [emu2413](https://github.com/digital-sound-antiques/emu2413) (MIT) vendored under `src/msx/emu2413/`, driven through ports 0x7C/0x7D and the FM-PAC's memory-mapped 0x7FF4/0x7FF5. On Pico 2 it renders on core1 (core0 logs the register writes, core1 renders the frame, mixed one frame later); PiZero renders inline on core0. New `msx.ini` keys: `fm=on|off` (default on), `fm_volume=` (default 256, 0-1024). Save states append a 69-byte `"OPL1"` block after the SCC block (older saves still load; FM then starts silent).
+- **`fm_rom=PATH`**: loads the FM-BIOS (the first 16KB of an FM-PAC image, or a 16KB MSX-MUSIC ROM) into cart slot 2, so software that detects MSX-MUSIC and calls the FM-BIOS plays FM music (16KB of C heap). Confirmed with R-Type: FM music at 59.8 FPS.
+- **`fm_id=on`** (default off): an empty slot 2 only answers the `"APRLOPLL"` ID, with no BIOS behind it. Only for software that writes the ports itself. It was on unconditionally during development and made R-Type hang on a black screen (it calls the missing BIOS at 0x4113).
+- **FM-PAC mapper** (`MSX_MAPPER_FMPAC` / `msx.MAPPER_FMPAC` = 6): 16KB bank at 0x4000-0x7FFF (0x7FF7), OPLL enable (0x7FF6), 8KB SRAM unlocked by 0x4D/0x69 at 0x5FFE/0x5FFF (kept in RAM only, not saved to SD yet). Detected from `"PAC2OPLL"` at 0x18. `_FMPAC` used to give a Syntax Error because the cart was misdetected as ASCII8; it now opens the FM-PAC menu.
+- **R-Type mapper** (`MSX_MAPPER_RTYPE` / `msx.MAPPER_RTYPE` = 5): 0x4000-0x7FFF fixed to 16KB block 0x17, writes to 0x4000-0x7FFF select the block at 0x8000. Auto-detected when the ROM is loaded via XIP.
+- Diagnostics: the FPS line now also shows `busy:` (share of the 60 FPS frame budget spent working), `fmwait:`/`fmcalc:` (core0 waiting for core1 / core1 render time) and `fmovf:`. New `msx.fm_stats()`, `msx.fm_sync()`, `msx.set_fm()`, `msx.set_fm_id()`, `msx_ui.load_fm_rom()`.
+
+### Improved (2026-11-12 to 13, real-hardware confirmed on pico2)
+
+- **emu2413's per-sample path runs from RAM** on Pico 2: from XIP flash, core1's constant fetches evicted core0's code and the XIP cart ROM from the shared XIP cache (FM-PAC menu with music: busy 147%, 41 FPS). To fit the GC-heap floor (64KB), the two 1024-entry sine tables became one 256-entry quarter wave and the file is built `-Os`: ~3.4KB of RAM in total. Output is sample-identical to upstream.
+- **Z80 direct-read map** (`rmap[]`/`rlim[]` in `z80.h`, `msx_rmap_update()`): plain ROM/RAM bytes are read straight from one pointer per 8KB page instead of calling `msx_mem_read()` for every byte. Cart registers, SRAM, the SCC window, the FDC and empty slots still take the old path. The map is rebuilt on every slot-select write, cart-area write, load/eject/reset/state load, and once per frame. Host check: frame-by-frame RAM/VRAM/PC hashes identical to before on all test ROMs. Real hardware: the FM-PAC menu's logo animation (a ROM-resident division loop) went from busy ~107% / ~56 FPS / slow music to **busy 90% / 59.9 FPS**; R-Type with FM from 92-102% to 90%.
+
+### Fixed (2026-11-12)
+
+- **SD card stuck after a read timeout**: a data-token timeout inside a multi-block read (CMD18) raised straight out of the loop without sending CMD12, leaving the card in its data state, so every later command (including retries) failed with EIO until power-cycle (seen while copying a Mega ROM to XIP flash). CMD12 is now always sent, the post-stop busy wait is bounded, and the last failure is printed (`SD: read failed blk=... stage=...`).
+- **USB keyboard behind a hub stopping** (PIO-USB builds): SOFs are now exactly 1ms apart (timed from the previous target, not from the end of the frame), which a hub otherwise treats as babble and disables the port. After a Mega ROM copy to flash (interrupts off for long stretches) the root port is force-reconnected so the hub and keyboard re-enumerate. `CFG_TUH_DEVICE_MAX` raised 1 → 4 (hub + keyboard). Both changes are ported from the sibling PB-1000 project.
+- Pico-PIO-USB updated 0.7.2 → 0.7.3 (`src/usb_host/pio_usb/PROVENANCE.md`).
+
+### Removed (2026-11-12)
+
+- **External SCC board output** (`scc_out=`, `msx.scc_out_init()`/`scc_out_deinit()`/`scc_out_mute()`, `src/msx/scc_out.c`): never verified on real hardware; the built-in SCC stays. An `scc_out=` line left in `msx.ini` is ignored.

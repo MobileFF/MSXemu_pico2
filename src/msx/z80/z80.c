@@ -47,6 +47,9 @@ static const uint8_t cyc_ddfd[256] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 15, 4, 4, 4, 4,
 #define GET_BIT(n, val) (((val) >> (n)) & 1)
 
 static inline uint8_t rb(z80* const z, uint16_t addr) {
+  const uint8_t* const m = z->rmap[addr >> 13];
+  const uint16_t off = addr & 0x1FFF;
+  if (m && off < z->rlim[addr >> 13]) return m[off];
   return z->read_byte(z->userdata, addr);
 }
 
@@ -55,8 +58,7 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
 }
 
 static inline uint16_t rw(z80* const z, uint16_t addr) {
-  return (z->read_byte(z->userdata, addr + 1) << 8) |
-         z->read_byte(z->userdata, addr);
+  return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
 }
 
 static inline void ww(z80* const z, uint16_t addr, uint16_t val) {
@@ -756,6 +758,8 @@ void z80_init(z80* const z) {
   z->call_hook = NULL;
   z->userdata = NULL;
   z->hook_suppress_active = false;
+  memset(z->rmap, 0, sizeof(z->rmap));
+  memset(z->rlim, 0, sizeof(z->rlim));
   memset(z->hook_bitmap, 0, sizeof(z->hook_bitmap));
 
   z->cyc = 0;

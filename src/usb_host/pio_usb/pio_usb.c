@@ -82,52 +82,89 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, true);
 }
 
-void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
-                                              uint8_t *data, uint16_t len) {
+static_assert(IRQ_TX_EOP == 0, "slot 0 patch needs IRQ_TX_EOP == 0");
+
+static __always_inline void usb_transfer(pio_port_t *pp, uint8_t *data,
+                                         uint16_t len, bool arm_rx) {
   if (pp->need_pre) {
     send_pre(pp);
+  }
+
+  // Bounds the time from the packet start to the slot 0 patch below
+  uint32_t irq_status = 0;
+  if (arm_rx) {
+    irq_status = save_and_disable_interrupts();
   }
 
   pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
   dma_channel_transfer_from_buffer_now(pp->tx_ch, data, len);
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
-  io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
-  while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
+  bool hw_arm = false;
+  if (arm_rx) {
+    __compiler_memory_barrier(); // keep the checks below after the start
+    // IRQ flags are local to a PIO block
+    hw_arm = pp->pio_usb_tx == pp->pio_usb_rx;
+    if (hw_arm) {
+      // Slot 0 runs only for the EOP, a whole packet later, so patching it
+      // after the start keeps it out of the SETUP/OUT token-to-DATA gap.
+      // irq IRQ_TX_EOP becomes irq clear IRQ_RX_EOP. The fs and ls programs
+      // encode this slot identically, as send_pre() also relies on.
+      pp->pio_usb_tx->instr_mem[pp->offset_tx] =
+          pp->fs_tx_program->instructions[0] | pio_encode_irq_clear(false, IRQ_RX_EOP);
+    }
+    restore_interrupts(irq_status);
+  }
+
+  // After COMP the trailing K padding ends in an OUT stall at PC1, so a CPU
+  // that misses the brief COMP window would poll the PC forever. Once DMA has
+  // queued every byte, a fresh stall can only follow COMP, not a DMA gap.
+  // Done before the EOP wait to keep it out of the COMP window.
+  while (dma_channel_is_busy(pp->tx_ch)) {
     continue;
   }
-  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
+  uint32_t const stall_mask = 1u << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
+  pp->pio_usb_tx->fdebug = stall_mask;
 
-  if (pp->low_speed) {
-    // For Low speed host, wait until EOP is fully sent. Otherwise, we can send another packet
-    // before inter-packet delay timeout, which is 2-bit time by USB specs.
-    // For Full speed, our overhead is probably enough without this additional wait.
-    while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
+  // LS also waits out the EOP's J for the 2-bit inter-packet delay
+  uint32_t const done_pc = PIO_USB_TX_ENCODED_DATA_COMP + (pp->low_speed ? 1 : 0);
+  io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
+  if (hw_arm) {
+    // A fast reply may already have parked the detector again, but its START
+    // still shows that our EOP was sent
+    while ((pp->pio_usb_rx->irq & (IRQ_RX_COMP_MASK | IRQ_RX_START_MASK)) ==
+           IRQ_RX_COMP_MASK) {
       continue;
     }
+    pp->pio_usb_tx->instr_mem[pp->offset_tx] = pp->fs_tx_program->instructions[0];
   } else {
-    while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
+    // An interrupt between the start and the clear above that outlasts the
+    // packet erases its EOP flag; the post-COMP stall still ends the wait
+    while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0 &&
+           !(pp->pio_usb_tx->fdebug & stall_mask)) {
       continue;
     }
+    pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
+  }
+
+  while (*pc < done_pc && !(pp->pio_usb_tx->fdebug & stall_mask)) {
+    continue;
+  }
+
+  if (arm_rx && !hw_arm) {
+    // The other RX flags were cleared while the detector was parked
+    pp->pio_usb_rx->irq = IRQ_RX_COMP_MASK;
   }
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_send_handshake)(
-    pio_port_t *pp, uint8_t pid) {
-  switch (pid) {
-  case USB_PID_ACK:
-    pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
-    break;
+void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
+                                              uint8_t *data, uint16_t len) {
+  usb_transfer(pp, data, len, false);
+}
 
-  case USB_PID_NAK:
-    pio_usb_bus_usb_transfer(pp, nak_encoded, 5);
-    break;
-
-  case USB_PID_STALL:
-  default:
-    pio_usb_bus_usb_transfer(pp, stall_encoded, 5);
-    break;
-  }
+void __not_in_flash_func(pio_usb_bus_usb_transfer_arm_rx)(pio_port_t *pp,
+                                                     uint8_t *data, uint16_t len) {
+  usb_transfer(pp, data, len, true);
 }
 
 void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
@@ -144,7 +181,13 @@ void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
   uint8_t packet_encoded[sizeof(packet) * 2 * 7 / 6 + 2];
   uint8_t encoded_len = pio_usb_ll_encode_tx_data(packet, sizeof(packet), packet_encoded);
 
-  pio_usb_bus_usb_transfer(pp, packet_encoded, encoded_len);
+  // Only IN is answered by the device; SETUP/OUT is followed by our DATA, so
+  // keep the arming checks out of that gap.
+  if (token == USB_PID_IN) {
+    usb_transfer(pp, packet_encoded, encoded_len, true);
+  } else {
+    usb_transfer(pp, packet_encoded, encoded_len, false);
+  }
 }
 
 void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t *pp) {
@@ -203,15 +246,10 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp
 
 int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
     pio_port_t *pp, uint8_t handshake) {
-  if (!pio_usb_bus_wait_for_rx_start(pp)) {
-    return -1;
-  }
-
   uint16_t crc = 0xffff;
   uint16_t crc_prev = 0xffff;
   uint16_t crc_prev2 = 0xffff;
   uint16_t crc_receive = 0xffff;
-  uint16_t crc_receive_inverse = 0;
   bool crc_match = false;
   const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
   int16_t idx = 0;
@@ -222,21 +260,28 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   // - Lowspeed: 1 bit time = (cpufreq / 1.5 Mhz) = clk_div_ls_tx.div_int*6Mhz / 1.5 Mhz = 4 * clk_div_ls_tx.div_int
   // - Fullspeed 1 bit time = (cpufreq / 12 Mhz) = clk_div_fs_tx.div_int*48Mhz / 12 Mhz = 4 * clk_div_fs_tx.div_int
   // Since there is also overhead, we only wait 1.5 bit for LS and no wait for FS
-  uint32_t turnaround_in_cycle;
+  uint32_t turnaround_in_cycle = 0;
   if (pp->low_speed) {
     turnaround_in_cycle = 6 * pp->clk_div_ls_tx.div_int; // 1.5 bit time
-  } else {
-    turnaround_in_cycle = 4 * pp->clk_div_fs_tx.div_int; // 1 bit time, but not used
   }
+
+  if (!pio_usb_bus_wait_for_rx_start(pp)) {
+    return -1;
+  }
+
+  // Timing Critical: use local variable to reduce de-reference
+  PIO pio_usb_rx = pp->pio_usb_rx;
+  uint sm_rx =  pp->sm_rx;
+  uint8_t *usb_rx_buffer = pp->usb_rx_buffer;
 
   // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
   // This is to detect packets without an EOP because the device was unplugged.
   uint32_t start = get_time_us_32();
-  while (get_time_us_32() - start <= 7) {
-    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-      uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
+  while (1) {
+    if (pio_sm_get_rx_fifo_level(pio_usb_rx, sm_rx)) {
+      uint8_t data = pio_sm_get(pio_usb_rx, sm_rx) >> 24;
       if (idx < rx_buf_len) {
-        pp->usb_rx_buffer[idx] = data;
+        usb_rx_buffer[idx] = data;
       }
       start = get_time_us_32(); // reset timeout when a byte is received
 
@@ -245,28 +290,30 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
         crc_prev = crc;
         crc = update_usb_crc16(crc, data);
         crc_receive = (crc_receive >> 8) | (data << 8);
-        crc_receive_inverse = crc_receive ^ 0xffff;
-        crc_match = (crc_receive_inverse == crc_prev2);
+        crc_match = ((crc_receive ^ 0xffff) == crc_prev2);
       }
       idx++;
-    } else if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
+    } else if ((pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
       // Exit since we've gotten an EOP.
       // Timing critical: per USB specs, handshake must be sent within 2-7 bit-time strictly
-      if (pp->low_speed) {
+      if (turnaround_in_cycle) {
         busy_wait_at_least_cycles(turnaround_in_cycle); // wait for turnaround for LS only
       }
 
       if (handshake == USB_PID_ACK) {
         // Only ACK if crc matches
         if (idx >= 4 && crc_match) {
-          pio_usb_bus_send_handshake(pp, USB_PID_ACK);
+          usb_transfer(pp, ack_encoded, 5, false);
           return idx - 4;
         }
+      } else if (handshake == USB_PID_NAK) {
+        usb_transfer(pp, nak_encoded, 5, false);
       } else {
-        // always send other handshake NAK/STALL
-        pio_usb_bus_send_handshake(pp, handshake);
+        usb_transfer(pp, stall_encoded, 5, false);
       }
       break;
+    } else if (get_time_us_32() - start > 7) {
+      return -1; // device is probably unplugged
     }
   }
 
